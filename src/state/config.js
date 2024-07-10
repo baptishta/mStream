@@ -113,9 +113,11 @@ exports.setup = async configFile => {
   // Create config if none exists
   try {
     await fs.access(configFile);
+    winston.info(`Config file loaded: ${configFile}`);
   } catch(err) {
     winston.info('Config File does not exist. Attempting to create file');
     await fs.writeFile(configFile, JSON.stringify({}), 'utf8');
+    winston.info(`Config file created: ${configFile}`);
   }
 
   const program = JSON.parse(await fs.readFile(configFile, 'utf8'));

@@ -574,10 +574,16 @@ body {
   cursor: pointer;
 }
 
-.songDropdown {
+.songDropdown:not(.pop-c) {
+  height: 46px;
   min-width: 42px !important;
   line-height: 100% !important;
+  opacity: 0.7;
 }
+
+/* .songDropdown.pop-c {
+  height: 14px;
+} */
 
 #pop-d, #pop-f {
   min-width: 50px;
@@ -651,6 +657,11 @@ body {
   font-size: 12px;
   font-family: "Arial Black", Gadget, sans-serif;
   opacity: 0.9;
+}
+
+.removeSong {
+  min-width: 32px !important;
+  height: 52px;
 }
 
 .removeSong:hover, .deletePlaylist:hover, .removePlaylistSong:hover{
