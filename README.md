@@ -56,7 +56,7 @@ git clone https://github.com/IrosTheBeggar/mStream.git
 cd mStream
 
 # Install dependencies and run
-npm run-script wizard
+npm run wizard
 ```
 
 ## Technical Details
