@@ -1,0 +1,11 @@
+[Unit]
+Description=mStream - personal music streaming server
+After=network-online.target
+
+[Service]
+Restart=on-failure
+WorkingDirectory=/srv/dev-disk-by-uuid-e3c6c8e9-4938-4c93-b2b0-153d5fad151e/git/mStream
+ExecStart=/usr/bin/node /srv/dev-disk-by-uuid-e3c6c8e9-4938-4c93-b2b0-153d5fad151e/git/mStream/cli-boot-wrapper.js
+
+[Install]
+WantedBy=multi-user.target
