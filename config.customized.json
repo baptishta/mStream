@@ -1,0 +1,12 @@
+{
+  "noUpload": true,
+  "scanOptions": {
+    "skipImg": true
+  },
+  "writeLogs": true,
+  "port": "5347",
+  "ssl": {
+    "key": "mstream-ssl.key",
+    "cert": "mstream-ssl.crt"
+  }
+}
