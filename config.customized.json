@@ -1,7 +1,8 @@
 {
   "noUpload": true,
   "scanOptions": {
-    "skipImg": true
+    "skipImg": true,
+    "scanInterval": "72"
   },
   "writeLogs": true,
   "port": "5347",

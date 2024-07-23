@@ -59,6 +59,12 @@ Anything your new *myapp* service outputs to the error or standard output stream
 journalctl -lf -u myapp
 ```
 
+- To see the logs from nodejs:
+
+```
+sudo journalctl -u mstream
+```
+
 - To stop the service:
 
 ```
