@@ -26,7 +26,7 @@
   <link rel="stylesheet" href="assets/css/materialize.css">
 
   <!-- JS -->
-  <script defer src="alpha/spa.js"></script>
+  <script src="alpha/spa.js"></script>
   <link rel="stylesheet" href="assets/css/waves.css">
   <script defer src="assets/js/waves.js"></script>
 
@@ -487,10 +487,10 @@
     </div>
 
     <div class="col-z hide-on-med-and-up flex">
-      <div onclick="toggleThing(this, true);" class="m-tab selected-tab panel_one_name">
+      <div id="file-explorer-tab-btn" onclick="toggleThing(this, true);" class="m-tab selected-tab panel_one_name">
         File Explorer
       </div>
-      <div onclick="toggleThing(this, false);" class="m-tab">
+      <div id="now-playing-tab-btn" onclick="toggleThing(this, false);" class="m-tab">
         Now Playing
       </div>
     </div>

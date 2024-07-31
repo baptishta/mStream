@@ -476,6 +476,8 @@ const MSTREAMPLAYER = (() => {
     // Scrobble song after 30 seconds
     clearTimeout(scrobbleTimer);
     scrobbleTimer = setTimeout(() => { mstreamModule.scrobble() }, 30000);
+
+    App.scrollToSong();
   }
 
   // Should be called whenever the "metadata" field of the current song is changed, or

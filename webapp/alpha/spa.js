@@ -1,6 +1,78 @@
-document.getElementById("sidenav-cover").addEventListener("click", () => {
-  toggleSideMenu();
-}); 
+const debounce = (callback, wait) => {
+  let timeoutId = null;
+  return (...args) => {
+    window.clearTimeout(timeoutId);
+    timeoutId = window.setTimeout(() => {
+      callback(...args);
+    }, wait);
+  };
+};
+// Example usage:
+// const handleMouseMove = debounce((mouseEvent) => { console.log(mouseEvent) }, 250);
+// document.addEventListener('mousemove', handleMouseMove);
+
+const App = (function() {
+  const ViewBreakPoints = {
+    SMALL: 600,
+    MEDIUM: 768
+  };
+  const Views = {
+    SMALL: "view--small",
+    MEDIUM: "view--medium"
+  };
+
+  const getView = () => window.innerWidth <= ViewBreakPoints.SMALL ? Views.SMALL: Views.MEDIUM;
+
+  const setViewClass = () => {
+    const view = getView();
+    const html = document.documentElement;
+    if (!html.classList.contains(view)) {
+      Object.keys(Views).forEach(key => html.classList.remove(Views[key]));
+      html.classList.add(view);
+    }
+  };
+
+  const onWinResize = e => {
+    document.documentElement.style.setProperty('--vh', `${window.innerHeight/100}px`);
+    setViewClass();
+    // console.log(getView());
+  };
+  const onWinResizeDebounced = debounce(onWinResize, 50);
+
+  const onDOMContentLoaded = e => {
+    document.getElementById("sidenav-cover").addEventListener("click", toggleSideMenu);
+  
+    document.documentElement.style.setProperty('--vh', `${window.innerHeight/100}px`);
+    setViewClass();
+    window.addEventListener("resize", onWinResizeDebounced);
+  };
+
+  const init = () => {
+    document.addEventListener("DOMContentLoaded", onDOMContentLoaded);
+  };
+
+  const scrollToSong = () => {
+    requestAnimationFrame(() => { 
+      const playlistEl = document.getElementById('playlist');
+      const nowPlayingBtn = document.getElementById('now-playing-tab-btn');
+      if (playlistEl !== null && ( (App.getView() === App.Views.SMALL && nowPlayingBtn.classList.contains('selected-tab')) || (App.getView() !== App.Views.SMALL) )) {
+        const playItem = playlistEl.getElementsByClassName('playing')[0];
+        if (playItem) {
+          playItem.scrollIntoViewIfNeeded();
+        }
+      }
+    });
+  };
+
+  return {
+    init,
+    getView,
+    Views,
+    scrollToSong
+  };
+})();
+
+App.init();
 
 function toggleSideMenu() {
   document.getElementById("sidenav-cover").classList.toggle("click-through");
@@ -30,12 +102,6 @@ function closeSideMenu() {
   }
 }
 
-document.documentElement.style.setProperty('--vh', `${window.innerHeight/100}px`);
-window.addEventListener("resize", () => {
-  document.documentElement.style.setProperty('--vh', `${window.innerHeight/100}px`);
-});
-
-
 function changeView(fn, el){
   const elements = document.querySelectorAll('.side-nav-item'); // or:
   elements.forEach(elm => {
@@ -50,10 +116,7 @@ function changeView(fn, el){
 }
 
 function toggleThing(el, bool) {
-  document.querySelectorAll('.m-tab').forEach(elm => {
-    elm.classList.remove("selected-tab")
-  });
-
+  el.parentElement.children.forEach(el => el.classList.remove("selected-tab"));
   el.classList.add("selected-tab");
 
   if (bool === false) {
@@ -61,4 +124,6 @@ function toggleThing(el, bool) {
   }else {
     document.getElementById('browser').classList.remove('hide-on-small-only');
   }
+
+  App.scrollToSong();
 }
