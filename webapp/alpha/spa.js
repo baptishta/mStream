@@ -58,7 +58,7 @@ const App = (function() {
       if (playlistEl !== null && ( (App.getView() === App.Views.SMALL && nowPlayingBtn.classList.contains('selected-tab')) || (App.getView() !== App.Views.SMALL) )) {
         const playItem = playlistEl.getElementsByClassName('playing')[0];
         if (playItem) {
-          playItem.scrollIntoViewIfNeeded();
+          typeof playItem.scrollIntoViewIfNeeded === "function" && playItem.scrollIntoViewIfNeeded();
         }
       }
     });
