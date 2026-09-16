@@ -143,8 +143,8 @@
         <div class="hystmodal__styled">
           <h5>Save Playlist</h5>
           <form action="javascript:savePlaylist()">
-            <input id="playlist_name" autocomplete="off" type="text" required placeholder="Enter your playlist name" pattern="[a-zA-Z0-9 _-]+">
-            <input id="save_playlist" type="submit" class="btn green" value="Save Playlist">
+            <input id="playlist_name" autocomplete="off" type="text" required placeholder="Enter your playlist name" pattern="[a-zA-Z0-9\s_-]+" />
+            <input id="save_playlist" type="submit" class="btn green" value="Save Playlist" />
           </form>
         </div>
       </div>
@@ -231,7 +231,7 @@
         <div class="hystmodal__styled">
           <h5>New Playlist</h5>
           <form id="newPlaylistForm" action="javascript:newPlaylist()">
-            <input autocomplete="off" id="new_playlist_name" type="text" required placeholder="Enter your playlist name" pattern="[a-zA-Z0-9 _-]+">
+            <input autocomplete="off" id="new_playlist_name" type="text" required placeholder="Enter your playlist name" pattern="[a-zA-Z0-9\s_\-]+">
             <input id="new_playlist" type="submit" class="btn green" value="Create Playlist">
           </form>
         </div>
@@ -363,6 +363,10 @@
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" height="24" width="24" fill="#FFF"><path d="M0 0h24v24H0z" fill="none"/><path d="M3 3h8v8H3zm10 0h8v8h-8zM3 13h8v8H3zm15 0h-2v3h-3v2h3v3h2v-3h3v-2h-3z"/></svg>
       <span>Layout</span>
     </div>
+    <div id="debug-side-link" class="side-nav-item my-waves" onclick="">
+      <input type="checkbox" id="debug-mode-checkbox" tabindex="-1" onchange="App.toggleDebugMode(this.checked)" />
+      <label for="debug-mode-checkbox" id="debug-mode-checkbox-label">Debug Mode</label>
+    </div>
     <!-- <div class="side-nav-item my-waves" onclick="changeView(advancedConfig, this);">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" height="24" width="24" fill="#FFF"><path d="M0 0h24v24H0z" fill="none"/><path d="M3 3h8v8H3zm10 0h8v8h-8zM3 13h8v8H3zm15 0h-2v3h-3v2h3v3h2v-3h3v-2h-3z"/></svg>
       <span>Config</span>
@@ -396,13 +400,13 @@
 
     <!-- Song Info -->
     <div class="row row-y" id="mstream-player">
-      <div class="col s12 m4 l3 h100-res">
+      <div id="playback-controls-wrapper" class="col s12 m4 l3 h100-res">
         <div class="card aa-card">
-          <div v-if="altLayout.moveMeta === false" class="card-image hide-on-small-only">
+          <div v-if="altLayout.moveMeta === false" id="song-image" class="card-image hide-on-small-only">
             <img class="pointer" :src="albumArtPath" v-on:click="getSongInfo" />
           </div>
 
-          <div class="card-action">
+          <div id="playback-controls" class="card-action">
             <div class="row row-mod">
               <div v-on:click="previousSong" class="col s4 pointer">
                 <svg xmlns="http://www.w3.org/2000/svg" height="28" width="100%" viewBox="0 0 24 24"><path d="M0 0h24v24H0z" fill="none"/><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg>
@@ -419,8 +423,8 @@
 
         </div>
       </div>
-      <div class="col s12 m8 l9">
-        <div v-if="altLayout.moveMeta === false" class="card data-card hide-on-small-only">
+      <div id="song-controls" class="col s12 m8 l9">
+        <div v-if="altLayout.moveMeta === false" id="song-data" class="card data-card hide-on-small-only">
           <div class="card-content">
             <p>
               <b>Title:</b>
@@ -486,33 +490,36 @@
       </div>
     </div>
 
-    <div class="col-z hide-on-med-and-up flex">
-      <div id="file-explorer-tab-btn" onclick="toggleThing(this, true);" class="m-tab selected-tab panel_one_name">
+    <div id="content-tab-btns" class="col-z hide-on-med-and-up flex">
+      <div id="file-explorer-tab-btn" onclick="toggleThing(this, 'browser');" class="m-tab selected-tab panel_one_name">
         File Explorer
       </div>
-      <div id="now-playing-tab-btn" onclick="toggleThing(this, false);" class="m-tab">
-        Now Playing
+      <div id="now-playing-tab-btn" onclick="toggleThing(this, 'playlist');" class="m-tab">
+        Playlist
       </div>
     </div>
 
-    <div class="row row-x grow">
-      <div id="browser" class="col col-x s12 m6 h1 flex-x">
-        <div class="header-tab hide-on-small-only">
-          <h5 class="panel_one_name">File Explorer</h5>
+    <div id="content-lists">
+      <div id="browser" class="content-list selected-content-tab">
+        <div id="file-explorer-title" class="header-tab hide-on-small-only">
+          <h5 class="panel_one_name content-list-title">File Explorer</h5>
         </div>
         <div id="directory_bar" class="level-2 flex">
-          <svg onclick="onBackButton();" class="pointer" xmlns="http://www.w3.org/2000/svg" height="24" width="24"><path d="M0 0h24v24H0z" fill="none"/><path fill="#FFF" d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
-          <svg xmlns="http://www.w3.org/2000/svg" id="local_search_btn" class="pointer" onclick="onSearchButtonClick();" height="24" width="24"><path d="M0 0h24v24H0z" fill="none"/><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+          <svg id="browser-back-btn" onclick="onBackButton();" class="pointer" xmlns="http://www.w3.org/2000/svg" height="24" width="24"><path d="M0 0h24v24H0z" fill="none"/><path fill="#FFF" d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
+          <div id="local_search_btn" class="pointer" onclick="onSearchButtonClick();">
+            <svg xmlns="http://www.w3.org/2000/svg" id="local_search_default_icon"  width="24" height="24"><path d="M0 0h24v24H0z" fill="none"/><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+            <svg xmlns="http://www.w3.org/2000/svg" id="local_search_close_icon" class="super-hide" width="24" height="24" viewBox="11 11 26 26"><g fill="#FFF"><path d="M32.662 15.338c-4.784-4.784-12.54-4.784-17.324 0s-4.784 12.54 0 17.324 12.54 4.784 17.324 0c4.783-4.784 4.784-12.54 0-17.324zm-5.127 14.318a.5.5 0 0 1-.707 0L24 26.828l-2.828 2.828a.5.5 0 0 1-.707 0l-2.121-2.121a.5.5 0 0 1 0-.707L21.172 24l-2.828-2.828a.5.5 0 0 1 0-.707l2.121-2.121a.5.5 0 0 1 .707 0L24 21.172l2.828-2.828a.5.5 0 0 1 .707 0l2.121 2.121a.5.5 0 0 1 0 .707L26.828 24l2.828 2.828a.5.5 0 0 1 0 .707l-2.121 2.121z"></path></g></svg>
+          </div>
           <div id="directoryName" class=""></div>
           <div id="search_folders" class="super-hide">
-            <input id="localSearchBar" onkeyup="runLocalSearch(this)" type="text" placeholder="Search List" autocomplete="off">
+            <input id="localSearchBar" onkeyup="runLocalSearchDebounced(this)" type="text" placeholder="Search List" autocomplete="off">
           </div>
-          <svg onclick="addAll();" class="pointer" xmlns="http://www.w3.org/2000/svg" height="24" width="24"><path d="M0 0h24v24H0V0z" fill="none"/><path d="M21 3H3c-1.11 0-2 .89-2 2v12a2 2 0 0 0 2 2h5v2h8v-2h5c1.1 0 1.99-.9 1.99-2L23 5a2 2 0 0 0-2-2zm0 14H3V5h18v12zm-5-7v2h-3v3h-2v-3H8v-2h3V7h2v3h3z"/></svg>
+          <svg id="browser-add-all-btn" onclick="addAll();" class="pointer" xmlns="http://www.w3.org/2000/svg" height="24" width="24"><path d="M0 0h24v24H0V0z" fill="none"/><path d="M21 3H3c-1.11 0-2 .89-2 2v12a2 2 0 0 0 2 2h5v2h8v-2h5c1.1 0 1.99-.9 1.99-2L23 5a2 2 0 0 0-2-2zm0 14H3V5h18v12zm-5-7v2h-3v3h-2v-3H8v-2h3V7h2v3h3z"/></svg>
         </div>
         <div class="upload-progress-bar">
           <div style="width:0%" id="upload-progress-inner" class="upload-progress-inner"></div>
         </div>
-        <div id="filelist">
+        <div id="filelist" class="content-list-scrollable">
           <h4>Welcome To mStream!</h4>
         </div>
         <div style="visibility:hidden; position: absolute;" class="pop-f" id="pop-f" role="tooltip">
@@ -520,10 +527,10 @@
         </div>
       </div>
   
-      <div class="col col-y s12 m6 flex-x h1" id="playlist">
+      <div id="playlist" class="content-list">
         <div class="header-tab">
           <div class="show-on-medium-and-up">
-            <h5>Now Playing</h5>
+            <h5 class="content-list-title">Playlist:</h5>
           </div>
           <div class="flex grow flex-end" id="playlist-buttons">
             <a title="Live Playlist" onclick="openLivePlaylistModal();">
@@ -544,7 +551,7 @@
             </a>
           </div>
         </div>
-        <div id="flip-me" class="flex-x h1"> <!-- Flippable -->
+        <div id="flip-me" class="content-list-scrollable"> <!-- Flippable -->
           <div v-if="altLayout.moveMeta === true" style="background-color: #1a1a1a !important;" class="card card-mod data-card hide-on-small-only">
             <div class="card-content flex">
               <div class="custom-card-img">
@@ -586,15 +593,16 @@
   </div>
 
   <div id="nav-bar">
-    <div>
+    <div style="display: none;">
       <a target="_blank" href="https://github.com/IrosTheBeggar/mStream">Github</a>
     </div>
     <div id="scan-status"></div>
     <div id="scan-status-files"></div>
+    <div id="debug-mode-content"></div>
   </div>
   
-  <div class="fixed-action-btn responsive-hide">
-    <a class="btn-floating btn-large blue-grey darken-1" onclick="toggleSideMenu()">
+  <div id="hamburger-menu" class="fixed-action-btn responsive-hide">
+    <a id="hamburger-btn" class="btn-floating btn-large blue-grey darken-1" onclick="toggleSideMenu()">
       <svg id="sidenav-button" class="ham hamRotate180 ham5" viewBox="0 0 100 100" >
         <path class="line top" d="m 30,33 h 40 c 0,0 8.5,-0.68551 8.5,10.375 0,8.292653 -6.122707,9.002293 -8.5,6.625 l -11.071429,-11.071429" />
         <path class="line middle" d="m 70,50 h -40" />

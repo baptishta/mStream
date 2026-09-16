@@ -256,7 +256,22 @@ async function senddir(root) {
 
   try {
     const response = await MSTREAMAPI.dirparser(directoryString);
-    document.getElementById('directoryName').innerHTML = response.path;
+    // document.getElementById('directoryName').innerHTML = response.path;
+
+    // const formattedPath = response.path.replaceAll("/", "/<wbr>");
+    // document.getElementById('directoryName').innerHTML = formattedPath;
+
+    const arr = response.path.split(/(\/)/);
+    arr.shift();
+    arr.pop();
+    arr.forEach((item, i) => {
+      if (item === "/") {
+        arr[i] = "/<wbr>"
+      }
+    })
+    arr[arr.length-2] = `<span id="directoryName--last">${arr[arr.length-2]}</span>`;
+
+    document.getElementById('directoryName').innerHTML = arr.join("");
 
     if(root === true && response.path.length > 1) {
       fileExplorerArray.push(response.path.replaceAll('/', ''));
@@ -302,6 +317,8 @@ function printdir(response) {
 
   // Post the html to the filelist div
   document.getElementById('filelist').innerHTML = filelist;
+
+  App.setFocusableElements();
 }
 
 function getFileExplorerPath() {
@@ -675,16 +692,40 @@ function downloadFileplaylist(el) {
 }
 
 function onSearchButtonClick() {
-  // Hide Filepath
-  document.getElementById('search_folders').classList.toggle('super-hide');
-  // Show Search Input
-  document.getElementById('directoryName').classList.toggle('super-hide');
+  toggleLocalSearch();
+}
 
-  if (!document.getElementById('search_folders').classList.contains('super-hide')) {
-    document.getElementById("localSearchBar").focus();
-  } else {
-    document.getElementById('localSearchBar').value = '';
-    document.getElementById('localSearchBar').dispatchEvent(new Event('change'));
+function toggleLocalSearch(forceToggle) {
+  const shouldShow = document.getElementById('search_folders').classList.contains('super-hide');
+  const show = typeof forceToggle === "boolean" ? forceToggle : shouldShow;
+
+  const localSearchBar = document.getElementById('localSearchBar');
+  const defaultIcon = document.getElementById("local_search_default_icon");
+  const closeIcon = document.getElementById("local_search_close_icon");
+
+  //show
+  if (show) {   
+    document.getElementById('search_folders').classList.remove('super-hide'); // Show Search Input
+    document.getElementById('directoryName').classList.add('super-hide'); // Hide Filepath
+
+    localSearchBar.focus();
+
+    closeIcon.classList.remove("super-hide");
+    defaultIcon.classList.add("super-hide");
+  } else {  //hide
+    document.getElementById('directoryName').classList.remove('super-hide');  // Show Filepath
+    document.getElementById('search_folders').classList.add('super-hide'); // Hide Search Input
+
+    localSearchBar.value = '';
+    localSearchBar.dispatchEvent(new Event('change'));
+    //Do not execute the search command when forced to hide!
+    if (forceToggle === undefined) {
+      localSearchBar.onkeyup();
+    }
+    localSearchBar.blur();
+
+    defaultIcon.classList.remove("super-hide");
+    closeIcon.classList.add("super-hide");
   }
 }
 
@@ -715,6 +756,8 @@ async function onBackButton() {
   if (backState.state !== 'searchPanel' &&  thisState.previousSearch) {
     document.getElementById('localSearchBar').value = thisState.previousSearch;
     document.getElementById('localSearchBar').dispatchEvent(new Event('keyup'));
+
+    App.setFocusableElements();
   }
 
   // Scroll to position
@@ -749,6 +792,8 @@ async function getAllPlaylists() {
     playlists += '</ul>'
 
     document.getElementById('filelist').innerHTML = playlists;
+
+    App.setFocusableElements();
   }catch (err) {
     document.getElementById('filelist').innerHTML = '<div>Server call failed</div>';
     return boilerplateFailure(err);
@@ -1004,6 +1049,8 @@ async function getAllArtists() {
     artists += '</ul>';
 
     document.getElementById('filelist').innerHTML = artists;
+
+    App.setFocusableElements();
   }catch(err) {
     document.getElementById('filelist').innerHTML = '<div>Server call failed</div>';
     boilerplateFailure(response, error);
@@ -1035,7 +1082,7 @@ async function getArtistsAlbums(artist) {
       })
     });
 
-    let albums = '<ul>';
+    let albums = '<ul class="collection">';
     response.albums.forEach(value => {
       const albumString = value.name ? value.name : 'SINGLES';
       // 'value.name === null ? artist : null' is some clever shit that only passes in artist info when the album is null
@@ -1047,6 +1094,8 @@ async function getArtistsAlbums(artist) {
     albums += '</ul>';
 
     document.getElementById('filelist').innerHTML = albums;
+
+    App.setFocusableElements();
   }catch(err) {
     document.getElementById('filelist').innerHTML = '<div>Server call failed</div>';
     boilerplateFailure(response, error);
@@ -1081,6 +1130,8 @@ async function getAllAlbums() {
     albums += '</ul>'
 
     document.getElementById('filelist').innerHTML = albums;
+
+    App.setFocusableElements();
   }catch (err) {
     document.getElementById('filelist').innerHTML = '<div>Server call failed</div>';
     return boilerplateFailure(err);
@@ -1129,6 +1180,8 @@ async function getAlbumSongs(album, artist, year) {
     files += '</ul>';
 
     document.getElementById('filelist').innerHTML = files;
+
+    App.setFocusableElements();
   }catch(err) {
     document.getElementById('filelist').innerHTML = '<div>Server call failed</div>';
     boilerplateFailure(err);
@@ -1168,7 +1221,9 @@ async function getRatedSongs() {
         value.metadata.artist ? `<span style="font-size:15px;">${value.metadata.artist}</span>` : '');
     });
 
-    document.getElementById('filelist').innerHTML = files;
+    document.getElementById('filelist').innerHTML = `<ul class="collection">${files}</ul>`;
+
+    App.setFocusableElements();
   }catch (err) {
     document.getElementById('filelist').innerHTML = '<div>Server call failed</div>';
     return boilerplateFailure(err);
@@ -1213,6 +1268,8 @@ async function redoRecentlyPlayed() {
     filelist += '</ul>'
   
     document.getElementById('filelist').innerHTML = filelist;
+
+    App.setFocusableElements();
   }catch(err) {
     document.getElementById('filelist').innerHTML = '<div>Server call failed</div>';
     return boilerplateFailure(err);
@@ -1263,6 +1320,8 @@ async function redoMostPlayed() {
     filelist += '</ul>'
   
     document.getElementById('filelist').innerHTML = filelist;
+
+    App.setFocusableElements();
   }catch(err) {
     document.getElementById('filelist').innerHTML = '<div>Server call failed</div>';
     return boilerplateFailure(err);
@@ -1313,6 +1372,8 @@ async function redoRecentlyAdded() {
     filelist += '</ul>'
   
     document.getElementById('filelist').innerHTML = filelist;
+
+    App.setFocusableElements();
   }catch(err) {
     document.getElementById('filelist').innerHTML = '<div>Server call failed</div>';
     return boilerplateFailure(err);
@@ -1573,6 +1634,8 @@ function connectToJukeBox(el) {
 }
 
 //////////////////////// Local Search
+const runLocalSearchDebounced = debounce(runLocalSearch, 100);
+
 function runLocalSearch(el) {
   // Do nothing if we are in the search panel
   if (document.getElementById('db-search')) {
@@ -1607,15 +1670,17 @@ function runLocalSearch(el) {
     }
   });
 
-  document.getElementById('filelist').innerHTML= filelist;
+  document.getElementById('filelist').innerHTML= `<ul class="collection">${filelist}</ul>`;
+
+  App.setFocusableElements();
 }
 
 //////////////////////// Search
 const searchToggles = {
-  albums: true,
-  artists: true,
-  files: false,
-  titles: true
+  albums: false,
+  artists: false,
+  files: true,
+  titles: false
 }
 
 const searchMap = {
@@ -1655,12 +1720,12 @@ function setupSearchPanel(searchTerm) {
 
   document.getElementById('filelist').innerHTML = 
     `<div>
-      <form id="db-search" action="javascript:submitSearchForm()" class="flex">
+      <div id="db-search" class="flex">
         <input ${valString} id="search-term" required type="text" placeholder="Search Database">
-        <!-- <button type="submit" class="searchButton">
+        <button id="search-submit-btn" onclick="submitSearchForm()" class="">
           <svg fill="#DDD" viewBox="-150 -50 1224 1174" height="24px" width="24px" xmlns="http://www.w3.org/2000/svg"><path d="M960 832L710.875 582.875C746.438 524.812 768 457.156 768 384 768 171.969 596 0 384 0 171.969 0 0 171.969 0 384c0 212 171.969 384 384 384 73.156 0 140.812-21.562 198.875-57L832 960c17.5 17.5 46.5 17.375 64 0l64-64c17.5-17.5 17.5-46.5 0-64zM384 640c-141.375 0-256-114.625-256-256s114.625-256 256-256 256 114.625 256 256-114.625 256-256 256z"></path></svg>
-        </button> -->
-      </form>
+        </button>
+      </div>
     </div>
     <div class="flex">
       <label class="grow" for="search-in-artists">
@@ -1726,8 +1791,8 @@ async function submitSearchForm() {
 
         // perform some operation on a value;
         searchList += `<li class="collection-item">
-          <div onclick="${searchMap[key].func}(this);" data-${searchMap[key].data}="${value.filepath ? value.filepath : value.name}" class="${searchMap[key].class} left">
-            <b>${searchMap[key].name}:</b> ${value.name}
+          <div onclick="${searchMap[key].func}(this);" data-${searchMap[key].data}="${value.filepath ? value.filepath : value.name}" class="${searchMap[key].class}">
+            <b>${searchMap[key].name}:&nbsp&nbsp</b><span>${value.name}</span>
           </div>
           ${
             key === 'files' || key === 'title' ? `<div class="song-button-box">
@@ -1750,6 +1815,8 @@ async function submitSearchForm() {
     }
 
     document.getElementById('search-results').innerHTML = searchList;
+
+    App.setFocusableElements();
   }catch(err) {
     boilerplateFailure(err);
   }

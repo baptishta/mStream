@@ -18,10 +18,15 @@ const App = (function() {
   };
   const Views = {
     SMALL: "view--small",
-    MEDIUM: "view--medium"
+    MEDIUM: "view--medium",
+    LARGE: "view--large"
   };
 
-  const getView = () => window.innerWidth <= ViewBreakPoints.SMALL ? Views.SMALL: Views.MEDIUM;
+  const getView = () => {
+    if (window.innerWidth <= ViewBreakPoints.SMALL) { return Views.SMALL; }
+    if (window.innerWidth > ViewBreakPoints.SMALL && window.innerWidth <= ViewBreakPoints.MEDIUM) { return Views.MEDIUM; }
+    else { return Views.LARGE; }
+  }
 
   const setViewClass = () => {
     const view = getView();
@@ -32,18 +37,56 @@ const App = (function() {
     }
   };
 
+  const Orientations = {
+    PORTRAIT: "orientation--portrait",
+    LANDSCAPE: "orientation--landscape"
+  }
+
+  const getOrientation = () => {
+    return window.innerHeight <= 460 ? Orientations.LANDSCAPE : Orientations.PORTRAIT;
+  }
+
+  const setOrientationClass = () => {
+    const orientation = getOrientation();
+    const html = document.documentElement;
+    if (!html.classList.contains(orientation)) {
+      Object.keys(Orientations).forEach(key => html.classList.remove(Orientations[key]));
+      html.classList.add(orientation);
+    }
+  }
+
+  const scrollIntoViewIfNeeded = el => typeof el.scrollIntoViewIfNeeded === "function" && el.scrollIntoViewIfNeeded();
+
+  const keepCollectionItemInView = (element) => {
+    if (!element.classList.contains("collection-item")) { return false; }
+
+    const container = document.getElementById("filelist").getElementsByClassName("collection")[0];
+    if (container instanceof HTMLElement === false) { return false; }
+
+    const containerRect = container.getBoundingClientRect();
+    const elementRect = element.getBoundingClientRect();
+
+    if (elementRect.top < containerRect.top) {
+      container.scrollTop -= containerRect.top - elementRect.top;
+    } else if (elementRect.bottom > containerRect.bottom) {
+      container.scrollTop += elementRect.bottom - containerRect.bottom;
+    }
+    return container.scrollTop;
+  }
+
   const onWinResize = e => {
-    document.documentElement.style.setProperty('--vh', `${window.innerHeight/100}px`);
+    // document.documentElement.style.setProperty('--vh', `${window.innerHeight/100}px`); // commented by baptishta
     setViewClass();
+    setOrientationClass();
     // console.log(getView());
   };
   const onWinResizeDebounced = debounce(onWinResize, 50);
 
   const onDOMContentLoaded = e => {
     document.getElementById("sidenav-cover").addEventListener("click", toggleSideMenu);
-  
-    document.documentElement.style.setProperty('--vh', `${window.innerHeight/100}px`);
+    // document.documentElement.style.setProperty('--vh', `${window.innerHeight/100}px`); // commented by baptishta
     setViewClass();
+    setOrientationClass();
     window.addEventListener("resize", onWinResizeDebounced);
   };
 
@@ -58,17 +101,110 @@ const App = (function() {
       if (playlistEl !== null && ( (App.getView() === App.Views.SMALL && nowPlayingBtn.classList.contains('selected-tab')) || (App.getView() !== App.Views.SMALL) )) {
         const playItem = playlistEl.getElementsByClassName('playing')[0];
         if (playItem) {
-          typeof playItem.scrollIntoViewIfNeeded === "function" && playItem.scrollIntoViewIfNeeded();
+          scrollIntoViewIfNeeded(playItem);
         }
       }
     });
   };
 
+  const toggleDebugMode = (checked) => {
+    const debugContentEl = document.getElementById("debug-mode-content");
+    if (checked) {
+      debugContentEl.innerHTML = `<div>window.innerWidth: ${window.innerWidth}; window.innerHeight: ${window.innerHeight};</div>`
+      const contentListEl = document.createElement("ol");
+      contentListEl.setAttribute("id", "debug-content-list");
+      debugContentEl.appendChild(contentListEl);
+      window.addEventListener("keydown", keyEventDebug);
+    } else {
+      debugContentEl.innerHTML = "";
+      window.removeEventListener("keydown", keyEventDebug);
+    }
+  }
+
+  const keyEventDebug = e => {
+    const contentListEl = document.getElementById("debug-content-list");
+
+    const content = document.createElement("li");
+    contentListEl.appendChild(content);
+    content.innerHTML = `event.key: "${e.key}"; event.code: "${e.code}"; event.keyCode: "${e.keyCode}";`;
+
+    const navBarEl = document.getElementById("nav-bar");
+    navBarEl.scrollTop = navBarEl.scrollHeight;
+  }
+
+  let focusedEl = undefined;
+  let focusableElements = [];
+
+  //called by functions after rendering HTML
+  const setFocusableElements = () => {
+    const backBtn = document.getElementById("browser-back-btn");
+    const addAllBtn = document.getElementById("browser-add-all-btn");
+    const fileListCollection = document.getElementById("filelist").getElementsByClassName("collection")[0];
+
+    focusableElements = [backBtn, addAllBtn];
+
+    if (fileListCollection !== undefined && fileListCollection.children.length > 0) {
+      focusableElements.push(...fileListCollection.children);
+
+      if (focusedEl !== backBtn) {
+        focusOnBrowserEl("", fileListCollection.children[0]); //focus on the first li.collection-item
+      }
+    }
+  }
+
+  const focusOnBrowserEl = (action, element) => {
+    if (focusableElements.length === 0) { return false; }
+
+    const focusedElIndex = focusableElements.indexOf(focusedEl)
+
+    if (element instanceof HTMLElement) {
+      focusedEl !== undefined && focusedEl.classList.remove("focused-element");
+      focusedEl = element;
+      focusedEl.classList.add("focused-element");
+      return focusedEl;
+    }
+
+    if (action === "prev" && focusedElIndex > 0) {
+      focusedEl.classList.remove("focused-element");
+      focusedEl = focusableElements[focusedElIndex - 1];
+      focusedEl.classList.add("focused-element");
+      // scrollIntoViewIfNeeded(focusedEl);
+      keepCollectionItemInView(focusedEl);
+      return focusedEl;
+    }
+
+    if (action === "next" && focusedElIndex < (focusableElements.length - 1)) {
+      focusedEl.classList.remove("focused-element");
+      focusedEl = focusableElements[focusedElIndex + 1];
+      focusedEl.classList.add("focused-element");
+      // scrollIntoViewIfNeeded(focusedEl);
+      keepCollectionItemInView(focusedEl);
+      return focusedEl;
+    }
+    return false;
+  };
+
+  const clickOnFocusedEl = () => {
+    if (typeof focusedEl.onclick === "function") {
+      focusedEl.onclick();
+    } else {
+      const onclickChildren = [];
+      focusedEl.children.forEach(el => typeof el.onclick === "function" && onclickChildren.push(el));
+      onclickChildren[0] !== undefined && onclickChildren[0].onclick();
+    }
+  }
+
   return {
     init,
     getView,
     Views,
-    scrollToSong
+    scrollToSong,
+    toggleDebugMode,
+    focusOnBrowserEl, //Arrows keydown event
+    clickOnFocusedEl, //Enter keydown event
+    getFocusedEl: () => focusedEl,
+    getFocusableElements: () => focusableElements,
+    setFocusableElements
   };
 })();
 
@@ -112,18 +248,21 @@ function changeView(fn, el){
 
   // close nav on mobile
   closeSideMenu();
+
+  toggleLocalSearch(false);
+
   fn();
 }
 
-function toggleThing(el, bool) {
+function toggleThing(el, tabElId) {
+  if (el.classList.contains("selected-tab")) { return; }
+
   el.parentElement.children.forEach(el => el.classList.remove("selected-tab"));
   el.classList.add("selected-tab");
 
-  if (bool === false) {
-    document.getElementById('browser').classList.add('hide-on-small-only');
-  }else {
-    document.getElementById('browser').classList.remove('hide-on-small-only');
-  }
+  const contentListsEl = document.getElementById("content-lists");
+  contentListsEl.children.forEach(el => el.classList.remove("selected-content-tab"));
+  document.getElementById(tabElId).classList.add("selected-content-tab");
 
   App.scrollToSong();
 }

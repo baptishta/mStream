@@ -32,3 +32,6 @@ frp/*.ini
 dist/*
 
 .env
+
+mstream-ssl.crt
+mstream-ssl.key

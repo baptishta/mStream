@@ -501,8 +501,20 @@ const VUEPLAYERCORE = (() => {
   // Change spacebar behavior to Play/Pause
   window.addEventListener("keydown", (event) => {
     // Use default behavior if user is in a form
-    const element = event.target.tagName.toLowerCase();
-    if (element === 'input' || element === 'textarea') {
+    const elementTag = event.target.tagName.toLowerCase();
+    if (elementTag === 'input') {
+      if (event.key === "Enter") {
+        if (event.target.id === "localSearchBar") {
+          event.target.blur();
+        }
+        if (event.target.id === "search-term") {
+          submitSearchForm();
+          event.target.blur();
+        }
+      }
+      return;
+    }
+    if (elementTag === 'textarea') {
       return;
     }
 
@@ -511,6 +523,26 @@ const VUEPLAYERCORE = (() => {
       case " ": //SpaceBar
         event.preventDefault();
         MSTREAMPLAYER.playPause();
+        break;
+      case "ArrowUp":
+        event.preventDefault();
+        App.focusOnBrowserEl("prev");
+        break;
+      case "ArrowDown":
+        event.preventDefault();
+        App.focusOnBrowserEl("next");
+        break;
+      case "ArrowLeft":
+        event.preventDefault();
+        App.focusOnBrowserEl("prev");
+        break;
+      case "ArrowRight":
+        event.preventDefault();
+        App.focusOnBrowserEl("next");
+        break;
+      case "Enter":
+        event.preventDefault();
+        App.clickOnFocusedEl();
         break;
     }
   }, false);
