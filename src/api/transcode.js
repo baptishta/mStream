@@ -1,85 +1,52 @@
-import path from 'path';
-import ffbinaries from 'ffbinaries';
-import ffmpeg from 'fluent-ffmpeg';
+import { spawn } from 'child_process';
+import { Readable } from 'stream';
 import winston from 'winston';
 import * as vpath from '../util/vpath.js';
 import * as config from '../state/config.js';
-import { Readable } from 'stream';
-
-const platform = ffbinaries.detectPlatform();
+import * as db from '../db/manager.js';
+import { ensureFfmpeg, ffmpegBin, startAutoUpdate, stopAutoUpdate } from '../util/ffmpeg-bootstrap.js';
 
 const codecMap = {
-  'mp3': { codec: 'libmp3lame', contentType: 'audio/mpeg' },
-  'opus': { codec: 'libopus', contentType: 'audio/ogg' },
-  'aac': { codec: 'aac', contentType: 'audio/aac' }
+  'mp3':  { codec: 'libmp3lame', format: 'mp3',  contentType: 'audio/mpeg' },
+  'opus': { codec: 'libopus',    format: 'ogg',  contentType: 'audio/ogg' },
+  'aac':  { codec: 'aac',        format: 'adts', contentType: 'audio/aac' }
 };
 
-const algoSet = new Set(['buffer', 'stream']);
-const bitrateSet = new Set(['64k', '128k', '192k', '96k']);
+const bitrateSet = new Set(['64k', '96k', '128k', '192k']);
 
-export function getTransAlgos() {
-  return Array.from(algoSet);
-}
-
-export function getTransBitrates() {
-  return Array.from(bitrateSet);
-}
-
-export function getTransCodecs() {
-  return Object.keys(codecMap);
-}
-
-function initHeaders(res, audioTypeId, contentLength) {
-  const contentType = codecMap[audioTypeId].contentType;
-  return res.header({
-    'Accept-Ranges': 'bytes',
-    'Content-Type': contentType,
-    'Content-Length': contentLength
-  });
-}
+export function getTransAlgos() { return ['buffer', 'stream']; } // kept for config schema compat
+export function getTransBitrates() { return Array.from(bitrateSet); }
+export function getTransCodecs() { return Object.keys(codecMap); }
 
 let lockInit = false;
-let isDownloading = false;
+let ffmpegPath = null;
 
-function init() {
-  return new Promise((resolve, reject) => {
-    // if (lockInit === true) { resolve(); }
-    if (isDownloading === true) { reject('Download In Progress'); }
-    isDownloading = true;
-    winston.info('Checking ffmpeg...');
-    ffbinaries.downloadFiles(
-      ["ffmpeg", "ffprobe"],
-      { platform: platform, quiet: true, destination: config.program.transcode.ffmpegDirectory },
-      (err, _data) => {
-        isDownloading = false;
-        if (err) { return reject(err); }
+async function init() {
+  winston.info('Checking ffmpeg...');
+  await ensureFfmpeg();
 
-        try {
-          winston.info('FFmpeg OK!');
-          const ffmpegPath = path.join(config.program.transcode.ffmpegDirectory, ffbinaries.getBinaryFilename("ffmpeg", platform));
-          const ffprobePath = path.join(config.program.transcode.ffmpegDirectory, ffbinaries.getBinaryFilename("ffprobe", platform));
-          ffmpeg.setFfmpegPath(ffmpegPath);
-          ffmpeg.setFfprobePath(ffprobePath);
-          lockInit = true;
-          resolve();
-        } catch (innerErr) {
-          reject(innerErr);
-        }
-      }
-    );
-  });
+  ffmpegPath = ffmpegBin();
+
+  const { access } = await import('node:fs/promises');
+  try {
+    await access(ffmpegPath);
+  } catch {
+    throw new Error(`FFmpeg binary not found at ${ffmpegPath}`);
+  }
+
+  lockInit = true;
+  winston.info('FFmpeg OK!');
+  startAutoUpdate();
 }
 
 export function reset() {
   lockInit = false;
+  ffmpegPath = null;
+  stopAutoUpdate();
 }
 
 export function isEnabled() {
-  if (lockInit === true && config.program.transcode.enabled === true) {
-    return true;
-  }
-
-  return false;
+  return lockInit === true && config.program.transcode.enabled === true;
 }
 
 export function isDownloaded() {
@@ -90,87 +57,148 @@ export async function downloadedFFmpeg() {
   await init();
 }
 
-const transCache = {};
-function ffmpegIt(pathInfo, codec, bitrate) {
-  return ffmpeg(pathInfo.fullPath)
-    .noVideo()
-    .format(codec)
-    .audioCodec(codecMap[codec].codec)
-    .audioBitrate(bitrate)
-    .on('end', () => {
-      winston.info('FFmpeg: file has been converted successfully');
-    })
-    .on('error', err => {
-      winston.error('Transcoding Error!', { stack: err });
-      winston.error(pathInfo.fullPath);
-    });
+// ── Transcode cache ─────────────────────────────────────────────────────────
+// Two-phase: strong reference for (song length + 2 min), then moved to weak.
+// Only one copy in memory at a time. GC can reclaim weak entries under pressure.
+
+const strongRefs = new Map();
+const weakRefs = {};
+
+function cacheGet(key) {
+  const strong = strongRefs.get(key);
+  if (strong) return strong;
+  const weak = weakRefs[key]?.deref();
+  if (!weak) delete weakRefs[key];
+  return weak || null;
 }
+
+function cacheSet(key, entry, durationSec) {
+  strongRefs.set(key, entry);
+  const holdMs = (durationSec * 1000) + 120000; // song length + 2 minutes
+  setTimeout(() => {
+    strongRefs.delete(key);
+    weakRefs[key] = new WeakRef(entry);
+  }, holdMs);
+}
+
+// ── Spawn ffmpeg ────────────────────────────────────────────────────────────
+
+function spawnTranscode(inputPath, codec, bitrate) {
+  const entry = codecMap[codec];
+  const args = [
+    '-i', inputPath,
+    '-vn',                          // no video
+    '-f', entry.format,             // output container format
+    '-acodec', entry.codec,         // audio codec
+    '-ab', bitrate,                 // audio bitrate
+    'pipe:1'                        // output to stdout
+  ];
+
+  const proc = spawn(ffmpegPath, args, {
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  proc.stderr.on('data', () => {}); // suppress ffmpeg stderr
+
+  proc.on('error', err => {
+    winston.error('Transcoding spawn error', { stack: err });
+  });
+
+  return proc;
+}
+
+// ── Route ───────────────────────────────────────────────────────────────────
 
 export function setup(mstream) {
   if (config.program.transcode.enabled === true) {
     init().catch(err => {
-      winston.error('Failed to download FFmpeg', { stack: err })
+      winston.error('Failed to initialize FFmpeg', { stack: err });
     });
   }
 
-  mstream.all("/transcode/{*filepath}", (req, res) => {
+  mstream.get("/transcode/{*filepath}", (req, res) => {
     if (!config.program.transcode || config.program.transcode.enabled !== true) {
       return res.status(500).json({ error: 'transcoding disabled' });
     }
-
     if (lockInit !== true) {
       return res.status(500).json({ error: 'transcoding disabled' });
     }
 
     const codec = codecMap[req.query.codec] ? req.query.codec : config.program.transcode.defaultCodec;
-    const algo = algoSet.has(req.query.algo) ? req.query.algo : config.program.transcode.algorithm;
     const bitrate = bitrateSet.has(req.query.bitrate) ? req.query.bitrate : config.program.transcode.defaultBitrate;
 
-    const pathInfo = vpath.getVPathInfo(req.params.filepath, req.user);
+    // Express 5 {*filepath} returns an array — join back to a path string
+    const filepath = Array.isArray(req.params.filepath)
+      ? req.params.filepath.join('/')
+      : req.params.filepath;
+    const pathInfo = vpath.getVPathInfo(filepath, req.user);
 
-    // Stream audio data
-    if (req.method === 'GET') {
+    const cacheKey = `${pathInfo.fullPath}|${bitrate}|${codec}`;
 
-      // check cache
-      if (transCache[`${pathInfo.fullPath}|${bitrate}|${codec}`]) {
-        const t = transCache[`${pathInfo.fullPath}|${bitrate}|${codec}`].deref();
-        if (t!== undefined) {
-          initHeaders(res, codec, t.contentLength);
-          Readable.from(t.bufs).pipe(res);
-          return;
-        }
-      }
-
-      if (algo === 'stream') {
-        return ffmpegIt(pathInfo, codec, bitrate).pipe(res);
-      }
-
-      const bufs = [];
-      let contentLength = 0;
-      const ffstream = ffmpegIt(pathInfo, codec, bitrate).pipe();
-
-      ffstream.on('data', (chunk) => {
-        bufs.push(chunk);
-        contentLength += chunk.length;
+    // ── Cache hit ────────────────────────────────────────────
+    const cached = cacheGet(cacheKey);
+    if (cached) {
+      res.header({
+        'Accept-Ranges': 'bytes',
+        'Content-Type': codecMap[codec].contentType,
+        'Content-Length': cached.contentLength
       });
-
-      ffstream.on('end', (_chunk) => {
-        // const contentLength = bufs.reduce((sum, buf) => {
-        //   return sum + buf.length;
-        // }, 0);
-        initHeaders(res, codec, contentLength);
-
-        transCache[`${pathInfo.fullPath}|${bitrate}|${codec}`] = new WeakRef({
-          contentLength, bufs
-        });
-        Readable.from(bufs).pipe(res);
-      });
-
-    // } else if (req.method === 'HEAD') {
-    //   // The HEAD request should return the same headers as the GET request, but not the body
-    //   initHeaders(res, codec, pathInfo.fullPath).sendStatus(200);
-    } else {
-      res.sendStatus(405); // Method not allowed
+      Readable.from(cached.bufs).pipe(res);
+      return;
     }
+
+    // ── Look up duration for Content-Length estimate ──────────
+    const lib = db.getLibraryByName(pathInfo.vpath);
+    let duration = 0;
+    if (lib) {
+      const track = db.getDB()?.prepare(
+        'SELECT duration FROM tracks WHERE filepath = ? AND library_id = ?'
+      ).get(pathInfo.relativePath, lib.id);
+      duration = track?.duration || 0;
+    }
+
+    const bitrateNum = parseInt(bitrate) * 1000; // '96k' → 96000
+    const estimatedBytes = duration > 0
+      ? Math.ceil(duration * bitrateNum / 8 * 1.05) // 5% container overhead
+      : 0;
+
+    // ── Set headers ──────────────────────────────────────────
+    const headers = { 'Content-Type': codecMap[codec].contentType };
+    if (estimatedBytes > 0) {
+      headers['Content-Length'] = estimatedBytes;
+      headers['Accept-Ranges'] = 'bytes';
+    }
+    res.header(headers);
+
+    // ── Stream + collect for cache ───────────────────────────
+    const proc = spawnTranscode(pathInfo.fullPath, codec, bitrate);
+    const bufs = [];
+    let contentLength = 0;
+
+    proc.stdout.on('data', chunk => {
+      bufs.push(chunk);
+      contentLength += chunk.length;
+    });
+
+    // Stream to client immediately
+    proc.stdout.pipe(res);
+
+    proc.on('close', code => {
+      if (code !== 0 && code !== null) {
+        winston.error(`FFmpeg exited with code ${code} for ${pathInfo.fullPath}`);
+        return;
+      }
+      // Cache the result — strong for song length + 2 min, then weak
+      if (contentLength > 0) {
+        cacheSet(cacheKey, { contentLength, bufs }, duration);
+      }
+    });
+
+    // Kill ffmpeg if client disconnects mid-stream
+    res.on('close', () => {
+      if (!proc.killed) {
+        proc.kill('SIGTERM');
+      }
+    });
   });
 }

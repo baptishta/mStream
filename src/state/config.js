@@ -18,12 +18,16 @@ const storageJoi = Joi.object({
 const scanOptions = Joi.object({
   skipImg: Joi.boolean().default(false),
   scanInterval: Joi.number().min(0).default(24),
-  saveInterval: Joi.number().default(250),
-  pause: Joi.number().min(0).default(0),
   bootScanDelay: Joi.number().default(3),
   maxConcurrentTasks: Joi.number().integer().min(1).default(1),
   compressImage: Joi.boolean().default(true),
-  rustParser: Joi.boolean().default(false)
+  scanBatchSize: Joi.number().integer().min(1).default(100),
+  autoAlbumArt: Joi.boolean().default(true),
+  albumArtWriteToFolder: Joi.boolean().default(false),
+  albumArtWriteToFile: Joi.boolean().default(false),
+  albumArtServices: Joi.array().items(
+    Joi.string().valid('musicbrainz', 'itunes', 'deezer')
+  ).default(['musicbrainz', 'itunes', 'deezer'])
 });
 
 const dbOptions = Joi.object({
@@ -31,7 +35,7 @@ const dbOptions = Joi.object({
 });
 
 const transcodeOptions = Joi.object({
-  algorithm: Joi.string().valid(...getTransAlgos()).default('stream'),
+  algorithm: Joi.string().valid(...getTransAlgos()).optional(), // deprecated — kept for config compat
   enabled: Joi.boolean().default(false),
   ffmpegDirectory: Joi.string().default(path.join(__dirname, '../../bin/ffmpeg')),
   defaultCodec: Joi.string().valid(...getTransCodecs()).default('opus'),
@@ -52,6 +56,13 @@ const lastFMOptions = Joi.object({
   apiSecret: Joi.string().default('a9df934fc504174d4cb68853d9feb143')
 });
 
+const discogsOptions = Joi.object({
+  enabled: Joi.boolean().default(false),
+  allowArtUpdate: Joi.boolean().default(false),
+  apiKey: Joi.string().allow('').default(''),
+  apiSecret: Joi.string().allow('').default(''),
+});
+
 const federationOptions = Joi.object({
   enabled: Joi.boolean().default(false),
   folder: Joi.string().optional(),
@@ -69,12 +80,15 @@ const schema = Joi.object({
     "opus": true, "m3u": false
   }),
   lastFM: lastFMOptions.default(lastFMOptions.validate({}).value),
+  discogs: discogsOptions.default(discogsOptions.validate({}).value),
   scanOptions: scanOptions.default(scanOptions.validate({}).value),
   noUpload: Joi.boolean().default(false),
   noMkdir: Joi.boolean().default(false),
+  noFileModify: Joi.boolean().default(false),
   writeLogs: Joi.boolean().default(false),
   lockAdmin: Joi.boolean().default(false),
   storage: storageJoi.default(storageJoi.validate({}).value),
+  ui: Joi.string().valid('default', 'velvet').default('default'),
   webAppDirectory: Joi.string().default(path.join(__dirname, '../../webapp')),
   rpn: rpnOptions.default(rpnOptions.validate({}).value),
   transcode: transcodeOptions.default(transcodeOptions.validate({}).value),
