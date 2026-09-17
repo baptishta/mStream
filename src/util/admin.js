@@ -254,6 +254,15 @@ exports.editSkipImg = async (val) => {
   config.program.scanOptions.skipImg = val;
 }
 
+exports.editNewScan = async (val) => {
+  const loadConfig = await this.loadFile(config.configFile);
+  if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
+  loadConfig.scanOptions.newScan = val;
+  await this.saveFile(loadConfig, config.configFile);
+
+  config.program.scanOptions.newScan = val;
+}
+
 exports.editPause = async (val) => {
   const loadConfig = await this.loadFile(config.configFile);
   if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
@@ -381,12 +390,12 @@ function testSSL(jsonLoad) {
 }
 
 exports.setSSL = async (cert, key) => {
-    const sslObj = { key, cert };
-    await testSSL(sslObj);
-    const loadConfig = await this.loadFile(config.configFile);
-    loadConfig.ssl = sslObj;
-    await this.saveFile(loadConfig, config.configFile);
-  
-    config.program.ssl = sslObj;
-    mStreamServer.reboot();
+  const sslObj = { key, cert };
+  await testSSL(sslObj);
+  const loadConfig = await this.loadFile(config.configFile);
+  loadConfig.ssl = sslObj;
+  await this.saveFile(loadConfig, config.configFile);
+
+  config.program.ssl = sslObj;
+  mStreamServer.reboot();
 }
