@@ -1,18 +1,18 @@
 const killThese = [];
 
-process.on('exit', code => {
+process.on('exit', _code => {
   // Kill them all
   killThese.forEach(func => {
     if (typeof func === 'function') {
       try {
         func();
-      }catch (err) {
+      } catch (_err) {
         console.log('Error: Failed to run kill function');
       }
     }
   });
 });
 
-exports.addToKillQueue = (func) => {
+export function addToKillQueue(func) {
   killThese.push(func);
 }

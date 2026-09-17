@@ -1,10 +1,15 @@
-const { app, Tray, Menu, shell, dialog } = require('electron');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const mkdirp = require('make-dir');
-const server = require('../src/server');
-const { autoUpdater } = require("electron-updater");
+import { app, Tray, Menu, shell, dialog } from 'electron';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import os from 'os';
+import { makeDirectory } from 'make-dir';
+import * as server from '../src/server.js';
+import pkg from 'electron-updater';
+const { autoUpdater } = pkg;
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 let appIcon;
 let trayTemplate;
@@ -13,27 +18,27 @@ let updateAlertFlag = false;
 const configFile = path.join(app.getPath('userData'), 'save/server-config-v3.json');
 
 if (!fs.existsSync(path.join(app.getPath('userData'), 'image-cache'))) {
-  mkdirp(path.join(app.getPath('userData'), 'image-cache'));
+  makeDirectory(path.join(app.getPath('userData'), 'image-cache'));
 }
 
 if (!fs.existsSync(path.join(app.getPath('userData'), 'save'))) {
-  mkdirp(path.join(app.getPath('userData'), 'save'));
+  makeDirectory(path.join(app.getPath('userData'), 'save'));
 }
 
 if (!fs.existsSync(path.join(app.getPath('userData'), 'db'))) {
-  mkdirp(path.join(app.getPath('userData'), 'db'));
+  makeDirectory(path.join(app.getPath('userData'), 'db'));
 }
 
 if (!fs.existsSync(path.join(app.getPath('userData'), 'logs'))) {
-  mkdirp(path.join(app.getPath('userData'), 'logs'));
+  makeDirectory(path.join(app.getPath('userData'), 'logs'));
 }
 
 if (!fs.existsSync(path.join(app.getPath('userData'), 'sync'))) {
-  mkdirp(path.join(app.getPath('userData'), 'sync'));
+  makeDirectory(path.join(app.getPath('userData'), 'sync'));
 }
 
 if (!fs.existsSync(path.join(app.getPath('userData'), 'ffmpeg'))) {
-  mkdirp(path.join(app.getPath('userData'), 'ffmpeg'));
+  makeDirectory(path.join(app.getPath('userData'), 'ffmpeg'));
 }
 
 process.on('uncaughtException', (error) => {
@@ -56,7 +61,7 @@ function bootServer() {
   let program;
   try {
     program = JSON.parse(fs.readFileSync(configFile));
-  } catch (err) {
+  } catch (_err) {
     fs.writeFileSync(configFile, JSON.stringify({}), 'utf8');
     program = JSON.parse(fs.readFileSync(configFile));
   }
@@ -165,7 +170,7 @@ function toggleBootOnStart() {
   appIcon.setContextMenu(Menu.buildFromTemplate(trayTemplate));
 }
 
-autoUpdater.on('update-available', async (info) => {
+autoUpdater.on('update-available', async (_info) => {
   if (updateAlertFlag === true) {
     updateAlertFlag = false;
     const selected = await dialog.showMessageBox({
@@ -188,7 +193,7 @@ autoUpdater.on('update-available', async (info) => {
   appIcon.setContextMenu(Menu.buildFromTemplate(trayTemplate));
 });
 
-autoUpdater.on('update-not-available', (info) => {
+autoUpdater.on('update-not-available', (_info) => {
   if (updateAlertFlag === true) {
     updateAlertFlag = false;
     dialog.showMessageBox({
@@ -208,7 +213,7 @@ autoUpdater.on('download-progress', (progressObj) => {
   appIcon.setContextMenu(Menu.buildFromTemplate(trayTemplate));
 });
 
-autoUpdater.on('update-downloaded', (info) => {
+autoUpdater.on('update-downloaded', (_info) => {
   if (!trayTemplate) { return; }
 
   trayTemplate[1] = {

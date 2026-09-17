@@ -1,9 +1,9 @@
-import { parseFile } from 'mm-v10';
+import { parseFile } from 'music-metadata';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import Joi from 'joi';
-import { Jimp } from 'jimpv1';
+import { Jimp } from 'jimp';
 import mime from 'mime-types';
 import axios from 'axios';
 import https from 'https';
@@ -14,9 +14,10 @@ const ax = axios.create({
   })
 });
 
+let loadJson;
 try {
-  var loadJson = JSON.parse(process.argv[process.argv.length - 1], 'utf8');
-} catch (error) {
+  loadJson = JSON.parse(process.argv[process.argv.length - 1], 'utf8');
+} catch (_error) {
   console.error(`Warning: failed to parse JSON input`);
   process.exit(1);
 }
@@ -38,10 +39,10 @@ const schema = Joi.object({
   ).required()
 });
 
-const { error, value } = schema.validate(loadJson);
-if (error) {
+const { error: validationError } = schema.validate(loadJson);
+if (validationError) {
   console.error(`Invalid JSON Input`);
-  console.log(error);
+  console.log(validationError);
   process.exit(1);
 }
 
@@ -97,17 +98,19 @@ async function run() {
 }
 
 async function recursiveScan(dir) {
+  let files;
   try {
-    var files = fs.readdirSync(dir);
-  } catch (err) {
+    files = fs.readdirSync(dir);
+  } catch (_err) {
     return;
   }
 
   for (const file of files) {
     const filepath = path.join(dir, file);
+    let stat;
     try {
-      var stat = fs.statSync(filepath);
-    } catch (error) {
+      stat = fs.statSync(filepath);
+    } catch (_error) {
       // Bad file, ignore and continue
       continue;
     }
@@ -228,7 +231,7 @@ async function compressAlbumArt(buff, imgName) {
 }
 
 const mapOfDirectoryAlbumArt = {};
-async function checkDirectoryForAlbumArt(songInfo) {
+function checkDirectoryForAlbumArt(songInfo) {
   const directory = path.join(loadJson.directory, path.dirname(songInfo.filePath));
 
   // album art has already been found
@@ -240,17 +243,19 @@ async function checkDirectoryForAlbumArt(songInfo) {
   if (mapOfDirectoryAlbumArt[directory] === false) { return; }
 
   const imageArray = [];
+  let files;
   try {
-    var files = fs.readdirSync(directory);
-  } catch (err) {
+    files = fs.readdirSync(directory);
+  } catch (_err) {
     return;
   }
 
   for (const file of files) {
     const filepath = path.join(directory, file);
+    let stat;
     try {
-      var stat = fs.statSync(filepath);
-    } catch (error) {
+      stat = fs.statSync(filepath);
+    } catch (_error) {
       // Bad file, ignore and continue
       continue;
     }
@@ -275,7 +280,7 @@ async function checkDirectoryForAlbumArt(songInfo) {
   let newFileFlag = false;
 
   // Search for a named file
-  for (var i = 0; i < imageArray.length; i++) {
+  for (let i = 0; i < imageArray.length; i++) {
     const imgMod = imageArray[i].toLowerCase();
     if (imgMod === 'folder.jpg' || imgMod === 'cover.jpg' || imgMod === 'album.jpg' || imgMod === 'folder.png' || imgMod === 'cover.png' || imgMod === 'album.png') {
       imageBuffer = fs.readFileSync(path.join(directory, imageArray[i]));

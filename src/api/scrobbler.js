@@ -1,21 +1,21 @@
-const crypto = require('crypto');
-const Joi = require('joi');
-const axios = require('axios');
-const config = require('../state/config');
-const scribble = require('../state/lastfm');
-const db = require('../db/manager');
-const { joiValidate } = require('../util/validation');
-const { getVPathInfo } = require('../util/vpath');
+import crypto from 'crypto';
+import Joi from 'joi';
+import axios from 'axios';
+import * as config from '../state/config.js';
+import Scribble from '../state/lastfm.js';
+import * as db from '../db/manager.js';
+import { joiValidate } from '../util/validation.js';
+import { getVPathInfo } from '../util/vpath.js';
 
-const Scrobbler = new scribble();
+const Scrobbler = new Scribble();
 
-exports.setup = (mstream) => {
+export function setup(mstream) {
   Scrobbler.setKeys(config.program.lastFM.apiKey, config.program.lastFM.apiSecret)
 
   for (const user in config.program.users) {
-    if (!config.program.users.hasOwnProperty(user)) { continue; }
+    if (!Object.hasOwn(config.program.users, user)) { continue; }
     if (!config.program.users[user]['lastfm-user'] || !config.program.users[user]['lastfm-password']) { continue; }
-    // TODO: Test Auth and alert user if it doesn't work        
+    // TODO: Test Auth and alert user if it doesn't work
     Scrobbler.addUser(config.program.users[user]['lastfm-user'], config.program.users[user]['lastfm-password']);
   }
 
@@ -35,7 +35,7 @@ exports.setup = (mstream) => {
     Scrobbler.Scrobble(
       req.body,
       req.user['lastfm-user'],
-      (post_return_data) => { res.json({}); }
+      (_post_return_data) => { res.json({}); }
     );
   });
 
@@ -72,7 +72,7 @@ exports.setup = (mstream) => {
       result.pc = result.pc && typeof result.pc === 'number'
         ? result.pc + 1 : 1;
       result.lp = Date.now();
-      
+
       db.getUserMetadataCollection().update(result);
     }
 
@@ -88,7 +88,7 @@ exports.setup = (mstream) => {
           track: dbFileInfo.title
         },
         req.user['lastfm-user'],
-        (post_return_data) => {}
+        (_post_return_data) => {}
       );
     }
   });
@@ -106,12 +106,12 @@ exports.setup = (mstream) => {
 
     await axios({
       method: 'GET',
-      url: `http://ws.audioscrobbler.com/2.0/?method=auth.getMobileSession&username=${req.body.username}&authToken=${token}&api_key=${apiKey1}&api_sig=${hash}`
+      url: `http://ws.audioscrobbler.com/2.0/?method=auth.getMobileSession&username=${req.body.username}&authToken=${token}&api_key=${config.program.lastFM.apiKey}&api_sig=${hash}`
     });
     res.json({});
   });
 }
 
-exports.reset = () => {
+export function reset() {
   Scrobbler.reset();
 }
