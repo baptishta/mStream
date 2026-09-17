@@ -500,7 +500,7 @@ const VUEPLAYERCORE = (() => {
 
   // Change spacebar behavior to Play/Pause
   window.addEventListener("keydown", (event) => {
-    // Use default behavior if user is in a form
+    // Use default behavior if user is in a form or editable element
     const elementTag = event.target.tagName.toLowerCase();
     if (elementTag === 'input') {
       if (event.key === "Enter") {

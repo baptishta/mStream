@@ -22,7 +22,8 @@ const scanOptions = Joi.object({
   pause: Joi.number().min(0).default(0),
   bootScanDelay: Joi.number().default(3),
   maxConcurrentTasks: Joi.number().integer().min(1).default(1),
-  compressImage: Joi.boolean().default(true)
+  compressImage: Joi.boolean().default(true),
+  rustParser: Joi.boolean().default(false)
 });
 
 const dbOptions = Joi.object({
@@ -70,6 +71,7 @@ const schema = Joi.object({
   lastFM: lastFMOptions.default(lastFMOptions.validate({}).value),
   scanOptions: scanOptions.default(scanOptions.validate({}).value),
   noUpload: Joi.boolean().default(false),
+  noMkdir: Joi.boolean().default(false),
   writeLogs: Joi.boolean().default(false),
   lockAdmin: Joi.boolean().default(false),
   storage: storageJoi.default(storageJoi.validate({}).value),
@@ -93,6 +95,8 @@ const schema = Joi.object({
       admin: Joi.boolean().default(false),
       salt: Joi.string().required(),
       vpaths: Joi.array().items(Joi.string()),
+      allowMkdir: Joi.boolean().default(true),
+      allowUpload: Joi.boolean().default(true),
       'lastfm-user': Joi.string().optional(),
       'lastfm-password': Joi.string().optional(),
     })
