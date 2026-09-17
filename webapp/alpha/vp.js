@@ -9,7 +9,9 @@ const VUEPLAYERCORE = (() => {
     'moveMeta': false,
     'audioBookCtrls': false,
     'flipPlayer': false,
-    'compressArt': false
+    'compressArt': false,
+    'hideTopBar': false,
+    'waveformBar': true
   };
 
   try {
@@ -18,10 +20,21 @@ const VUEPLAYERCORE = (() => {
     mstreamModule.altLayout.audioBookCtrls = typeof altLayout.audioBookCtrls === 'boolean' ? altLayout.audioBookCtrls : false;
     mstreamModule.altLayout.moveMeta = typeof altLayout.moveMeta === 'boolean' ? altLayout.moveMeta : false;
     mstreamModule.altLayout.compressArt = typeof altLayout.compressArt === 'boolean' ? altLayout.compressArt : false;
+    mstreamModule.altLayout.hideTopBar = typeof altLayout.hideTopBar === 'boolean' ? altLayout.hideTopBar : false;
+    mstreamModule.altLayout.waveformBar = typeof altLayout.waveformBar === 'boolean' ? altLayout.waveformBar : true;
 
     if (altLayout.flipPlayer === true) {
       document.getElementById('content').classList.add('col-rev');
       document.getElementById('flip-me').classList.add('col-rev');
+    }
+
+    // When the top bar is disabled, mark the body so CSS can:
+    //   - hide #nav-bar
+    //   - show the sidenav logo (its original spot)
+    //   - show the sidenav bottom language picker
+    //   - recompute #content / #sidenav heights
+    if (altLayout.hideTopBar === true) {
+      document.body.classList.add('top-bar-hidden');
     }
   } catch (e) {}
 
@@ -159,7 +172,7 @@ const VUEPLAYERCORE = (() => {
   // Template for playlist items
   Vue.component('playlist-item', {
     template: `
-      <li class="noselect np-queue-item" v-bind:class="{ 'np-queue-active': (this.index === positionCache.val), playError: (this.songError && this.songError === true) }">
+      <li v-on:click="goToSong($event)" class="noselect np-queue-item" v-bind:class="{ 'np-queue-active': (this.index === positionCache.val), playError: (this.songError && this.songError === true) }">
         <span onclick="event.stopPropagation()" class="drag-handle">
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="16" height="16"><path fill="#666" d="M4 7v2h24V7Zm0 8v2h24v-2Zm0 8v2h24v-2Z"/></svg>
         </span>
@@ -167,7 +180,7 @@ const VUEPLAYERCORE = (() => {
         <div v-else class="np-queue-art-placeholder">
           <svg xmlns="http://www.w3.org/2000/svg" height="18" viewBox="0 0 24 24" fill="#555"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
         </div>
-        <div v-on:click="goToSong($event)" class="np-queue-info">
+        <div class="np-queue-info">
           <div class="np-queue-title">{{ songTitle }}</div>
           <div class="np-queue-artist" v-if="songArtist">{{ songArtist }}</div>
         </div>
@@ -358,7 +371,7 @@ const VUEPLAYERCORE = (() => {
     }
   });
 
-  new Vue({
+  const playerVue = new Vue({
     el: '#mstream-player',
     data: {
       playerStats: MSTREAMPLAYER.playerStats,
@@ -367,7 +380,29 @@ const VUEPLAYERCORE = (() => {
       meta: MSTREAMPLAYER.playerStats.metadata,
       lastVol: 100,
       replayGainToggle: false,
-      altLayout: mstreamModule.altLayout
+      altLayout: mstreamModule.altLayout,
+      waveformReady: false
+    },
+    watch: {
+      'meta.filepath': function(newPath) {
+        this.waveformReady = false;
+        if (this.altLayout.waveformBar) {
+          _fetchWaveform(newPath);
+        }
+      },
+      'playerStats.playing': function(isPlaying) {
+        if (!this.altLayout.waveformBar) return;
+        if (isPlaying) {
+          // If waveform not loaded yet (e.g. first play after page load), fetch it
+          if (!_waveformData && this.meta.filepath) {
+            _fetchWaveform(this.meta.filepath);
+          } else if (_waveformData) {
+            _startWaveformRaf();
+          }
+        } else {
+          if (_waveformData) _stopWaveformRaf();
+        }
+      }
     },
     created: function () {
       if (typeof(Storage) !== "undefined") {
@@ -633,6 +668,16 @@ const VUEPLAYERCORE = (() => {
       }
     }
 
+    // Warm the waveform cache in the background so the moment this track
+    // starts playing, the waveform renders from localStorage instead of
+    // a fresh HTTP round-trip (~100-500ms lag otherwise). Concurrency-
+    // capped inside _prefetchWaveform so adding a full album doesn't
+    // hammer the server. Only runs when the setting is actually on —
+    // otherwise the waveform would never render and the fetch is wasted.
+    if (mstreamModule.altLayout.waveformBar) {
+      mstreamModule.prefetchWaveform(rawFilepath);
+    }
+
     // perform lookup
     if (lookupMetadata === true) {
       const response = await MSTREAMAPI.lookupMetadata(rawFilepath);
@@ -654,6 +699,248 @@ const VUEPLAYERCORE = (() => {
       MSTREAMAPI.savePlaylist(mstreamModule.livePlaylist.name,songs, true);
     }
   }
+
+  // ── WAVEFORM ────────────────────────────────────────────────────────────────
+  // Fetches waveform data from the server, caches in localStorage + memory,
+  // and renders a two-pass canvas overlay on the progress bar.
+
+  let _waveformData = null;   // Array of 0-255 bar heights (800 entries)
+  let _waveformFp   = null;   // filepath of the currently loaded waveform
+  let _waveformRaf  = null;   // requestAnimationFrame handle
+  const _WF_LS_PREFIX = 'wf:';
+
+  function _wfLsGet(filepath) {
+    try {
+      const raw = localStorage.getItem(_WF_LS_PREFIX + filepath);
+      if (!raw) return null;
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) && arr.length > 0 ? arr : null;
+    } catch (_e) { return null; }
+  }
+
+  const _WF_LS_MAX = 500; // max cached waveforms in localStorage
+
+  function _wfLsSet(filepath, data) {
+    try {
+      localStorage.setItem(_WF_LS_PREFIX + filepath, JSON.stringify(data));
+    } catch (_e) {
+      // Quota exceeded — evict oldest wf:* entries and retry once
+      _wfLsEvict();
+      try { localStorage.setItem(_WF_LS_PREFIX + filepath, JSON.stringify(data)); }
+      catch (_e2) { /* still full — give up */ }
+    }
+  }
+
+  function _wfLsEvict() {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(_WF_LS_PREFIX)) keys.push(k);
+    }
+    if (keys.length <= _WF_LS_MAX) return;
+    // Remove oldest half — localStorage has no insertion-order guarantee,
+    // so just remove an arbitrary batch to free space
+    const toRemove = keys.slice(0, Math.floor(keys.length / 2));
+    for (const k of toRemove) localStorage.removeItem(k);
+  }
+
+  function _setWaveformReady(val) {
+    if (playerVue) playerVue.waveformReady = val;
+  }
+
+  async function _fetchWaveform(filepath) {
+    // Skip radio/external streams and empty paths
+    if (!filepath || /^https?:\/\//i.test(filepath)) {
+      _waveformData = null;
+      _waveformFp = null;
+      _setWaveformReady(false);
+      _stopWaveformRaf();
+      _drawWaveform();
+      return;
+    }
+
+    // In-memory cache hit
+    if (_waveformFp === filepath && _waveformData) {
+      _setWaveformReady(true);
+      _drawWaveform();
+      if (MSTREAMPLAYER.playerStats.playing) _startWaveformRaf();
+      return;
+    }
+
+    // localStorage cache hit
+    const cached = _wfLsGet(filepath);
+    if (cached) {
+      _waveformData = cached;
+      _waveformFp   = filepath;
+      _setWaveformReady(true);
+      _drawWaveform();
+      if (MSTREAMPLAYER.playerStats.playing) _startWaveformRaf();
+      return;
+    }
+
+    // Clear while loading
+    _waveformData = null;
+    _waveformFp   = null;
+    _setWaveformReady(false);
+    _stopWaveformRaf();
+    _drawWaveform();
+
+    try {
+      const url = MSTREAMAPI.currentServer.host +
+        'api/v1/db/waveform?filepath=' + encodeURIComponent(filepath) +
+        '&token=' + MSTREAMAPI.currentServer.token;
+      const res = await fetch(url);
+      if (!res.ok) return;
+      const d = await res.json();
+      // Guard against track having changed during async fetch
+      if (MSTREAMPLAYER.playerStats.metadata.filepath !== filepath) return;
+      if (d.waveform && d.waveform.length > 0) {
+        _waveformData = d.waveform;
+        _waveformFp   = filepath;
+        _wfLsSet(filepath, d.waveform);
+        _setWaveformReady(true);
+        _drawWaveform();
+        if (MSTREAMPLAYER.playerStats.playing) _startWaveformRaf();
+      }
+    } catch (_e) { /* waveform unavailable — plain bar stays */ }
+  }
+
+  // ── WAVEFORM PREFETCH ──────────────────────────────────────────────────────
+  // Called from addSongWizard when a track is added to the queue. Loads the
+  // waveform into localStorage eagerly so the moment the track starts
+  // playing, `_fetchWaveform` hits the cache and renders instantly —
+  // eliminates the visible lag where the plain progress bar shows for
+  // ~100-500ms before swapping to the waveform.
+  //
+  // Concurrency-capped so "Add All To Queue" on a 52-track album doesn't
+  // fire 52 parallel HTTP requests at the server. Silently ignores:
+  //   - radio/http(s) streams (no waveform on the server side)
+  //   - anything already in-memory or already in localStorage
+  //   - duplicate enqueues (dedup'd by filepath)
+  const _WF_PREFETCH_MAX = 2;
+  const _wfPrefetchQueue = [];
+  const _wfPrefetchSeen = new Set(); // filepaths already queued/done this session
+  let _wfPrefetchActive = 0;
+
+  async function _prefetchWaveform(filepath) {
+    if (!filepath || /^https?:\/\//i.test(filepath)) { return; }
+    if (_wfPrefetchSeen.has(filepath)) { return; }
+    if (_waveformFp === filepath && _waveformData) { return; }  // in memory
+    if (_wfLsGet(filepath)) { return; }                          // localStorage
+    _wfPrefetchSeen.add(filepath);
+    _wfPrefetchQueue.push(filepath);
+    _drainWfPrefetch();
+  }
+
+  function _drainWfPrefetch() {
+    while (_wfPrefetchActive < _WF_PREFETCH_MAX && _wfPrefetchQueue.length) {
+      const filepath = _wfPrefetchQueue.shift();
+      _wfPrefetchActive++;
+      (async () => {
+        try {
+          // Re-check localStorage under the lock — the currently-playing
+          // track's own fetch may have filled the cache while we were
+          // waiting in the concurrency queue.
+          if (_wfLsGet(filepath)) { return; }
+          const url = MSTREAMAPI.currentServer.host +
+            'api/v1/db/waveform?filepath=' + encodeURIComponent(filepath) +
+            '&token=' + MSTREAMAPI.currentServer.token;
+          const res = await fetch(url);
+          if (!res.ok) { return; }
+          const d = await res.json();
+          if (!d.waveform || d.waveform.length === 0) { return; }
+          _wfLsSet(filepath, d.waveform);
+          // If the operator hit Play while we were prefetching, fold this
+          // data straight into the live render instead of waiting for the
+          // currentSong watcher to re-fetch.
+          const liveFp = MSTREAMPLAYER.playerStats.metadata.filepath;
+          if (liveFp === filepath && !_waveformData) {
+            _waveformData = d.waveform;
+            _waveformFp   = filepath;
+            _setWaveformReady(true);
+            _drawWaveform();
+            if (MSTREAMPLAYER.playerStats.playing) { _startWaveformRaf(); }
+          }
+        } catch (_e) { /* swallow — best-effort */ }
+        finally {
+          _wfPrefetchActive--;
+          _drainWfPrefetch();
+        }
+      })();
+    }
+  }
+
+  // Exposed so the queue-add path can trigger prefetch.
+  mstreamModule.prefetchWaveform = _prefetchWaveform;
+
+  function _drawWaveform() {
+    const canvas = document.getElementById('waveform-canvas');
+    if (!canvas) return;
+    const W = canvas.offsetWidth;
+    const H = canvas.offsetHeight;
+    if (W <= 0 || H <= 0) return;
+
+    if (canvas.width !== W)  canvas.width  = W;
+    if (canvas.height !== H) canvas.height = H;
+
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, W, H);
+
+    if (!_waveformData || _waveformData.length === 0) return;
+
+    const data   = _waveformData;
+    const pct    = MSTREAMPLAYER.playerStats.duration > 0
+      ? MSTREAMPLAYER.playerStats.currentTime / MSTREAMPLAYER.playerStats.duration
+      : 0;
+    const splitX = pct * W;
+    const midY   = H / 2;
+    const barW   = W / data.length;
+    const drawW  = Math.max(1, barW > 2 ? barW - 1 : barW);
+
+    // Pass 1: played region (left of splitX) — orange
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, splitX, H);
+    ctx.clip();
+    ctx.fillStyle = '#fa832b';
+    for (let i = 0; i < data.length; i++) {
+      const x    = (i / data.length) * W;
+      const barH = Math.max(2, (data[i] / 255) * midY * 1.8);
+      ctx.fillRect(x, midY - barH / 2, drawW, barH);
+    }
+    ctx.restore();
+
+    // Pass 2: unplayed region (right of splitX) — dim
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(splitX, 0, W - splitX, H);
+    ctx.clip();
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    for (let i = 0; i < data.length; i++) {
+      const x    = (i / data.length) * W;
+      const barH = Math.max(2, (data[i] / 255) * midY * 1.8);
+      ctx.fillRect(x, midY - barH / 2, drawW, barH);
+    }
+    ctx.restore();
+  }
+
+  function _startWaveformRaf() {
+    if (_waveformRaf) return;
+    (function loop() {
+      _drawWaveform();
+      _waveformRaf = requestAnimationFrame(loop);
+    }());
+  }
+
+  function _stopWaveformRaf() {
+    if (_waveformRaf) { cancelAnimationFrame(_waveformRaf); _waveformRaf = null; }
+    _drawWaveform(); // final redraw at resting position
+  }
+
+  // Redraw on window resize so the canvas doesn't appear stretched while paused
+  window.addEventListener('resize', () => { if (_waveformData) _drawWaveform(); });
+
+  mstreamModule.triggerWaveformFetch = _fetchWaveform;
 
   return mstreamModule;
 })()

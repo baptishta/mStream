@@ -25,6 +25,9 @@ const ADMINDATA = (() => {
   // server settings
   module.serverParams = {};
   module.serverParamsUpdated = { ts: 0 };
+  // server audio backend (rust vs CLI fallback)
+  module.serverAudioInfo = { backend: null, player: null, detectedCliPlayers: [] };
+  module.serverAudioInfoUpdated = { ts: 0 };
   // transcoding
   module.transcodeParams = {};
   module.transcodeParamsUpdated = { ts: 0 };
@@ -37,6 +40,19 @@ const ADMINDATA = (() => {
   module.federationParams = {};
   module.federationParamsUpdated = { ts: 0 };
   module.federationInviteToken = { val: null };
+  // dlna
+  module.dlnaParams = {};
+  module.dlnaParamsUpdated = { ts: 0 };
+  // subsonic
+  module.subsonicParams = {};
+  module.subsonicParamsUpdated = { ts: 0 };
+  // subsonic — API keys for the currently-authenticated user. Keys are
+  // returned in full only at creation; subsequent listings are metadata-only.
+  module.apiKeys = [];
+  module.apiKeysUpdated = { ts: 0 };
+  // Holds the most recently minted key so the UI can render a one-time
+  // "copy this now" panel. Cleared as soon as the user dismisses it.
+  module.lastMintedKey = { val: null, name: null };
 
   module.getSharedPlaylists = async () => {
     const res = await API.axios({
@@ -141,6 +157,30 @@ const ADMINDATA = (() => {
     module.serverParamsUpdated.ts = Date.now();
   }
 
+  module.getServerAudioInfo = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/admin/server-audio/info`
+      });
+      module.serverAudioInfo.backend = res.data.backend;
+      module.serverAudioInfo.player = res.data.player;
+      module.serverAudioInfo.detectedCliPlayers = res.data.detectedCliPlayers || [];
+      module.serverAudioInfoUpdated.ts = Date.now();
+    } catch (_err) {}
+  }
+
+  // Force a fresh detection probe server-side, then pull the updated info.
+  module.redetectCliPlayers = async () => {
+    try {
+      await API.axios({
+        method: 'POST',
+        url: `${API.url()}/api/v1/admin/server-audio/detect`
+      });
+      await module.getServerAudioInfo();
+    } catch (_err) {}
+  }
+
   module.getTranscodeParams = async () => {
     const res = await API.axios({
       method: 'GET',
@@ -169,6 +209,136 @@ const ADMINDATA = (() => {
     }catch (err) {}
 
     module.federationParamsUpdated.ts = Date.now();
+  }
+
+  module.getDlnaParams = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/admin/dlna`
+      });
+      Object.keys(res.data).forEach(key => { module.dlnaParams[key] = res.data[key]; });
+    } catch (err) {}
+    module.dlnaParamsUpdated.ts = Date.now();
+  }
+
+  module.getSubsonicParams = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/admin/subsonic`
+      });
+      Object.keys(res.data).forEach(key => { module.subsonicParams[key] = res.data[key]; });
+    } catch (err) {}
+    module.subsonicParamsUpdated.ts = Date.now();
+  }
+
+  // ── Subsonic API key management ───────────────────────────────────────
+  // All three helpers operate on the currently-authenticated user's keys
+  // via /api/v1/user/api-keys.
+  module.getApiKeys = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/user/api-keys`
+      });
+      module.apiKeys.length = 0;
+      res.data.forEach(k => module.apiKeys.push(k));
+    } catch (err) { /* not fatal for panel load */ }
+    module.apiKeysUpdated.ts = Date.now();
+  }
+
+  module.createApiKey = async (name) => {
+    const res = await API.axios({
+      method: 'POST',
+      url: `${API.url()}/api/v1/user/api-keys`,
+      data: { name }
+    });
+    // Stash the plaintext key for the one-time display card.
+    module.lastMintedKey.val = res.data.key;
+    module.lastMintedKey.name = res.data.name;
+    await module.getApiKeys();
+    return res.data.key;
+  }
+
+  module.revokeApiKey = async (id) => {
+    await API.axios({
+      method: 'DELETE',
+      url: `${API.url()}/api/v1/user/api-keys/${id}`
+    });
+    await module.getApiKeys();
+  }
+
+  // ── Subsonic admin-panel polish data ────────────────────────────────
+  module.subsonicStats = { methodsImplemented: 0, methods: [], nowPlaying: [] };
+  module.subsonicStatsUpdated = { ts: 0 };
+  module.getSubsonicStats = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET', url: `${API.url()}/api/v1/admin/subsonic/stats`,
+      });
+      Object.assign(module.subsonicStats, res.data);
+    } catch (err) { /* UI shows placeholder */ }
+    module.subsonicStatsUpdated.ts = Date.now();
+  }
+
+  // Jukebox status card. `available: false` means autoBootServerAudio is
+  // disabled or the rust-server-audio binary isn't reachable — the UI
+  // hides the whole card in that case.
+  module.jukeboxStatus = { available: false };
+  module.jukeboxStatusUpdated = { ts: 0 };
+  module.getJukeboxStatus = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET', url: `${API.url()}/api/v1/admin/subsonic/jukebox`,
+      });
+      module.jukeboxStatus = res.data;
+    } catch (err) { module.jukeboxStatus = { available: false, reason: err.message }; }
+    module.jukeboxStatusUpdated.ts = Date.now();
+  }
+
+  // Recent token-auth rejections. Each entry is { username, client, at, ua }.
+  module.tokenAuthAttempts = [];
+  module.tokenAuthAttemptsUpdated = { ts: 0 };
+  module.getTokenAuthAttempts = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET', url: `${API.url()}/api/v1/admin/subsonic/token-auth-attempts`,
+      });
+      module.tokenAuthAttempts.length = 0;
+      (res.data.attempts || []).forEach(a => module.tokenAuthAttempts.push(a));
+    } catch (err) { /* empty list */ }
+    module.tokenAuthAttemptsUpdated.ts = Date.now();
+  }
+
+  module.clearTokenAuthAttempts = async () => {
+    await API.axios({
+      method: 'DELETE', url: `${API.url()}/api/v1/admin/subsonic/token-auth-attempts`,
+    });
+    await module.getTokenAuthAttempts();
+  }
+
+  // Admin mints a key on behalf of a specific user. Returns the plaintext
+  // key once so the admin can relay it to the affected client.
+  module.mintKeyFor = async (username, name) => {
+    const res = await API.axios({
+      method: 'POST',
+      url: `${API.url()}/api/v1/admin/subsonic/mint-key`,
+      data: { username, name },
+    });
+    return res.data;
+  }
+
+  // Hit the Subsonic API as a real client would and return { ok, latencyMs, ... }.
+  module.testSubsonicConnection = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET', url: `${API.url()}/api/v1/admin/subsonic/test`,
+      });
+      return res.data;
+    } catch (err) {
+      return { ok: false, reason: err.message };
+    }
   }
 
   module.getVersion = async () => {
@@ -207,7 +377,14 @@ ADMINDATA.getFolders();
 ADMINDATA.getUsers();
 ADMINDATA.getDbParams();
 ADMINDATA.getServerParams();
+ADMINDATA.getServerAudioInfo();
 ADMINDATA.getFederationParams();
+ADMINDATA.getDlnaParams();
+ADMINDATA.getSubsonicParams();
+ADMINDATA.getApiKeys();
+ADMINDATA.getSubsonicStats();
+ADMINDATA.getJukeboxStatus();
+ADMINDATA.getTokenAuthAttempts();
 ADMINDATA.getVersion();
 ADMINDATA.getWinDrives();
 
@@ -221,6 +398,119 @@ M.Modal.init(document.querySelectorAll('.modal'), {
 
 // Intialize Clipboard
 new ClipboardJS('.fed-copy-button');
+
+// ----- i18n glue for Vue templates -----
+// A reactive counter that increments each time the active language changes.
+// Templates that call `t(...)` read this counter (below) to establish a
+// dependency, so Vue re-renders them automatically when translations swap.
+const I18NSTATE = Vue.observable({ version: 0 });
+
+// Expose t() to every Vue component/template. Reading I18NSTATE.version inside
+// this method is what ties the template to the reactive store.
+Vue.prototype.t = function (key, params) {
+  // eslint-disable-next-line no-unused-expressions
+  I18NSTATE.version;
+  return window.t(key, params);
+};
+
+// Bump the version whenever i18n.js finishes loading a new dictionary. If the
+// initial load already completed before this listener was attached, the first
+// language change (via the UI) will still fire and everything stays in sync.
+I18N.onChange(() => { I18NSTATE.version += 1; });
+
+// Flag SVGs are loaded from assets/js/flags.js into window.FLAG_SVGS so the
+// admin panel and main webapp can share one source of truth.
+
+// Custom language dropdown for the admin sidebar. Native <select> can't render
+// images inside <option>, so we use a button + absolutely-positioned listbox.
+// Opens upward (bottom: 100%) because the control sits at the bottom of the
+// sidebar.
+(() => {
+  const toggle = document.getElementById('admin-lang-toggle');
+  const menu = document.getElementById('admin-lang-menu');
+  if (!toggle || !menu) { return; }
+
+  const base = document.querySelector('meta[name="i18n-base"]')?.content || '';
+
+  // Escape text for use in innerHTML (defensive — language names come from
+  // our own JSON, but treating them as user-ish data is cheap insurance).
+  const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+
+  const flagMarkup = (code) => window.FLAG_SVGS && window.FLAG_SVGS[code]
+    ? `<span class="admin-lang-flag">${window.FLAG_SVGS[code]}</span>`
+    : '<span class="admin-lang-flag"></span>';
+
+  const renderCurrent = (code, label) => {
+    toggle.querySelector('.admin-lang-current').innerHTML =
+      `${flagMarkup(code)}<span class="admin-lang-name">${escapeHtml(label)}</span>`;
+  };
+
+  const updateSelected = (code) => {
+    menu.querySelectorAll('li').forEach(li => {
+      li.setAttribute('aria-selected', li.dataset.lang === code ? 'true' : 'false');
+    });
+  };
+
+  const openMenu = () => {
+    menu.hidden = false;
+    toggle.setAttribute('aria-expanded', 'true');
+  };
+
+  const closeMenu = () => {
+    menu.hidden = true;
+    toggle.setAttribute('aria-expanded', 'false');
+  };
+
+  // Track the languages we know about so renderCurrent can look up labels
+  // when the language changes externally.
+  let langs = {};
+
+  fetch(`${base}locales/languages.json`).then(r => r.json()).then(data => {
+    langs = data;
+    const cur = I18N.getLanguage();
+
+    Object.entries(langs).forEach(([code, name]) => {
+      const li = document.createElement('li');
+      li.setAttribute('role', 'option');
+      li.dataset.lang = code;
+      li.innerHTML = `${flagMarkup(code)}<span class="admin-lang-name">${escapeHtml(name)}</span>`;
+      li.addEventListener('click', () => {
+        I18N.loadLanguage(code);
+        closeMenu();
+      });
+      menu.appendChild(li);
+    });
+
+    renderCurrent(cur, langs[cur] || cur);
+    updateSelected(cur);
+  }).catch(() => { /* noop — control just stays empty */ });
+
+  toggle.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (menu.hidden) { openMenu(); } else { closeMenu(); }
+  });
+
+  // Click outside closes the menu
+  document.addEventListener('click', (e) => {
+    if (!menu.hidden && !menu.contains(e.target) && !toggle.contains(e.target)) {
+      closeMenu();
+    }
+  });
+
+  // Escape closes the menu
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !menu.hidden) { closeMenu(); }
+  });
+
+  // Keep the control in sync if the language changes from anywhere else
+  // (programmatic switch, future UI, etc.).
+  I18N.onChange((code) => {
+    renderCurrent(code, langs[code] || code);
+    updateSelected(code);
+  });
+})();
 
 const foldersView = Vue.component('folders-view', {
   data() {
@@ -240,35 +530,35 @@ const foldersView = Vue.component('folders-view', {
           <div class="col s12">
             <div class="card">
               <div class="card-content">
-                <span class="card-title">Add Folder</span>
+                <span class="card-title">{{ t('admin.folders.title') }}</span>
                 <form id="choose-directory-form" @submit.prevent="submitForm">
                   <div class="row">
                     <div class="input-field col s12">
                       <input v-on:click="addFolderDialog()" @blur="maybeResetForm()" v-model="folder.value" id="folder-name" required type="text" class="validate">
-                      <label for="folder-name">Select Directory</label>
-                      <span class="helper-text">Click to choose directory</span>
+                      <label for="folder-name">{{ t('admin.folders.selectDirectory') }}</label>
+                      <span class="helper-text">{{ t('admin.folders.selectDirectoryHint') }}</span>
                     </div>
                   </div>
                   <div class="row">
                     <div class="input-field col s12">
                       <input @blur="maybeResetForm()" pattern="[a-zA-Z0-9-]+" v-model="dirName" id="add-directory-name" required type="text" class="validate">
-                      <label for="add-directory-name">Server Path Alias (vPath)</label>
-                      <span class="helper-text">No special characters or spaces</span>
+                      <label for="add-directory-name">{{ t('admin.folders.vPathLabel') }}</label>
+                      <span class="helper-text">{{ t('admin.folders.vPathHint') }}</span>
                     </div>
                   </div>
                   <div class="row">
                     <div class="col m6 s12">
                       <div class="pad-checkbox"><label>
                         <input id="folder-auto-access" type="checkbox" checked/>
-                        <span>Give Access To All Users</span>
+                        <span>{{ t('admin.folders.giveAccessToAll') }}</span>
                       </label></div>
                       <div class="pad-checkbox"><label>
                         <input id="folder-is-audiobooks" type="checkbox"/>
-                        <span>Audiobooks & Podcasts</span>
+                        <span>{{ t('admin.folders.audiobooks') }}</span>
                       </label></div>
                     </div>
                     <button class="btn green waves-effect waves-light col m6 s12" type="submit" :disabled="submitPending === true">
-                      {{submitPending === false ? 'Add Folder' : 'Adding...'}}
+                      {{ submitPending === false ? t('admin.folders.addButton') : t('admin.folders.adding') }}
                     </button>
                   </div>
                 </form>
@@ -282,20 +572,29 @@ const foldersView = Vue.component('folders-view', {
       </div>
       <div v-show="foldersTS.ts > 0" class="row">
         <div class="col s12">
-          <h5>Directories</h5>
+          <h5>{{ t('admin.folders.heading') }}</h5>
           <table>
             <thead>
               <tr>
-                <th>Server Path Alias (vPath)</th>
-                <th>Directory</th>
-                <th>Actions</th>
+                <th>{{ t('admin.folders.vPathHeader') }}</th>
+                <th>{{ t('admin.folders.directoryHeader') }}</th>
+                <th title="When 'on', the scanner follows symlinks INSIDE this library. Default is 'off' to keep scanned content strictly within the library's physical tree.">Follow symlinks</th>
+                <th>{{ t('admin.folders.actionsHeader') }}</th>
               </tr>
             </thead>
             <tbody>
               <tr v-for="(v, k) in folders">
                 <td>{{k}}</td>
                 <td>{{v.root}}</td>
-                <td>[<a v-on:click="removeFolder(k, v.root)">remove</a>]</td>
+                <td>
+                  <select :value="v.followSymlinks ? 'true' : 'false'"
+                          v-on:change="setFollowSymlinks(k, $event.target.value === 'true')"
+                          style="margin:0;display:inline-block;width:auto;height:28px;font-size:13px">
+                    <option value="false">off</option>
+                    <option value="true">on</option>
+                  </select>
+                </td>
+                <td>[<a v-on:click="removeFolder(k, v.root)">{{ t('admin.folders.remove') }}</a>]</td>
               </tr>
             </tbody>
           </table>
@@ -311,6 +610,32 @@ const foldersView = Vue.component('folders-view', {
       }
     },
     methods: {
+      // V21: per-library followSymlinks flag. Default false —
+      // operators opt in per library when they want the scanner to
+      // traverse symlinks inside that vpath.
+      setFollowSymlinks: async function(vpath, value) {
+        try {
+          await API.axios({
+            method: 'POST',
+            url: `${API.url()}/api/v1/admin/directory/follow-symlinks`,
+            data: { vpath, followSymlinks: value },
+          });
+          // Reflect the change locally so the <select> stays in sync
+          // without waiting for the next folder-list poll.
+          if (ADMINDATA.folders[vpath]) {
+            Vue.set(ADMINDATA.folders[vpath], 'followSymlinks', value);
+          }
+          iziToast.success({
+            title: `Symlink policy updated for ${vpath}`,
+            position: 'topCenter', timeout: 2500,
+          });
+        } catch (err) {
+          iziToast.error({
+            title: `Failed: ${err.message || '?'}`,
+            position: 'topCenter', timeout: 3000,
+          });
+        }
+      },
       makeVPath(dir) {
         const newName = dir.split(/[\\\/]/).pop().toLowerCase().replace(' ', '-').replace(/[^a-zA-Z0-9-]/g, "");
         
@@ -333,7 +658,7 @@ const foldersView = Vue.component('folders-view', {
       submitForm: async function () {
         if (ADMINDATA.folders[this.dirName]) {
           iziToast.warn({
-            title: 'Server Path already in use',
+            title: t('admin.folders.pathInUse'),
             position: 'topCenter',
             timeout: 3500
           });
@@ -368,7 +693,7 @@ const foldersView = Vue.component('folders-view', {
           });
         }catch(err) {
           iziToast.error({
-            title: 'Failed to add directory',
+            title: t('admin.folders.addFailed'),
             position: 'topCenter',
             timeout: 3500
           });
@@ -387,11 +712,11 @@ const foldersView = Vue.component('folders-view', {
           zindex: 99999,
           layout: 2,
           maxWidth: 600,
-          title: `Remove access to <b>${folder}</b>?`,
-          message: `No files will be deleted. Your server will need to reboot.`,
+          title: t('admin.folders.removeTitle', { folder: folder }),
+          message: t('admin.folders.removeMessage'),
           position: 'center',
           buttons: [
-            ['<button><b>Remove</b></button>', (instance, toast) => {
+            [`<button><b>${t('admin.folders.removeButton')}</b></button>`, (instance, toast) => {
               instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
               API.axios({
                 method: 'DELETE',
@@ -399,7 +724,7 @@ const foldersView = Vue.component('folders-view', {
                 data: { vpath: vpath }
               }).then(() => {
                 iziToast.warning({
-                  title: 'Server Rebooting. Please wait 30s for the server to come back online',
+                  title: t('admin.folders.rebooting'),
                   position: 'topCenter',
                   timeout: 3500
                 });
@@ -411,13 +736,13 @@ const foldersView = Vue.component('folders-view', {
                 });
               }).catch(() => {
                 iziToast.error({
-                  title: 'Failed to remove folder',
+                  title: t('admin.folders.removeFailed'),
                   position: 'topCenter',
                   timeout: 3500
                 });
               });
             }, true],
-            ['<button>Go Back</button>', (instance, toast) => {
+            [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
               instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             }],
           ]
@@ -437,6 +762,10 @@ const usersView = Vue.component('users-view', {
       makeAdmin: Object.keys(ADMINDATA.users).length === 0 ? true : false,
       allowMkdir: true,
       allowUpload: true,
+      // Opt-in per user. Admins bypass the gate anyway; everyone else
+      // starts without /api/v1/server-playback access and gets it only
+      // when the operator ticks the box explicitly.
+      allowServerAudio: false,
       submitPending: false,
       selectInstance: null
     };
@@ -448,40 +777,44 @@ const usersView = Vue.component('users-view', {
           <div class="col s12">
             <div class="card">
               <div class="card-content">
-              <span class="card-title">Add User</span>
+              <span class="card-title">{{ t('admin.users.title') }}</span>
                 <form id="add-user-form" @submit.prevent="addUser">
                   <div class="row">
                     <div class="input-field directory-name-field col s12 m6">
                       <input @blur="maybeResetForm()" v-model="newUsername" id="new-username" required type="text" class="validate">
-                      <label for="new-username">Username</label>
+                      <label for="new-username">{{ t('admin.users.usernameLabel') }}</label>
                     </div>
                     <div class="input-field directory-name-field col s12 m6">
                       <input @blur="maybeResetForm()" v-model="newPassword" id="new-password" required type="password" class="validate">
-                      <label for="new-password">Password</label>
+                      <label for="new-password">{{ t('admin.users.passwordLabel') }}</label>
                     </div>
                   </div>
                   <div class="row">
                     <div class="input-field col s12">
                       <select class="material-select" :disabled="Object.keys(directories).length === 0" id="new-user-dirs" multiple>
-                        <option disabled selected value="" v-if="Object.keys(directories).length === 0">You must add a directory before adding a user</option>
+                        <option disabled selected value="" v-if="Object.keys(directories).length === 0">{{ t('admin.users.noDirsWarning') }}</option>
                         <option selected v-for="(key, value) in directories" :value="value">{{ value }}</option>
                       </select>
-                      <label for="new-user-dirs">Select User's Directories</label>
+                      <label for="new-user-dirs">{{ t('admin.users.selectDirs') }}</label>
                     </div>
                   </div>
                   <div class="row">
                     <div class="input-field col s12 m6">
                       <div class="pad-checkbox"><label>
                         <input id="folder-autoaccess" type="checkbox" v-model="makeAdmin"/>
-                        <span>Make Admin</span>
+                        <span>{{ t('admin.users.makeAdmin') }}</span>
                       </label></div>
                       <div class="pad-checkbox"><label>
                         <input type="checkbox" v-model="allowMkdir"/>
-                        <span>Allow Create Folders</span>
+                        <span>{{ t('admin.users.allowFolders') }}</span>
                       </label></div>
                       <div class="pad-checkbox"><label>
                         <input type="checkbox" v-model="allowUpload"/>
-                        <span>Allow Upload</span>
+                        <span>{{ t('admin.users.allowUpload') }}</span>
+                      </label></div>
+                      <div class="pad-checkbox"><label>
+                        <input type="checkbox" v-model="allowServerAudio"/>
+                        <span>Allow Server Audio</span>
                       </label></div>
                     </div>
                     <!-- <div class="col s12 m6">
@@ -490,7 +823,7 @@ const usersView = Vue.component('users-view', {
                   </div>
                   <div class="row">
                     <button id="submit-add-user-form" class="btn green waves-effect waves-light col m6 s12" type="submit" :disabled="submitPending === true">
-                      {{submitPending === false ? 'Add User' : 'Adding...'}}
+                      {{ submitPending === false ? t('admin.users.addButton') : t('admin.users.adding') }}
                     </button>
                   </div>
                 </form>
@@ -504,24 +837,24 @@ const usersView = Vue.component('users-view', {
       </div>
       <div v-else-if="Object.keys(users).length === 0" class="container">
         <h5>
-          There are currently no users. Authentication is disabled when no users exist.
+          {{ t('admin.users.noUsers') }}
         </h5>
         <h5>
-          Adding a user will enable authentication. Make sure the user add is has admin access. If you add a non-admin user, you will not be able to access this page.
+          {{ t('admin.users.addWarning') }}
         </h5>
       </div>
       <div v-else="usersTS.ts > 0" class="row">
         <div class="col s12">
-          <h5>Users</h5>
+          <h5>{{ t('admin.users.heading') }}</h5>
           <table>
             <thead>
               <tr>
-                <th>User</th>
-                <th>Directories</th>
-                <th>Admin</th>
-                <th>Create Folders</th>
-                <th>Upload</th>
-                <th>Modify</th>
+                <th>{{ t('admin.users.userHeader') }}</th>
+                <th>{{ t('admin.users.dirsHeader') }}</th>
+                <th>{{ t('admin.users.adminHeader') }}</th>
+                <th>{{ t('admin.users.foldersHeader') }}</th>
+                <th>{{ t('admin.users.uploadHeader') }}</th>
+                <th>{{ t('admin.users.modifyHeader') }}</th>
               </tr>
             </thead>
             <tbody>
@@ -538,10 +871,10 @@ const usersView = Vue.component('users-view', {
                   <svg v-if="v.allowUpload !== false" height="24px" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 117.72 117.72"><path d="M58.86 0c9.13 0 17.77 2.08 25.49 5.79-3.16 2.5-6.09 4.9-8.82 7.21a48.673 48.673 0 00-16.66-2.92c-13.47 0-25.67 5.46-34.49 14.29-8.83 8.83-14.29 21.02-14.29 34.49 0 13.47 5.46 25.66 14.29 34.49 8.83 8.83 21.02 14.29 34.49 14.29s25.67-5.46 34.49-14.29c8.83-8.83 14.29-21.02 14.29-34.49 0-3.2-.31-6.34-.9-9.37 2.53-3.3 5.12-6.59 7.77-9.85a58.762 58.762 0 013.21 19.22c0 16.25-6.59 30.97-17.24 41.62-10.65 10.65-25.37 17.24-41.62 17.24-16.25 0-30.97-6.59-41.62-17.24C6.59 89.83 0 75.11 0 58.86c0-16.25 6.59-30.97 17.24-41.62S42.61 0 58.86 0zM31.44 49.19L45.8 49l1.07.28c2.9 1.67 5.63 3.58 8.18 5.74a56.18 56.18 0 015.27 5.1c5.15-8.29 10.64-15.9 16.44-22.9a196.16 196.16 0 0120.17-20.98l1.4-.54H114l-3.16 3.51C101.13 30 92.32 41.15 84.36 52.65a325.966 325.966 0 00-21.41 35.62l-1.97 3.8-1.81-3.87c-3.34-7.17-7.34-13.75-12.11-19.63-4.77-5.88-10.32-11.1-16.79-15.54l1.17-3.84z" fill="#01a601"/></svg>
                 </td>
                 <td>
-                  [<a v-on:click="changePassword(k)">change pass</a>]
-                  [<a v-on:click="changeVPaths(k)">change folders</a>]
-                  [<a v-on:click="changeAccess(k)">access</a>]
-                  [<a v-on:click="deleteUser(k)">del</a>]
+                  [<a v-on:click="changePassword(k)">{{ t('admin.users.changePass') }}</a>]
+                  [<a v-on:click="changeVPaths(k)">{{ t('admin.users.changeFolders') }}</a>]
+                  [<a v-on:click="changeAccess(k)">{{ t('admin.users.changeAccess') }}</a>]
+                  [<a v-on:click="deleteUser(k)">{{ t('admin.users.delete') }}</a>]
                 </td>
               </tr>
             </tbody>
@@ -587,10 +920,10 @@ const usersView = Vue.component('users-view', {
           displayMode: 'once',
           id: 'question',
           zindex: 99999,
-          title: `Delete <b>${username}</b>?`,
+          title: t('admin.users.deleteTitle', { username: username }),
           position: 'center',
           buttons: [
-            ['<button><b>Delete</b></button>', async (instance, toast) => {
+            [`<button><b>${t('admin.users.deleteButton')}</b></button>`, async (instance, toast) => {
               instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
               try {
                 await API.axios({
@@ -601,13 +934,13 @@ const usersView = Vue.component('users-view', {
                 Vue.delete(ADMINDATA.users, username);
               } catch (err) {
                 iziToast.error({
-                  title: 'Failed to delete user',
+                  title: t('admin.users.deleteFailed'),
                   position: 'topCenter',
                   timeout: 3500
                 });
               }
             }, true],
-            ['<button>Go Back</button>', (instance, toast) => {
+            [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
               instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             }],
           ]
@@ -625,7 +958,8 @@ const usersView = Vue.component('users-view', {
             vpaths: Array.from(selected).map(el => el.value),
             admin: this.makeAdmin,
             allowMkdir: this.allowMkdir,
-            allowUpload: this.allowUpload
+            allowUpload: this.allowUpload,
+            allowServerAudio: this.allowServerAudio
           };
 
           await API.axios({
@@ -634,7 +968,7 @@ const usersView = Vue.component('users-view', {
             data: data
           });
 
-          Vue.set(ADMINDATA.users, this.newUsername, { vpaths: data.vpaths, admin: data.admin, allowMkdir: data.allowMkdir, allowUpload: data.allowUpload });
+          Vue.set(ADMINDATA.users, this.newUsername, { vpaths: data.vpaths, admin: data.admin, allowMkdir: data.allowMkdir, allowUpload: data.allowUpload, allowServerAudio: data.allowServerAudio });
           this.newUsername = '';
           this.newPassword = '';
 
@@ -647,9 +981,9 @@ const usersView = Vue.component('users-view', {
               displayMode: 'once',
               id: 'question',
               zindex: 99999,
-              title: 'You will be taken the login page',
+              title: t('admin.users.loginRedirect'),
               position: 'center',
-              buttons: [['<button>Go!</button>', (instance, toast) => {
+              buttons: [[`<button>${t('admin.users.go')}</button>`, (instance, toast) => {
                 API.logout();
                 instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
               }, true]],
@@ -661,7 +995,7 @@ const usersView = Vue.component('users-view', {
           });
         }catch(err) {
           iziToast.error({
-            title: 'Failed to add user',
+            title: t('admin.users.addFailed'),
             position: 'topCenter',
             timeout: 3500
           });
@@ -676,8 +1010,22 @@ const advancedView = Vue.component('advanced-view', {
   data() {
     return {
       params: ADMINDATA.serverParams,
-      paramsTS: ADMINDATA.serverParamsUpdated
+      paramsTS: ADMINDATA.serverParamsUpdated,
+      audioInfo: ADMINDATA.serverAudioInfo,
+      audioInfoTS: ADMINDATA.serverAudioInfoUpdated
     };
+  },
+  computed: {
+    activePlayerLabel: function() {
+      if (!this.audioInfo.backend) { return 'None'; }
+      if (this.audioInfo.backend === 'rust') { return 'rust-server-audio (native)'; }
+      if (this.audioInfo.backend === 'cli') { return (this.audioInfo.player || 'cli') + ' (CLI fallback)'; }
+      return this.audioInfo.player || 'Unknown';
+    },
+    detectedCliPlayersLabel: function() {
+      const d = this.audioInfo.detectedCliPlayers || [];
+      return d.length ? d.join(', ') : 'None';
+    }
   },
   template: `
     <div v-if="paramsTS.ts === 0" class="row">
@@ -689,31 +1037,31 @@ const advancedView = Vue.component('advanced-view', {
           <div class="col s12">
             <div class="card">
               <div class="card-content">
-                <span class="card-title">Security</span>
+                <span class="card-title">{{ t('admin.settings.security') }}</span>
                 <table>
                   <tbody>
                     <tr>
-                      <td><b>File Uploading:</b> {{params.noUpload === false ? 'Enabled' : 'Disabled'}}</td>
+                      <td><b>{{ t('admin.settings.fileUploading') }}</b> {{ params.noUpload === false ? t('admin.settings.enabled') : t('admin.settings.disabled') }}</td>
                       <td>
-                        [<a v-on:click="toggleFileUpload()">edit</a>]
+                        [<a v-on:click="toggleFileUpload()">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Create Folder:</b> {{params.noMkdir === false ? 'Enabled' : 'Disabled'}}</td>
+                      <td><b>{{ t('admin.settings.createFolder') }}</b> {{ params.noMkdir === false ? t('admin.settings.enabled') : t('admin.settings.disabled') }}</td>
                       <td>
-                        [<a v-on:click="toggleMkdir()">edit</a>]
+                        [<a v-on:click="toggleMkdir()">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
-                      <td><b>File Modification:</b> {{params.noFileModify === false ? 'Enabled' : 'Disabled'}}</td>
+                      <td><b>{{ t('admin.settings.fileModification') }}</b> {{ params.noFileModify === false ? t('admin.settings.enabled') : t('admin.settings.disabled') }}</td>
                       <td>
-                        [<a v-on:click="toggleFileModify()">edit</a>]
+                        [<a v-on:click="toggleFileModify()">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Auth Key:</b> ****************{{params.secret}}</td>
+                      <td><b>{{ t('admin.settings.authKey') }}</b> ****************{{params.secret}}</td>
                       <td>
-                        [<a v-on:click="generateNewKey()">edit</a>]
+                        [<a v-on:click="generateNewKey()">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                   </tbody>
@@ -724,31 +1072,31 @@ const advancedView = Vue.component('advanced-view', {
           <div class="col s12">
             <div class="card">
               <div class="card-content">
-                <span class="card-title">Network Settings</span>
+                <span class="card-title">{{ t('admin.settings.network') }}</span>
                 <table>
                   <tbody>
                     <tr>
-                      <td><b>Port:</b> {{params.port}}</td>
+                      <td><b>{{ t('admin.settings.port') }}</b> {{params.port}}</td>
                       <td>
-                        [<a v-on:click="openModal('edit-port-modal')">edit</a>]
+                        [<a v-on:click="openModal('edit-port-modal')">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Max Request Size:</b> {{params.maxRequestSize}}</td>
+                      <td><b>{{ t('admin.settings.maxRequestSize') }}</b> {{params.maxRequestSize}}</td>
                       <td>
-                        [<a v-on:click="openModal('edit-request-size-modal')">edit</a>]
+                        [<a v-on:click="openModal('edit-request-size-modal')">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Address:</b> {{params.address}}</td>
+                      <td><b>{{ t('admin.settings.address') }}</b> {{params.address}}</td>
                       <td>
-                        [<a v-on:click="openModal('edit-address-modal')">edit</a>]
+                        [<a v-on:click="openModal('edit-address-modal')">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Frontend:</b> {{params.ui === 'velvet' ? 'Velvet' : 'Default'}}</td>
+                      <td><b>{{ t('admin.settings.frontend') }}</b> {{uiLabel(params.ui)}}</td>
                       <td>
-                        [<a v-on:click="switchUI()">switch to {{params.ui === 'velvet' ? 'Default' : 'Velvet'}}</a>]
+                        [<a v-on:click="switchUI()">switch to {{uiLabel(nextUI(params.ui))}}</a>]
                       </td>
                     </tr>
                   </tbody>
@@ -759,20 +1107,30 @@ const advancedView = Vue.component('advanced-view', {
           <div class="col s12">
             <div class="card">
               <div class="card-content">
-                <span class="card-title">Server Audio</span>
+                <span class="card-title">{{ t('admin.settings.serverAudio') }}</span>
                 <table>
                   <tbody>
                     <tr>
-                      <td><b>Auto-Boot Server Audio:</b> {{params.autoBootServerAudio ? 'Enabled' : 'Disabled'}}</td>
+                      <td><b>{{ t('admin.settings.autoBoot') }}</b> {{ params.autoBootServerAudio ? t('admin.settings.enabled') : t('admin.settings.disabled') }}</td>
                       <td>
-                        [<a v-on:click="toggleAutoBootServerAudio()">edit</a>]
+                        [<a v-on:click="toggleAutoBootServerAudio()">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Rust Player Port:</b> {{params.rustPlayerPort}}</td>
+                      <td><b>{{ t('admin.settings.rustPlayerPort') }}</b> {{params.rustPlayerPort}}</td>
                       <td>
-                        [<a v-on:click="openModal('edit-rust-player-port-modal')">edit</a>]
+                        [<a v-on:click="openModal('edit-rust-player-port-modal')">{{ t('admin.settings.edit') }}</a>]
                       </td>
+                    </tr>
+                    <tr>
+                      <td><b>Active player:</b> {{ activePlayerLabel }}</td>
+                      <td>
+                        [<a v-on:click="refreshServerAudioInfo()">refresh</a>]
+                      </td>
+                    </tr>
+                    <tr>
+                      <td><b>Detected CLI players:</b> {{ detectedCliPlayersLabel }}</td>
+                      <td></td>
                     </tr>
                   </tbody>
                 </table>
@@ -783,13 +1141,13 @@ const advancedView = Vue.component('advanced-view', {
             <div class="card">
               <div v-if="!params.ssl || !params.ssl.cert">
                 <div class="card-content">
-                  <span class="card-title">SSL Settings</span>
-                  <a v-on:click="openModal('edit-ssl-modal')" class="waves-effect waves-light btn">Add SSL Certs</a>
+                  <span class="card-title">{{ t('admin.settings.ssl') }}</span>
+                  <a v-on:click="openModal('edit-ssl-modal')" class="waves-effect waves-light btn">{{ t('admin.settings.addSSL') }}</a>
                 </div>
               </div>
               <div v-else>
                 <div class="card-content">
-                  <span class="card-title">SSL Settings</span>
+                  <span class="card-title">{{ t('admin.settings.ssl') }}</span>
                   <table>
                     <tbody>
                       <tr>
@@ -802,8 +1160,8 @@ const advancedView = Vue.component('advanced-view', {
                   </table>
                 </div>
                 <div class="card-action">
-                  <a v-on:click="openModal('edit-ssl-modal')" class="waves-effect waves-light btn">Edit SSL</a>
-                  <a v-on:click="removeSSL()" class="waves-effect waves-light btn">Remove SSL</a>
+                  <a v-on:click="openModal('edit-ssl-modal')" class="waves-effect waves-light btn">{{ t('admin.settings.editSSL') }}</a>
+                  <a v-on:click="removeSSL()" class="waves-effect waves-light btn">{{ t('admin.settings.removeSSL') }}</a>
                 </div>
               </div>
             </div>
@@ -815,9 +1173,29 @@ const advancedView = Vue.component('advanced-view', {
       modVM.currentViewModal = modalView;
       M.Modal.getInstance(document.getElementById('admin-modal')).open();
     },
+    // Lookup: internal UI id → user-visible label. The `subsonic`
+    // value (Airsonic Refix — webapp/subsonic/) is still valid in
+    // the Joi validator and can be set by hand-editing config.json,
+    // but it is intentionally NOT listed in the switcher rotation
+    // below. The admin panel + shared pages don't yet render cleanly
+    // under the Subsonic UI; until that's sorted out we don't want
+    // to let operators trap themselves in a broken state by flipping
+    // to it from here. `uiLabel` still knows the Subsonic label so
+    // an operator who set it via config.json sees the correct name
+    // rendered instead of a raw 'subsonic' string.
+    uiLabel: function(id) {
+      return ({ default: 'Default', velvet: 'Velvet', subsonic: 'Subsonic UI' })[id] || id;
+    },
+    // Rotate through the switcher-exposed UIs on each click.
+    // Subsonic is deliberately omitted — see uiLabel comment.
+    nextUI: function(id) {
+      const order = ['default', 'velvet'];
+      const i = order.indexOf(id);
+      return order[(i < 0 ? 0 : i + 1) % order.length];
+    },
     switchUI: function() {
-      const newUI = this.params.ui === 'velvet' ? 'default' : 'velvet';
-      const label = newUI === 'velvet' ? 'Velvet' : 'Default';
+      const newUI = this.nextUI(this.params.ui);
+      const label = this.uiLabel(newUI);
       iziToast.question({
         timeout: 20000,
         close: false,
@@ -828,11 +1206,11 @@ const advancedView = Vue.component('advanced-view', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: `<b>Switch to ${label} frontend?</b>`,
-        message: 'The server will restart to apply the change.',
+        title: `<b>${t('admin.settings.switchFrontend', { label: label })}</b>`,
+        message: t('admin.settings.switchRestart'),
         position: 'center',
         buttons: [
-          [`<button><b>Switch to ${label}</b></button>`, (instance, toast) => {
+          [`<button><b>${t('admin.settings.switchingTo', { label: label })}</b></button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             API.axios({
               method: 'POST',
@@ -840,20 +1218,20 @@ const advancedView = Vue.component('advanced-view', {
               data: { ui: newUI }
             }).then(() => {
               iziToast.success({
-                title: `Switching to ${label}...`,
-                message: 'Server is restarting',
+                title: t('admin.settings.switchingTo', { label: label }),
+                message: t('admin.settings.serverRestarting'),
                 position: 'topCenter',
                 timeout: 3500
               });
             }).catch(() => {
               iziToast.error({
-                title: 'Error',
+                title: t('admin.settings.failed'),
                 position: 'topCenter',
                 timeout: 3500
               });
             });
           }, true],
-          ['<button>Cancel</button>', (instance, toast) => {
+          [`<button>${t('admin.settings.cancel')}</button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
           }],
         ]
@@ -870,11 +1248,11 @@ const advancedView = Vue.component('advanced-view', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: 'Remove SSL Keys?',
-        message: 'Your server will need to reboot',
+        title: t('admin.settings.removeSSLTitle'),
+        message: t('admin.settings.serverReboot'),
         position: 'center',
         buttons: [
-          [`<button><b>Remove SSL</b></button>`, async (instance, toast) => {
+          [`<button><b>${t('admin.folders.removeButton')} SSL</b></button>`, async (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             try {
               await API.axios({
@@ -887,19 +1265,19 @@ const advancedView = Vue.component('advanced-view', {
               }, 4000);
       
               iziToast.success({
-                title: 'Certs Deleted. You will be redirected shortly',
+                title: t('admin.settings.certsDeleted'),
                 position: 'topCenter',
                 timeout: 8500
               });
             } catch (err) {
               iziToast.error({
-                title: 'Failed to Delete Cert',
+                title: t('admin.settings.certDeleteFailed'),
                 position: 'topCenter',
                 timeout: 3500
               });
             }
           }, true],
-          ['<button>Go Back</button>', (instance, toast) => {
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
           }],
         ]
@@ -920,11 +1298,11 @@ const advancedView = Vue.component('advanced-view', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: '<b>Generate a New Auth Key?</b>',
-        message: 'All active login sessions will be invalidated.  You will need to login after',
+        title: `<b>${t('admin.settings.generateAuthKey')}</b>`,
+        message: t('admin.settings.authKeyWarning'),
         position: 'center',
         buttons: [
-          [`<button><b>Generate Key</b></button>`, (instance, toast) => {
+          [`<button><b>${t('admin.settings.generateButton')}</b></button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             API.axios({
               method: 'POST',
@@ -934,13 +1312,13 @@ const advancedView = Vue.component('advanced-view', {
               API.logout();
             }).catch(() => {
               iziToast.error({
-                title: 'Failed',
+                title: t('admin.settings.failed'),
                 position: 'topCenter',
                 timeout: 3500
               });
             });
           }, true],
-          ['<button>Go Back</button>', (instance, toast) => {
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
           }],
         ]
@@ -957,10 +1335,10 @@ const advancedView = Vue.component('advanced-view', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: `<b>${this.params.noMkdir === false ? 'Disable' : 'Enable'} Create Folder?</b>`,
+        title: `<b>${this.params.noMkdir === false ? t('admin.settings.disableFolders') : t('admin.settings.enableFolders')}</b>`,
         position: 'center',
         buttons: [
-          [`<button><b>${this.params.noMkdir === false ? 'Disable' : 'Enable'}</b></button>`, (instance, toast) => {
+          [`<button><b>${this.params.noMkdir === false ? t('admin.settings.disableButton') : t('admin.settings.enableButton')}</b></button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             API.axios({
               method: 'POST',
@@ -970,19 +1348,19 @@ const advancedView = Vue.component('advanced-view', {
               Vue.set(ADMINDATA.serverParams, 'noMkdir', !this.params.noMkdir);
 
               iziToast.success({
-                title: 'Updated Successfully',
+                title: t('admin.settings.updated'),
                 position: 'topCenter',
                 timeout: 3500
               });
             }).catch(() => {
               iziToast.error({
-                title: 'Failed',
+                title: t('admin.settings.failed'),
                 position: 'topCenter',
                 timeout: 3500
               });
             });
           }, true],
-          ['<button>Go Back</button>', (instance, toast) => {
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
           }],
         ]
@@ -993,11 +1371,11 @@ const advancedView = Vue.component('advanced-view', {
       iziToast.question({
         timeout: 20000, close: false, overlayClose: true, overlay: true,
         displayMode: 'once', id: 'question', zindex: 99999, layout: 2, maxWidth: 600,
-        title: `<b>${self.params.noFileModify === false ? 'Disable' : 'Enable'} File Modification?</b>`,
-        message: 'Controls whether album art can be embedded directly into audio files',
+        title: `<b>${self.params.noFileModify === false ? t('admin.settings.disableModify') : t('admin.settings.enableModify')}</b>`,
+        message: t('admin.settings.modifyHint'),
         position: 'center',
         buttons: [
-          [`<button><b>${self.params.noFileModify === false ? 'Disable' : 'Enable'}</b></button>`, (instance, toast) => {
+          [`<button><b>${self.params.noFileModify === false ? t('admin.settings.disableButton') : t('admin.settings.enableButton')}</b></button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             API.axios({
               method: 'POST',
@@ -1005,12 +1383,12 @@ const advancedView = Vue.component('advanced-view', {
               data: { noFileModify: !self.params.noFileModify }
             }).then(() => {
               Vue.set(ADMINDATA.serverParams, 'noFileModify', !self.params.noFileModify);
-              iziToast.success({ title: 'Updated Successfully', position: 'topCenter', timeout: 3500 });
+              iziToast.success({ title: t('admin.settings.updated'), position: 'topCenter', timeout: 3500 });
             }).catch(() => {
-              iziToast.error({ title: 'Failed', position: 'topCenter', timeout: 3500 });
+              iziToast.error({ title: t('admin.settings.failed'), position: 'topCenter', timeout: 3500 });
             });
           }, true],
-          ['<button>Go Back</button>', (instance, toast) => {
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
           }],
         ]
@@ -1027,10 +1405,10 @@ const advancedView = Vue.component('advanced-view', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: `<b>${this.params.noUpload === false ? 'Disable' : 'Enable'} File Uploading?</b>`,
+        title: `<b>${this.params.noUpload === false ? t('admin.settings.disableUploading') : t('admin.settings.enableUploading')}</b>`,
         position: 'center',
         buttons: [
-          [`<button><b>${this.params.noUpload === false ? 'Disable' : 'Enable'}</b></button>`, (instance, toast) => {
+          [`<button><b>${this.params.noUpload === false ? t('admin.settings.disableButton') : t('admin.settings.enableButton')}</b></button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             API.axios({
               method: 'POST',
@@ -1041,23 +1419,26 @@ const advancedView = Vue.component('advanced-view', {
               Vue.set(ADMINDATA.serverParams, 'noUpload', !this.params.noUpload);
 
               iziToast.success({
-                title: 'Updated Successfully',
+                title: t('admin.settings.updated'),
                 position: 'topCenter',
                 timeout: 3500
               });
             }).catch(() => {
               iziToast.error({
-                title: 'Failed',
+                title: t('admin.settings.failed'),
                 position: 'topCenter',
                 timeout: 3500
               });
             });
           }, true],
-          ['<button>Go Back</button>', (instance, toast) => {
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
           }],
         ]
       });
+    },
+    refreshServerAudioInfo: function() {
+      ADMINDATA.redetectCliPlayers();
     },
     toggleAutoBootServerAudio: function() {
       iziToast.question({
@@ -1070,11 +1451,11 @@ const advancedView = Vue.component('advanced-view', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: `<b>${this.params.autoBootServerAudio ? 'Disable' : 'Enable'} Auto-Boot Server Audio?</b>`,
-        message: 'When enabled, mStream will automatically start the Rust audio player on boot',
+        title: `<b>${this.params.autoBootServerAudio ? t('admin.settings.disableAutoBoot') : t('admin.settings.enableAutoBoot')}</b>`,
+        message: t('admin.settings.autoBootHint'),
         position: 'center',
         buttons: [
-          [`<button><b>${this.params.autoBootServerAudio ? 'Disable' : 'Enable'}</b></button>`, (instance, toast) => {
+          [`<button><b>${this.params.autoBootServerAudio ? t('admin.settings.disableButton') : t('admin.settings.enableButton')}</b></button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             API.axios({
               method: 'POST',
@@ -1082,20 +1463,21 @@ const advancedView = Vue.component('advanced-view', {
               data: { autoBootServerAudio: !this.params.autoBootServerAudio }
             }).then(() => {
               Vue.set(ADMINDATA.serverParams, 'autoBootServerAudio', !this.params.autoBootServerAudio);
+              setTimeout(() => ADMINDATA.getServerAudioInfo(), 500);
               iziToast.success({
-                title: 'Updated Successfully',
+                title: t('admin.settings.updated'),
                 position: 'topCenter',
                 timeout: 3500
               });
             }).catch(() => {
               iziToast.error({
-                title: 'Failed',
+                title: t('admin.settings.failed'),
                 position: 'topCenter',
                 timeout: 3500
               });
             });
           }, true],
-          ['<button>Go Back</button>', (instance, toast) => {
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
           }],
         ]
@@ -1123,38 +1505,38 @@ const dbView = Vue.component('db-view', {
           <div class="col s12">
             <div class="card">
               <div class="card-content">
-                <span class="card-title">DB Scan Settings</span>
+                <span class="card-title">{{ t('admin.db.scanSettings') }}</span>
                 <table>
                   <tbody>
                     <tr>
-                      <td><b>Scan Interval:</b> {{dbParams.scanInterval}} hours</td>
+                      <td><b>{{ t('admin.db.scanInterval') }}</b> {{dbParams.scanInterval}} hours</td>
                       <td>
-                        [<a v-on:click="openModal('edit-scan-interval-modal')">edit</a>]
+                        [<a v-on:click="openModal('edit-scan-interval-modal')">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Boot Scan Delay:</b> {{dbParams.bootScanDelay}} seconds</td>
+                      <td><b>{{ t('admin.db.bootScanDelay') }}</b> {{dbParams.bootScanDelay}} seconds</td>
                       <td>
-                        [<a v-on:click="openModal('edit-boot-scan-delay-modal')">edit</a>]
+                        [<a v-on:click="openModal('edit-boot-scan-delay-modal')">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Skip Image Metadata:</b> {{dbParams.skipImg}}</td>
+                      <td><b>{{ t('admin.db.skipImageMeta') }}</b> {{dbParams.skipImg}}</td>
                       <td>
-                        [<a v-on:click="toggleSkipImg()">edit</a>]
+                        [<a v-on:click="toggleSkipImg()">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Compress Images:</b> {{dbParams.compressImage}}</td>
+                      <td><b>{{ t('admin.db.compressImages') }}</b> {{dbParams.compressImage}}</td>
                       <td>
-                        [<a v-on:click="recompressImages()">re-compress</a>]
-                        [<a v-on:click="toggleCompressImage()">edit</a>]
+                        [<a v-on:click="recompressImages()">{{ t('admin.db.recompress') }}</a>]
+                        [<a v-on:click="toggleCompressImage()">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Max Concurrent Scans:</b> {{dbParams.maxConcurrentTasks}}</td>
+                      <td><b>{{ t('admin.db.maxConcurrentScans') }}</b> {{dbParams.maxConcurrentTasks}}</td>
                       <td>
-                        [<a v-on:click="openModal('edit-max-scan-modal')">edit</a>]
+                        [<a v-on:click="openModal('edit-max-scan-modal')">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                   </tbody>
@@ -1165,31 +1547,31 @@ const dbView = Vue.component('db-view', {
           <div class="col s12">
             <div class="card">
               <div class="card-content">
-                <span class="card-title">Album Art Lookup</span>
+                <span class="card-title">{{ t('admin.db.albumArtLookup') }}</span>
                 <table>
                   <tbody>
                     <tr>
-                      <td><b>Auto Lookup:</b> {{dbParams.autoAlbumArt ? 'Enabled' : 'Disabled'}}</td>
+                      <td><b>{{ t('admin.db.autoLookup') }}</b> {{ dbParams.autoAlbumArt ? t('admin.settings.enabled') : t('admin.settings.disabled') }}</td>
                       <td>
-                        [<a v-on:click="toggleAutoAlbumArt()">edit</a>]
+                        [<a v-on:click="toggleAutoAlbumArt()">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Write to Folder:</b> {{dbParams.albumArtWriteToFolder ? 'Enabled' : 'Disabled'}}</td>
+                      <td><b>{{ t('admin.db.writeToFolder') }}</b> {{ dbParams.albumArtWriteToFolder ? t('admin.settings.enabled') : t('admin.settings.disabled') }}</td>
                       <td>
-                        [<a v-on:click="toggleAlbumArtWriteToFolder()">edit</a>]
+                        [<a v-on:click="toggleAlbumArtWriteToFolder()">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Embed in File:</b> {{dbParams.albumArtWriteToFile ? 'Enabled' : 'Disabled'}}</td>
+                      <td><b>{{ t('admin.db.embedInFile') }}</b> {{ dbParams.albumArtWriteToFile ? t('admin.settings.enabled') : t('admin.settings.disabled') }}</td>
                       <td>
-                        [<a v-on:click="toggleAlbumArtWriteToFile()">edit</a>]
+                        [<a v-on:click="toggleAlbumArtWriteToFile()">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Service Order:</b> {{dbParams.albumArtServices ? dbParams.albumArtServices.join(', ') : 'musicbrainz, itunes, deezer'}}</td>
+                      <td><b>{{ t('admin.db.serviceOrder') }}</b> {{dbParams.albumArtServices ? dbParams.albumArtServices.join(', ') : 'musicbrainz, itunes, deezer'}}</td>
                       <td>
-                        [<a v-on:click="openModal('edit-album-art-services-modal')">edit</a>]
+                        [<a v-on:click="openModal('edit-album-art-services-modal')">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                   </tbody>
@@ -1202,10 +1584,10 @@ const dbView = Vue.component('db-view', {
           <div class="col s12">
             <div class="card">
               <div class="card-content">
-                <span class="card-title">Scan Queue & Stats</span>
-                <a v-on:click="scanDB" class="waves-effect waves-light btn">Start A Scan</a>
-                <a v-on:click="forceRescan" class="waves-effect waves-light btn orange">Force Rescan</a>
-                <a v-on:click="pullStats" class="waves-effect waves-light btn">Pull Stats</a>
+                <span class="card-title">{{ t('admin.db.scanQueueStats') }}</span>
+                <a v-on:click="scanDB" class="waves-effect waves-light btn">{{ t('admin.db.startScan') }}</a>
+                <a v-on:click="forceRescan" class="waves-effect waves-light btn orange">{{ t('admin.db.forceRescan') }}</a>
+                <a v-on:click="pullStats" class="waves-effect waves-light btn">{{ t('admin.db.pullStats') }}</a>
                 <div v-if="isPullingStats === true">
                   <svg class="spinner" width="65px" height="65px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
                 </div>
@@ -1220,24 +1602,24 @@ const dbView = Vue.component('db-view', {
           <div class="col s12">
             <div class="card">
               <div class="card-content">
-                <span class="card-title">Shared Playlists</span>
-                <a v-on:click="loadShared" class="waves-effect waves-light btn">Load Playlists</a>
+                <span class="card-title">{{ t('admin.db.sharedPlaylists') }}</span>
+                <a v-on:click="loadShared" class="waves-effect waves-light btn">{{ t('admin.db.loadPlaylists') }}</a>
                 <br><br>
                 <div v-if="isPullingShared === true">
                   <svg class="spinner" width="65px" height="65px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
                 </div>
                 <div v-else-if="sharedPlaylistsTS.ts !== 0 && sharedPlaylists.length > 0">
-                  [<a v-on:click="deleteUnxpShared">Delete Playlists with no Expiration</a>]
+                  [<a v-on:click="deleteUnxpShared">{{ t('admin.db.deleteNoExpiry') }}</a>]
                   <br>
-                  [<a v-on:click="deleteExpiredShared">Delete Expired Playlists</a>]
+                  [<a v-on:click="deleteExpiredShared">{{ t('admin.db.deleteExpired') }}</a>]
                   <br>
                   <table>
                     <thead>
                       <tr>
-                        <th>Playlist ID</th>
-                        <th>User</th>
-                        <th>Expires</th>
-                        <th>Actions</th>
+                        <th>{{ t('admin.db.playlistId') }}</th>
+                        <th>{{ t('admin.db.user') }}</th>
+                        <th>{{ t('admin.db.expires') }}</th>
+                        <th>{{ t('admin.db.actions') }}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1245,13 +1627,13 @@ const dbView = Vue.component('db-view', {
                         <th><a target="_blank" v-bind:href="'/shared/'+ v.playlistId">{{v.playlistId}}</a></th>
                         <th>{{v.user}}</th>
                         <th>{{new Date(v.expires * 1000).toLocaleString()}}</th>
-                        <th>[<a v-on:click="deletePlaylist(v)">delete</a>]</th>
+                        <th>[<a v-on:click="deletePlaylist(v)">{{ t('admin.db.deleteLower') }}</a>]</th>
                       </tr>
                     </tbody>
                   </table>
                 </div>
                 <div v-else-if="sharedPlaylistsTS.ts !== 0 && sharedPlaylists.length === 0">
-                  No Shared Playlists
+                  {{ t('admin.db.noSharedPlaylists') }}
                 </div>
               </div>
             </div>
@@ -1271,7 +1653,7 @@ const dbView = Vue.component('db-view', {
         this.dbStats = res.data
       } catch (err) {
         iziToast.error({
-          title: 'Failed to Pull Data',
+          title: t('admin.db.pullDataFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -1285,7 +1667,7 @@ const dbView = Vue.component('db-view', {
         await ADMINDATA.getSharedPlaylists();
       } catch (err) {
         iziToast.error({
-          title: 'Failed to Pull Data',
+          title: t('admin.db.pullDataFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -1304,22 +1686,22 @@ const dbView = Vue.component('db-view', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: `Delete playlist <b>${playlistObj.playlistId}</b>?`,
+        title: t('admin.db.deletePlaylistTitle', { id: playlistObj.playlistId }),
         position: 'center',
         buttons: [
-          [`<button><b>Delete</b></button>`, async (instance, toast) => {
+          [`<button><b>${t('admin.users.deleteButton')}</b></button>`, async (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             try {
               await ADMINDATA.deleteSharedPlaylist(playlistObj);
             } catch (err) {
               iziToast.error({
-                title: 'Failed to Delete Playlist',
+                title: t('admin.db.deletePlaylistFailed'),
                 position: 'topCenter',
                 timeout: 3500
               });
             }
           }, true],
-          ['<button>Go Back</button>', (instance, toast) => {
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
           }],
         ]
@@ -1336,10 +1718,10 @@ const dbView = Vue.component('db-view', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: `Delete all playlists without expiration dates?`,
+        title: t('admin.db.deleteAllTitle'),
         position: 'center',
         buttons: [
-          [`<button><b>Delete</b></button>`, async (instance, toast) => {
+          [`<button><b>${t('admin.users.deleteButton')}</b></button>`, async (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             try {
               this.isPullingShared = true;
@@ -1347,7 +1729,7 @@ const dbView = Vue.component('db-view', {
               await ADMINDATA.getSharedPlaylists();
             } catch (err) {
               iziToast.error({
-                title: 'Failed to Delete Shared Playlists',
+                title: t('admin.db.deleteAllFailed'),
                 position: 'topCenter',
                 timeout: 3500
               });
@@ -1355,7 +1737,7 @@ const dbView = Vue.component('db-view', {
               this.isPullingShared = false;
             }
           }, true],
-          ['<button>Go Back</button>', (instance, toast) => {
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
           }],
         ]
@@ -1368,7 +1750,7 @@ const dbView = Vue.component('db-view', {
         await ADMINDATA.getSharedPlaylists();
       } catch (err) {
         iziToast.error({
-          title: 'Failed to Pull Data',
+          title: t('admin.db.pullDataFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -1384,13 +1766,13 @@ const dbView = Vue.component('db-view', {
         });
 
         iziToast.success({
-          title: 'Scan Started',
+          title: t('admin.db.scanStarted'),
           position: 'topCenter',
           timeout: 3500
         });
       } catch (err) {
         iziToast.error({
-          title: 'Failed to Start Scan',
+          title: t('admin.db.scanStartFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -1407,11 +1789,11 @@ const dbView = Vue.component('db-view', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: '<b>Force Rescan All Libraries?</b>',
-        message: 'This will re-parse every file in your library, even if unchanged. Takes longer than a normal scan but ensures all metadata fields are up to date.',
+        title: `<b>${t('admin.db.forceRescanTitle')}</b>`,
+        message: t('admin.db.forceRescanDesc'),
         position: 'center',
         buttons: [
-          ['<button><b>Force Rescan</b></button>', async (instance, toast) => {
+          [`<button><b>${t('admin.db.forceRescan')}</b></button>`, async (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             try {
               await API.axios({
@@ -1419,19 +1801,19 @@ const dbView = Vue.component('db-view', {
                 url: `${API.url()}/api/v1/admin/db/scan/force-rescan`
               });
               iziToast.success({
-                title: 'Force Rescan Started',
+                title: t('admin.db.forceRescanStarted'),
                 position: 'topCenter',
                 timeout: 3500
               });
             } catch (err) {
               iziToast.error({
-                title: 'Failed to Start Rescan',
+                title: t('admin.db.rescanStartFailed'),
                 position: 'topCenter',
                 timeout: 3500
               });
             }
           }, true],
-          ['<button>Cancel</button>', (instance, toast) => {
+          [`<button>${t('admin.settings.cancel')}</button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
           }],
         ]
@@ -1448,11 +1830,11 @@ const dbView = Vue.component('db-view', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: `<b>Compress All Images?</b>`,
-        message: 'This process will run in the background',
+        title: `<b>${t('admin.db.compressAllTitle')}</b>`,
+        message: t('admin.db.compressBackground'),
         position: 'center',
         buttons: [
-          [`<button><b>Start</b></button>`, async (instance, toast) => {
+          [`<button><b>${t('admin.db.startButton')}</b></button>`, async (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             
             try {
@@ -1463,13 +1845,13 @@ const dbView = Vue.component('db-view', {
 
               if (res.data.started === true) {
                 iziToast.success({
-                  title: 'Process Started',
+                  title: t('admin.db.processStarted'),
                   position: 'topCenter',
                   timeout: 3500
                 });
               } else {
                 iziToast.warning({
-                  title: 'Image Compression In Progress',
+                  title: t('admin.db.compressionInProgress'),
                   position: 'topCenter',
                   timeout: 3500
                 });
@@ -1477,13 +1859,13 @@ const dbView = Vue.component('db-view', {
 
             } catch (err) {
               iziToast.error({
-                title: 'Failed',
+                title: t('admin.settings.failed'),
                 position: 'topCenter',
                 timeout: 3500
               });
             }
           }, true],
-          ['<button>Go Back</button>', (instance, toast) => {
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
           }],
         ]
@@ -1500,10 +1882,10 @@ const dbView = Vue.component('db-view', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: `<b>${this.dbParams.compressImage === true ? 'Disable' : 'Enable'} Compress Images?</b>`,
+        title: `<b>${this.dbParams.compressImage === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')} ${t('admin.db.toggleCompressImages')}?</b>`,
         position: 'center',
         buttons: [
-          [`<button><b>${this.dbParams.compressImage === true ? 'Disable' : 'Enable'}</b></button>`, (instance, toast) => {
+          [`<button><b>${this.dbParams.compressImage === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')}</b></button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             API.axios({
               method: 'POST',
@@ -1514,19 +1896,19 @@ const dbView = Vue.component('db-view', {
               Vue.set(ADMINDATA.dbParams, 'compressImage', !this.dbParams.compressImage);
 
               iziToast.success({
-                title: 'Updated Successfully',
+                title: t('admin.settings.updated'),
                 position: 'topCenter',
                 timeout: 3500
               });
             }).catch(() => {
               iziToast.error({
-                title: 'Failed',
+                title: t('admin.settings.failed'),
                 position: 'topCenter',
                 timeout: 3500
               });
             });
           }, true],
-          ['<button>Go Back</button>', (instance, toast) => {
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
           }],
         ]
@@ -1543,10 +1925,10 @@ const dbView = Vue.component('db-view', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: `<b>${this.dbParams.skipImg === true ? 'Disable' : 'Enable'} Image Skip?</b>`,
+        title: `<b>${this.dbParams.skipImg === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')} ${t('admin.db.toggleSkipImg')}?</b>`,
         position: 'center',
         buttons: [
-          [`<button><b>${this.dbParams.skipImg === true ? 'Disable' : 'Enable'}</b></button>`, (instance, toast) => {
+          [`<button><b>${this.dbParams.skipImg === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')}</b></button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             API.axios({
               method: 'POST',
@@ -1557,19 +1939,19 @@ const dbView = Vue.component('db-view', {
               Vue.set(ADMINDATA.dbParams, 'skipImg', !this.dbParams.skipImg);
 
               iziToast.success({
-                title: 'Updated Successfully',
+                title: t('admin.settings.updated'),
                 position: 'topCenter',
                 timeout: 3500
               });
             }).catch(() => {
               iziToast.error({
-                title: 'Failed',
+                title: t('admin.settings.failed'),
                 position: 'topCenter',
                 timeout: 3500
               });
             });
           }, true],
-          ['<button>Go Back</button>', (instance, toast) => {
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
           }],
         ]
@@ -1581,8 +1963,8 @@ const dbView = Vue.component('db-view', {
         data: { autoAlbumArt: !self.dbParams.autoAlbumArt }
       }).then(() => {
         Vue.set(ADMINDATA.dbParams, 'autoAlbumArt', !self.dbParams.autoAlbumArt);
-        iziToast.success({ title: 'Updated', position: 'topCenter', timeout: 3500 });
-      }).catch(() => { iziToast.error({ title: 'Failed', position: 'topCenter', timeout: 3500 }); });
+        iziToast.success({ title: t('admin.settings.updated'), position: 'topCenter', timeout: 3500 });
+      }).catch(() => { iziToast.error({ title: t('admin.settings.failed'), position: 'topCenter', timeout: 3500 }); });
     },
     toggleAlbumArtWriteToFolder: function() {
       const self = this;
@@ -1590,8 +1972,8 @@ const dbView = Vue.component('db-view', {
         data: { albumArtWriteToFolder: !self.dbParams.albumArtWriteToFolder }
       }).then(() => {
         Vue.set(ADMINDATA.dbParams, 'albumArtWriteToFolder', !self.dbParams.albumArtWriteToFolder);
-        iziToast.success({ title: 'Updated', position: 'topCenter', timeout: 3500 });
-      }).catch(() => { iziToast.error({ title: 'Failed', position: 'topCenter', timeout: 3500 }); });
+        iziToast.success({ title: t('admin.settings.updated'), position: 'topCenter', timeout: 3500 });
+      }).catch(() => { iziToast.error({ title: t('admin.settings.failed'), position: 'topCenter', timeout: 3500 }); });
     },
     toggleAlbumArtWriteToFile: function() {
       const self = this;
@@ -1599,8 +1981,8 @@ const dbView = Vue.component('db-view', {
         data: { albumArtWriteToFile: !self.dbParams.albumArtWriteToFile }
       }).then(() => {
         Vue.set(ADMINDATA.dbParams, 'albumArtWriteToFile', !self.dbParams.albumArtWriteToFile);
-        iziToast.success({ title: 'Updated', position: 'topCenter', timeout: 3500 });
-      }).catch(() => { iziToast.error({ title: 'Failed', position: 'topCenter', timeout: 3500 }); });
+        iziToast.success({ title: t('admin.settings.updated'), position: 'topCenter', timeout: 3500 });
+      }).catch(() => { iziToast.error({ title: t('admin.settings.failed'), position: 'topCenter', timeout: 3500 }); });
     },
     openModal: function(modalView) {
       modVM.currentViewModal = modalView;
@@ -1787,7 +2169,7 @@ const transcodeView = Vue.component('transcode-view', {
   template: `
     <div class="container">
       <div class="row logo-row">
-        <h4>Powered By</h4>
+        <h4>{{ t('admin.transcode.poweredBy') }}</h4>
         <?xml version="1.0" encoding="UTF-8" standalone="no"?>
         <svg xmlns="http://www.w3.org/2000/svg" width="100%" xmlns:xlink="http://www.w3.org/1999/xlink" height="120" viewBox="0 0 224.44334 60.186738" version="1.1">
           <defs>
@@ -1834,19 +2216,13 @@ const transcodeView = Vue.component('transcode-view', {
         <div class="col s12">
           <div class="card">
             <div class="card-content">
-              <span class="card-title">Settings</span>
+              <span class="card-title">{{ t('admin.transcode.settings') }}</span>
               <table>
                 <tbody>
                   <tr>
-                    <td><b>Transcoding:</b> {{params.enabled === true ? 'Enabled' : 'Disabled'}}</td>
-                    <td>
-                      [<a v-on:click="toggleEnabled()">edit</a>]
-                    </td>
-                  </tr>
-                  <tr>
                     <td><b>FFmpeg Directory:</b> {{params.ffmpegDirectory}}</td>
                     <td>
-                      [<a v-on:click="changeFolder()">edit</a>]
+                      [<a v-on:click="changeFolder()">{{ t('admin.settings.edit') }}</a>]
                     </td>
                   </tr>
                   <tr>
@@ -1858,13 +2234,13 @@ const transcodeView = Vue.component('transcode-view', {
                   <tr>
                     <td><b>Default Codec:</b> {{params.defaultCodec}}</td>
                     <td>
-                      [<a v-on:click="changeCodec()">edit</a>]
+                      [<a v-on:click="changeCodec()">{{ t('admin.settings.edit') }}</a>]
                     </td>
                   </tr>
                   <tr>
                     <td><b>Default Bitrate:</b> {{params.defaultBitrate}}</td>
                     <td>
-                      [<a v-on:click="changeBitrate()">edit</a>]
+                      [<a v-on:click="changeBitrate()">{{ t('admin.settings.edit') }}</a>]
                     </td>
                   </tr>
                 </tbody>
@@ -1875,53 +2251,6 @@ const transcodeView = Vue.component('transcode-view', {
       </div>
     </div>`,
   methods: {
-    toggleEnabled: function() {
-      iziToast.question({
-        timeout: 20000,
-        close: false,
-        overlayClose: true,
-        overlay: true,
-        displayMode: 'once',
-        id: 'question',
-        zindex: 99999,
-        layout: 2,
-        maxWidth: 600,
-        title: `<b>${this.params.enabled === true ? 'Disable' : 'Enable'} Transcoding?</b>`,
-        message: 'Enabling this will download FFmpeg',
-        position: 'center',
-        buttons: [
-          [`<button><b>${this.params.enabled === true ? 'Disable' : 'Enable'}</b></button>`, async (instance, toast) => {
-            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
-            try {
-              await API.axios({
-                method: 'POST',
-                url: `${API.url()}/api/v1/admin/transcode/enable`,
-                data: { enable: !this.params.enabled }
-              });
-              Vue.set(ADMINDATA.transcodeParams, 'enabled', !this.params.enabled);
-
-              // download ffmpeg
-              if (this.params.enabled === true) { this.downloadFFMpeg(); }
-
-              iziToast.success({
-                title: 'Updated Successfully',
-                position: 'topCenter',
-                timeout: 3500
-              });
-            } catch (err) {
-              iziToast.error({
-                title: 'Failed',
-                position: 'topCenter',
-                timeout: 3500
-              });
-            }
-          }, true],
-          ['<button>Go Back</button>', (instance, toast) => {
-            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
-          }],
-        ]
-      });
-    },
     changeCodec: function() {
       modVM.currentViewModal = 'edit-transcode-codec-modal';
       M.Modal.getInstance(document.getElementById('admin-modal')).open();
@@ -1943,13 +2272,13 @@ const transcodeView = Vue.component('transcode-view', {
         });
         Vue.set(ADMINDATA.transcodeParams, 'downloaded', true);
         iziToast.success({
-          title: 'FFmpeg Downloaded',
+          title: t('admin.transcode.ffmpegDownloaded'),
           position: 'topCenter',
           timeout: 3500
         });
       } catch (err) {
         iziToast.error({
-          title: 'Failed To Download FFmpeg',
+          title: t('admin.transcode.ffmpegFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -1959,7 +2288,7 @@ const transcodeView = Vue.component('transcode-view', {
     },
     changeFolder: function() {
       iziToast.warning({
-        title: 'Coming Soon',
+        title: t('admin.transcode.comingSoon'),
         position: 'topCenter',
         timeout: 3500
       });
@@ -1985,8 +2314,8 @@ const federationMainPanel = Vue.component('federation-main-panel', {
   template: `
     <div>
       <ul id="syncthing-tabs" class="tabs tabs-fixed-width">
-        <li class="tab"><a class="active" href="#sync-tab-1">Federation</a></li>
-        <li v-on:click="setSyncthingUrl()" class="tab"><a href="#sync-tab-2">Syncthing</a></li>
+        <li class="tab"><a class="active" href="#sync-tab-1">{{ t('admin.federation.tabFederation') }}</a></li>
+        <li v-on:click="setSyncthingUrl()" class="tab"><a href="#sync-tab-2">{{ t('admin.federation.tabSyncthing') }}</a></li>
       </ul>
       <div id="sync-tab-1">
         <div class="container">
@@ -1994,18 +2323,18 @@ const federationMainPanel = Vue.component('federation-main-panel', {
             <div class="col s12">
               <div class="card">
                 <div class="card-content">
-                  <span class="card-title">mStream Federation</span>
+                  <span class="card-title">{{ t('admin.federation.title') }}</span>
                   <table>
                     <tbody>
                       <tr>
-                        <td><b>Device ID:</b> {{params.deviceId}}</td>
+                        <td><b>{{ t('admin.federation.deviceId') }}</b> {{params.deviceId}}</td>
                       </tr>
                     </tbody>
                   </table>
-                  <p v-on:click="openFederationGenerateInviteModal()">Generate Invite Token</p>
+                  <p v-on:click="openFederationGenerateInviteModal()">{{ t('admin.modal.generateInvite') }}</p>
                 </div>
                 <div class="card-action flow-root">
-                  <a v-on:click="enableFederation()" v-bind:class="{ 'red': enabled.val }" class="waves-effect waves-light btn right">Disable Federation</a>
+                  <a v-on:click="enableFederation()" v-bind:class="{ 'red': enabled.val }" class="waves-effect waves-light btn right">{{ t('admin.federation.disableAction') }}</a>
                 </div>
               </div>
             </div>
@@ -2016,25 +2345,25 @@ const federationMainPanel = Vue.component('federation-main-panel', {
             <div class="col s12">
               <div class="card">
                 <div class="card-content">
-                  <span class="card-title">Accept Invite Token</span>
+                  <span class="card-title">{{ t('admin.federation.acceptInvite') }}</span>
                   <div class="row">
                     <div class="col s12 m12 l6">
                       <div class="row">
                         <div class="col s12">
-                          <label for="fed-invite-token">Federation Token</label>
-                          <textarea id="fed-invite-token" v-model="currentToken" style="height: auto;" rows="4" cols="60" placeholder="Paste your token here"></textarea>
+                          <label for="fed-invite-token">{{ t('admin.federation.tokenLabel') }}</label>
+                          <textarea id="fed-invite-token" v-model="currentToken" style="height: auto;" rows="4" cols="60" :placeholder="t('admin.federation.tokenPlaceholder')"></textarea>
                         </div>
                       </div>
                       <div class="row">
                         <div class="input-field col s12">
                           <input id="fed-invite-url" required type="text" class="validate">
-                          <label for="fed-invite-url">Server URL</label>
+                          <label for="fed-invite-url">{{ t('admin.federation.serverURL') }}</label>
                         </div>
                       </div>
                     </div>
                     <div class="col s12 m12 l6">
                       <form @submit.prevent="acceptInvite" v-if="parsedTokenData !== null">
-                        <p>Select and name folders you want to federate:</p>
+                        <p>{{ t('admin.federation.selectFolders') }}</p>
                         <div v-for="(item, key, index) in parsedTokenData.vPaths">
                           <label>
                             <input type="checkbox" checked/>
@@ -2042,11 +2371,11 @@ const federationMainPanel = Vue.component('federation-main-panel', {
                           </label>
                         </div>
                         <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-                          {{submitPending === false ? 'Accept Invite' : 'Working ...'}}
+                          {{ submitPending === false ? t('admin.federation.acceptInviteButton') : t('admin.federation.working') }}
                         </button>
                       </form>
                       <div v-else>
-                        <p>Paste your token in the textbox to continue</p>
+                        <p>{{ t('admin.federation.pasteTokenHint') }}</p>
                       </div>
                     </div>
                   </div>
@@ -2100,7 +2429,7 @@ const federationMainPanel = Vue.component('federation-main-panel', {
         });
       } catch (err) {
         iziToast.error({
-          title: 'Failed to accept invite',
+          title: t('admin.federation.acceptFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -2160,13 +2489,13 @@ const federationMainPanel = Vue.component('federation-main-panel', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: `${this.enabled.val === true ? 'Disable' : 'Enable'} Federation?`,
+        title: `${this.enabled.val === true ? t('admin.federation.disableTitle') : t('admin.federation.enableTitle')}`,
         position: 'center',
         buttons: [
-          [`<button><b>${this.enabled.val === true ? 'Disable' : 'Enable'}</b></button>`, async (instance, toast) => {
+          [`<button><b>${this.enabled.val === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')}</b></button>`, async (instance, toast) => {
             try {
               this.enablePending = true;
-      
+
               await API.axios({
                 method: 'POST',
                 url: `${API.url()}/api/v1/admin/federation/enable`,
@@ -2174,20 +2503,20 @@ const federationMainPanel = Vue.component('federation-main-panel', {
                   enable: !this.enabled.val,
                 }
               });
-      
+
               // update fronted data
               Vue.set(ADMINDATA.federationEnabled, 'val', !this.enabled.val);
-        
+
               instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
 
               iziToast.success({
-                title: `Syncthing ${this.enabled.val === true ? 'Enabled' : 'Disabled'}`,
+                title: `Syncthing ${this.enabled.val === true ? t('admin.settings.enabled') : t('admin.settings.disabled')}`,
                 position: 'topCenter',
                 timeout: 3500
               });
             } catch(err) {
               iziToast.error({
-                title: 'Toggle Failed',
+                title: t('admin.federation.toggleFailed'),
                 position: 'topCenter',
                 timeout: 3500
               });
@@ -2195,7 +2524,7 @@ const federationMainPanel = Vue.component('federation-main-panel', {
               this.enablePending = false;
             }
           }, true],
-          ['<button>Go Back</button>', (instance, toast) => {
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
           }],
         ]
@@ -2219,10 +2548,10 @@ const federationView = Vue.component('federation-view', {
     <div v-else-if="enabled.val === false" class="row">
       <div class="container">
         <div class="row logo-row">
-          <h4>Powered By</h4>
+          <h4>{{ t('admin.federation.poweredBy') }}</h4>
           <svg xmlns="http://www.w3.org/2000/svg" max-width="200px" viewBox="0 0 429 117.3"><linearGradient id="a" gradientUnits="userSpaceOnUse" x1="58.666" y1="117.332" x2="58.666" y2="0"><stop offset="0" stop-color="#0882c8"/><stop offset="1" stop-color="#26b6db"/></linearGradient><circle fill="url(#a)" cx="58.7" cy="58.7" r="58.7"/><circle fill="none" stroke="#FFF" stroke-width="6" stroke-miterlimit="10" cx="58.7" cy="58.5" r="43.7"/><path fill="#FFF" d="M94.7 47.8c4.7 1.6 9.8-.9 11.4-5.6 1.6-4.7-.9-9.8-5.6-11.4-4.7-1.6-9.8.9-11.4 5.6-1.6 4.7.9 9.8 5.6 11.4z"/><path fill="none" stroke="#FFF" stroke-width="6" stroke-miterlimit="10" d="M97.6 39.4l-30.1 25"/><path fill="#FFF" d="M77.6 91c-.4 4.9 3.2 9.3 8.2 9.8 5 .4 9.3-3.2 9.8-8.2.4-4.9-3.2-9.3-8.2-9.8-5-.4-9.4 3.2-9.8 8.2z"/><path fill="none" stroke="#FFF" stroke-width="6" stroke-miterlimit="10" d="M86.5 91.8l-19-27.4"/><path fill="#FFF" d="M60 69.3c2.7 4.2 8.3 5.4 12.4 2.7 4.2-2.7 5.4-8.3 2.7-12.4-2.7-4.2-8.3-5.4-12.4-2.7-4.2 2.6-5.4 8.2-2.7 12.4z"/><g><path fill="#FFF" d="M21.2 61.4c-4.3-2.5-9.8-1.1-12.3 3.1-2.5 4.3-1.1 9.8 3.1 12.3 4.3 2.5 9.8 1.1 12.3-3.1s1.1-9.7-3.1-12.3z"/><path fill="none" stroke="#FFF" stroke-width="6" stroke-miterlimit="10" d="M16.6 69.1l50.9-4.7"/></g><g fill="#0891D1"><path d="M163.8 50.2c-.6-.7-6.3-4.1-11.4-4.1-3.4 0-5.2 1.2-5.2 3.5 0 2.9 3.2 3.7 8.9 5.2 8.2 2.2 13.3 5 13.3 12.9 0 9.7-7.8 13-16 13-6.2 0-13.1-2-18.2-5.3l4.3-8.6c.8.8 7.5 5 14 5 3.5 0 5.2-1.1 5.2-3.2 0-3.2-4.4-4-10.3-5.8-7.9-2.4-11.5-5.3-11.5-11.8 0-9 7.2-13.9 15.7-13.9 6.1 0 11.6 2.5 15.4 4.7l-4.2 8.4zM175 85.1c1.7.5 3.3.8 4.4.8 2 0 3.3-1.5 4.2-5.5l-11.9-31.5h9.8l7.4 23.3 6.3-23.3h8.9L192 85.5c-1.7 5.3-6.2 8.7-11.8 8.8-1.7 0-3.5-.2-5.3-.9v-8.3zM239.3 80.3h-9.6V62.6c0-4.1-1.7-5.9-4.3-5.9-2.6 0-5.8 2.3-7 5.6v18.1h-9.6V48.8h8.6v5.3c2.3-3.7 6.8-5.9 12.2-5.9 8.2 0 9.5 6.7 9.5 11.9v20.2zM261.6 48.2c7.2 0 12.3 3.4 14.8 8.3l-9.4 2.8c-1.2-1.9-3.1-3-5.5-3-4 0-7 3.2-7 8.2 0 5 3.1 8.3 7 8.3 2.4 0 4.6-1.3 5.5-3.1l9.4 2.9c-2.3 4.9-7.6 8.3-14.8 8.3-10.6 0-16.9-7.7-16.9-16.4s6.2-16.3 16.9-16.3zM302.1 78.7c-2.6 1.1-6.2 2.3-9.7 2.3-4.7 0-8.8-2.3-8.8-8.4V56.1h-4v-7.3h4v-10h9.6v10h6.4v7.3h-6.4v13.1c0 2.1 1.2 2.9 2.8 2.9 1.4 0 3-.6 4.2-1.1l1.9 7.7zM337.2 80.3h-9.6V62.6c0-4.1-1.8-5.9-4.6-5.9-2.3 0-5.5 2.2-6.7 5.6v18.1h-9.6V36.5h9.6v17.6c2.3-3.7 6.3-5.9 10.9-5.9 8.5 0 9.9 6.5 9.9 11.9v20.2zM343.4 45.2v-8.7h9.6v8.7h-9.6zm0 35.1V48.8h9.6v31.5h-9.6zM389.9 80.3h-9.6V62.6c0-4.1-1.7-5.9-4.3-5.9-2.6 0-5.8 2.3-7 5.6v18.1h-9.6V48.8h8.6v5.3c2.3-3.7 6.8-5.9 12.2-5.9 8.2 0 9.5 6.7 9.5 11.9v20.2zM395.5 64.6c0-9.2 6-16.3 14.6-16.3 4.7 0 8.4 2.2 10.6 5.8v-5.2h8.3v29.3c0 9.6-7.5 15.5-18.2 15.5-6.8 0-11.5-2.3-15-6.3l5.1-5.2c2.3 2.6 6 4.3 9.9 4.3 4.6 0 8.6-2.4 8.6-8.3v-3.1c-1.9 3.5-5.9 5.3-10 5.3-8.3.1-13.9-7.1-13.9-15.8zm23.9 3.9v-6.6c-1.3-3.3-4.2-5.5-7.1-5.5-4.1 0-7 4-7 8.4 0 4.6 3.2 8 7.5 8 2.9 0 5.3-1.8 6.6-4.3z"/></g></svg>
         </div>
-        <a v-on:click="enableFederation()" class="waves-effect waves-light btn-large">Enable Federation</a>
+        <a v-on:click="enableFederation()" class="waves-effect waves-light btn-large">{{ t('admin.federation.enableButton') }}</a>
       </div>
     </div>
     <federation-main-panel v-else>
@@ -2244,13 +2573,13 @@ const federationView = Vue.component('federation-view', {
         Vue.set(ADMINDATA.federationEnabled, 'val', !this.enabled.val);
   
         iziToast.success({
-          title: `Syncthing ${this.enabled.val === true ? 'Enabled' : 'Disabled'}`,
+          title: `Syncthing ${this.enabled.val === true ? t('admin.settings.enabled') : t('admin.settings.disabled')}`,
           position: 'topCenter',
           timeout: 3500
         });
       } catch(err) {
         iziToast.error({
-          title: 'Toggle Failed',
+          title: t('admin.federation.toggleFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -2278,26 +2607,26 @@ const logsView = Vue.component('logs-view', {
           <div class="col s12">
             <div class="card">
               <div class="card-content">
-                <span class="card-title">Logging</span>
+                <span class="card-title">{{ t('admin.logs.title') }}</span>
                 <table>
                   <tbody>
                     <tr>
-                      <td><b>Write Logs:</b> {{params.writeLogs === true ? 'Enabled' : 'Disabled'}}</td>
+                      <td><b>{{ t('admin.logs.writeLogs') }}</b> {{ params.writeLogs === true ? t('admin.settings.enabled') : t('admin.settings.disabled') }}</td>
                       <td>
-                        [<a v-on:click="toggleWriteLogs">edit</a>]
+                        [<a v-on:click="toggleWriteLogs">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Logs Directory:</b> {{params.storage.logsDirectory}}</td>
+                      <td><b>{{ t('admin.logs.logsDirectory') }}</b> {{params.storage.logsDirectory}}</td>
                       <td>
-                        [<a v-on:click="changeLogsDir()">edit</a>]
+                        [<a v-on:click="changeLogsDir()">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                   </tbody>
                 </table>
               </div>
               <div class="card-action">
-                <a v-on:click="downloadLogs()" class="waves-effect waves-light btn">Download Log File</a>
+                <a v-on:click="downloadLogs()" class="waves-effect waves-light btn">{{ t('admin.logs.download') }}</a>
               </div>
             </div>
           </div>
@@ -2307,7 +2636,7 @@ const logsView = Vue.component('logs-view', {
   methods: {
     changeLogsDir: function() {
       iziToast.warning({
-        title: 'Coming Soon',
+        title: t('admin.transcode.comingSoon'),
         position: 'topCenter',
         timeout: 3500
       });
@@ -2329,7 +2658,7 @@ const logsView = Vue.component('logs-view', {
       } catch (err) {
         console.log(err)
         iziToast.error({
-          title: 'Download Failed',
+          title: t('admin.logs.downloadFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -2346,10 +2675,10 @@ const logsView = Vue.component('logs-view', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: `<b>${this.params.writeLogs === true ? 'Disable' : 'Enable'} Writing Logs To Disk?</b>`,
+        title: `<b>${this.params.writeLogs === true ? t('admin.logs.disableTitle') : t('admin.logs.enableTitle')}</b>`,
         position: 'center',
         buttons: [
-          [`<button><b>${this.params.writeLogs === true ? 'Disable' : 'Enable'}</b></button>`, (instance, toast) => {
+          [`<button><b>${this.params.writeLogs === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')}</b></button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             API.axios({
               method: 'POST',
@@ -2360,19 +2689,19 @@ const logsView = Vue.component('logs-view', {
               Vue.set(ADMINDATA.serverParams, 'writeLogs', !this.params.writeLogs);
 
               iziToast.success({
-                title: 'Updated Successfully',
+                title: t('admin.settings.updated'),
                 position: 'topCenter',
                 timeout: 3500
               });
             }).catch(() => {
               iziToast.error({
-                title: 'Failed',
+                title: t('admin.settings.failed'),
                 position: 'topCenter',
                 timeout: 3500
               });
             });
           }, true],
-          ['<button>Go Back</button>', (instance, toast) => {
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
           }],
         ]
@@ -2388,16 +2717,16 @@ const lockView = Vue.component('lock-view', {
   template: `
     <div class="container">
       <div class="row">
-        <h2>Lock Admin Panel</h2>
+        <h2>{{ t('admin.lock.title') }}</h2>
         <p>
-          This will prevent anyone from making configuration changes with the Admin Panel. If you want undo this you will need to:
+          {{ t('admin.lock.description') }} {{ t('admin.lock.undoInstructions') }}
           <br><br>
-          -- Open the config file<br>
-          -- Change the value of 'lockAdmin' to 'false'<br>
-          -- Reboot mStream
+          -- {{ t('admin.lock.undoStep1') }}<br>
+          -- {{ t('admin.lock.undoStep2') }}<br>
+          -- {{ t('admin.lock.undoStep3') }}
         </p>
         <br>
-        <a class="waves-effect waves-light btn-large" v-on:click="disableAdmin()">Disable Admin Panel</a>
+        <a class="waves-effect waves-light btn-large" v-on:click="disableAdmin()">{{ t('admin.lock.disableButton') }}</a>
       </div>
     </div>`,
     methods: {
@@ -2412,10 +2741,10 @@ const lockView = Vue.component('lock-view', {
           zindex: 99999,
           layout: 2,
           maxWidth: 600,
-          title: '<b>Disable Admin Panel?</b>',
+          title: `<b>${t('admin.lock.disableTitle')}</b>`,
           position: 'center',
           buttons: [
-            [`<button><b>Disable</b></button>`, (instance, toast) => {
+            [`<button><b>${t('admin.lock.disable')}</b></button>`, (instance, toast) => {
               instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
               API.axios({
                 method: 'POST',
@@ -2425,19 +2754,803 @@ const lockView = Vue.component('lock-view', {
                 window.location.reload();
               }).catch(() => {
                 iziToast.error({
-                  title: 'Failed to disable admin panel',
+                  title: t('admin.lock.disableFailed'),
                   position: 'topCenter',
                   timeout: 3500
                 });
               });
             }, true],
-            ['<button>Go Back</button>', (instance, toast) => {
+            [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
               instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             }],
           ]
         });
       }
     }
+});
+
+const dlnaView = Vue.component('dlna-view', {
+  data() {
+    return {
+      paramsTS: ADMINDATA.dlnaParamsUpdated,
+      params: ADMINDATA.dlnaParams,
+      selectedMode: 'disabled',
+      selectedPort: 3011,
+      selectedBrowse: 'dirs',
+      applyPending: false,
+      browsePending: false,
+    };
+  },
+  watch: {
+    'paramsTS.ts': {
+      immediate: true,
+      handler: function() {
+        this.selectedMode   = this.params.mode   || 'disabled';
+        this.selectedPort   = this.params.port   || 3011;
+        this.selectedBrowse = this.params.browse || 'dirs';
+      }
+    }
+  },
+  template: `
+    <div v-if="paramsTS.ts === 0" class="row">
+      <svg class="spinner" width="65px" height="65px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
+    </div>
+    <div v-else class="container">
+      <div class="row" style="margin-top:24px">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">DLNA Media Server</span>
+              <p>DLNA lets smart TVs, receivers, and other devices on your local network discover and play music from mStream without needing to log in.</p>
+              <div style="margin-top:16px">
+                <p><b>Current mode:</b> {{params.mode || 'disabled'}}</p>
+                <p v-if="params.mode !== 'disabled'"><b>Server name:</b> {{params.name}}</p>
+                <p v-if="params.mode !== 'disabled'"><b>UUID:</b> {{params.uuid}}</p>
+                <p v-if="params.mode === 'separate-port'"><b>DLNA port:</b> {{params.port}}</p>
+              </div>
+              <div style="margin-top:20px">
+                <p><b>Change mode:</b></p>
+                <p>
+                  <label style="margin-right:20px">
+                    <input type="radio" v-model="selectedMode" value="disabled" />
+                    <span>Disabled</span>
+                  </label>
+                  <label style="margin-right:20px">
+                    <input type="radio" v-model="selectedMode" value="same-port" />
+                    <span>Same port as mStream</span>
+                  </label>
+                  <label>
+                    <input type="radio" v-model="selectedMode" value="separate-port" />
+                    <span>Separate port (recommended)</span>
+                  </label>
+                </p>
+                <div v-if="selectedMode === 'separate-port'" style="margin-top:12px">
+                  <div class="input-field" style="max-width:200px">
+                    <input id="dlna-port" type="number" v-model.number="selectedPort" min="1" max="65535" />
+                    <label for="dlna-port" class="active">DLNA Port</label>
+                  </div>
+                </div>
+              </div>
+              <div v-if="selectedMode !== 'disabled'" class="card-panel orange lighten-4" style="margin-top:16px">
+                <p><b>Security notice:</b> DLNA exposes your music library to anyone on the local network without authentication.</p>
+                <p v-if="selectedMode === 'same-port'" style="margin-top:8px"><b>Note:</b> In same-port mode, media streaming may be blocked for password-protected libraries. Use separate-port mode for full compatibility.</p>
+                <p v-if="selectedMode === 'same-port'" style="margin-top:8px"><b>HTTPS notice:</b> DLNA is not compatible with self-signed HTTPS certificates. Most DLNA renderers will refuse the connection.</p>
+              </div>
+            </div>
+            <div class="card-action flow-root">
+              <a v-on:click="applyMode()" :disabled="applyPending"
+                 class="waves-effect waves-light btn right">
+                Apply
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="row">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Default View</span>
+              <p>DLNA clients always see all five views (Folders, Artists, Albums, Genres, All Tracks) as sibling containers. This setting controls which one is listed first &mdash; useful for clients that auto-drill into the first container.</p>
+              <div style="margin-top:16px">
+                <p><b>Current:</b> {{params.browse || 'dirs'}}</p>
+              </div>
+              <div style="margin-top:16px">
+                <p>
+                  <label style="margin-right:20px">
+                    <input type="radio" v-model="selectedBrowse" value="dirs" />
+                    <span>Folders</span>
+                  </label>
+                  <label style="margin-right:20px">
+                    <input type="radio" v-model="selectedBrowse" value="artist" />
+                    <span>Artists</span>
+                  </label>
+                  <label style="margin-right:20px">
+                    <input type="radio" v-model="selectedBrowse" value="album" />
+                    <span>Albums</span>
+                  </label>
+                  <label style="margin-right:20px">
+                    <input type="radio" v-model="selectedBrowse" value="genre" />
+                    <span>Genres</span>
+                  </label>
+                  <label>
+                    <input type="radio" v-model="selectedBrowse" value="flat" />
+                    <span>All Tracks</span>
+                  </label>
+                </p>
+              </div>
+            </div>
+            <div class="card-action flow-root">
+              <a v-on:click="applyBrowse()" :disabled="browsePending"
+                 class="waves-effect waves-light btn right">
+                Apply
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`,
+  methods: {
+    applyBrowse: async function() {
+      try {
+        this.browsePending = true;
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/dlna/browse`,
+          data: { browse: this.selectedBrowse }
+        });
+        await ADMINDATA.getDlnaParams();
+        const labels = { dirs: 'Folders', artist: 'Artists', flat: 'All Tracks', album: 'Albums', genre: 'Genres' };
+        iziToast.success({ title: `Default view set to: ${labels[this.selectedBrowse] || this.selectedBrowse}`, position: 'topCenter', timeout: 3500 });
+      } catch(err) {
+        iziToast.error({ title: 'Failed to update browse mode', position: 'topCenter', timeout: 3500 });
+      } finally {
+        this.browsePending = false;
+      }
+    },
+    applyMode: async function() {
+      const mode = this.selectedMode;
+      const port = this.selectedPort;
+      const modeLabels = { disabled: 'Disabled', 'same-port': 'Same Port', 'separate-port': 'Separate Port' };
+      iziToast.question({
+        timeout: 20000,
+        close: false,
+        overlayClose: true,
+        overlay: true,
+        displayMode: 'once',
+        id: 'dlna-question',
+        zindex: 99999,
+        layout: 2,
+        maxWidth: 600,
+        title: `Set DLNA mode to "${modeLabels[mode] || mode}"?`,
+        position: 'center',
+        buttons: [
+          [`<button><b>Apply</b></button>`, async (instance, toast) => {
+            try {
+              this.applyPending = true;
+              const data = { mode };
+              if (mode === 'separate-port') { data.port = port; }
+              await API.axios({
+                method: 'POST',
+                url: `${API.url()}/api/v1/admin/dlna/mode`,
+                data
+              });
+              await ADMINDATA.getDlnaParams();
+              instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+              iziToast.success({
+                title: `DLNA mode set to ${modeLabels[mode] || mode}`,
+                position: 'topCenter',
+                timeout: 3500
+              });
+            } catch(err) {
+              iziToast.error({ title: 'Failed to update DLNA setting', position: 'topCenter', timeout: 3500 });
+            } finally {
+              this.applyPending = false;
+            }
+          }, true],
+          [`<button>Cancel</button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+          }],
+        ]
+      });
+    }
+  }
+});
+
+const subsonicView = Vue.component('subsonic-view', {
+  data() {
+    return {
+      paramsTS: ADMINDATA.subsonicParamsUpdated,
+      params: ADMINDATA.subsonicParams,
+      selectedMode: 'disabled',
+      selectedPort: 3012,
+      applyPending: false,
+      // API keys — the state lives in ADMINDATA so every view sees a fresh
+      // list, but we reach in locally for the inputs driving this form.
+      apiKeysTS:  ADMINDATA.apiKeysUpdated,
+      apiKeys:    ADMINDATA.apiKeys,
+      newKeyName: '',
+      mintPending: false,
+      lastMintedKey: ADMINDATA.lastMintedKey,
+      // Polish widgets — stats / now-playing / jukebox / token-auth log.
+      statsTS:            ADMINDATA.subsonicStatsUpdated,
+      stats:              ADMINDATA.subsonicStats,
+      jukeboxTS:          ADMINDATA.jukeboxStatusUpdated,
+      jukebox:            ADMINDATA.jukeboxStatus,
+      tokenAttemptsTS:    ADMINDATA.tokenAuthAttemptsUpdated,
+      tokenAttempts:      ADMINDATA.tokenAuthAttempts,
+      testResult:         null,
+      testPending:        false,
+      showMethodList:     false,
+      // Transient success message shown next to the purge buttons.
+      lyricsCachePurgeMsg: null,
+      // One-time display for admin-minted-on-behalf-of keys. Mirrors
+      // `lastMintedKey` but carries the target username too.
+      adminMintedForUser: { val: null, name: null, username: null },
+      pollTimer:          null,
+    };
+  },
+
+  mounted() {
+    // Refresh the live widgets every 5s so now-playing / jukebox state
+    // stays fresh without the admin reloading the page. Stopped on unmount.
+    this.pollTimer = setInterval(() => {
+      ADMINDATA.getSubsonicStats();
+      ADMINDATA.getJukeboxStatus();
+      ADMINDATA.getTokenAuthAttempts();
+    }, 5000);
+  },
+  beforeDestroy() {
+    if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
+  },
+  watch: {
+    'paramsTS.ts': {
+      immediate: true,
+      handler: function() {
+        this.selectedMode = this.params.mode || 'disabled';
+        this.selectedPort = this.params.port || 3012;
+      }
+    }
+  },
+  template: `
+    <div v-if="paramsTS.ts === 0" class="row">
+      <svg class="spinner" width="65px" height="65px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
+    </div>
+    <div v-else class="container">
+      <div class="row" style="margin-top:24px">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Subsonic REST API</span>
+              <p>The Subsonic API lets you use third-party music apps &mdash; DSub, Symfonium, Substreamer, play:Sub, Feishin, Sonixd, and many others &mdash; as clients for your mStream library. Each user signs in with their mStream username and password (or an API key they generate on their profile) from inside the client app.</p>
+              <div style="margin-top:16px">
+                <p><b>Current mode:</b> {{params.mode || 'disabled'}}</p>
+                <p v-if="params.mode === 'separate-port'"><b>Subsonic port:</b> {{params.port}}</p>
+              </div>
+              <div style="margin-top:20px">
+                <p><b>Change mode:</b></p>
+                <p>
+                  <label style="margin-right:20px">
+                    <input type="radio" v-model="selectedMode" value="disabled" />
+                    <span>Disabled</span>
+                  </label>
+                  <label style="margin-right:20px">
+                    <input type="radio" v-model="selectedMode" value="same-port" />
+                    <span>Same port as mStream</span>
+                  </label>
+                  <label>
+                    <input type="radio" v-model="selectedMode" value="separate-port" />
+                    <span>Separate port</span>
+                  </label>
+                </p>
+                <div v-if="selectedMode === 'separate-port'" style="margin-top:12px">
+                  <div class="input-field" style="max-width:200px">
+                    <input id="subsonic-port" type="number" v-model.number="selectedPort" min="1" max="65535" />
+                    <label for="subsonic-port" class="active">Subsonic Port</label>
+                  </div>
+                </div>
+              </div>
+              <div v-if="selectedMode !== 'disabled'" class="card-panel orange lighten-4" style="margin-top:16px">
+                <p><b>Security notice:</b> Subsonic clients authenticate with your mStream user credentials. For best security, enable HTTPS before exposing the Subsonic API to untrusted networks, and use an API key in each client instead of sharing your password.</p>
+                <p style="margin-top:8px">Mint and revoke API keys in the section below. Token-style auth (<code>t=</code>, <code>s=</code>) is not supported &mdash; use plaintext over HTTPS, or an API key.</p>
+              </div>
+            </div>
+            <div class="card-action flow-root">
+              <a v-on:click="applyMode()" :disabled="applyPending"
+                 class="waves-effect waves-light btn right">
+                Apply
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Methods implemented + test connection -->
+      <div v-if="params.mode !== 'disabled'" class="row">
+        <div class="col s12 m6">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">API Surface</span>
+              <p style="font-size:32px;font-weight:300;margin:8px 0">
+                {{stats.methodsImplemented || '—'}}
+                <span style="font-size:14px;color:#777;font-weight:400">
+                  Subsonic methods implemented
+                </span>
+              </p>
+              <p v-if="stats.fullCount != null" style="color:#777;margin:0 0 4px">
+                <small>{{stats.fullCount}} fully implemented &middot; {{stats.stubCount}} stubbed (empty response — real feature not backed)</small>
+              </p>
+              <p style="color:#777"><small>Subsonic 1.16.1 + OpenSubsonic defines roughly 70 methods. The ones this server does not implement at all return a "method not found" error — see the decline list in docs/subsonic-phase3.md.</small></p>
+              <a v-on:click="showMethodList = !showMethodList" class="btn-flat waves-effect" style="padding:0 8px">
+                {{showMethodList ? 'Hide' : 'Show'}} method list
+              </a>
+              <div v-if="showMethodList" style="margin-top:12px;max-height:220px;overflow-y:auto;background:#f5f5f5;padding:8px;border-radius:4px;font-family:monospace;font-size:12px">
+                <!-- New shape: per-method {name, status}. Fall back to the
+                     plain list on older server builds that don't emit it. -->
+                <div v-if="stats.methodStatuses && stats.methodStatuses.length">
+                  <div v-for="m in stats.methodStatuses" :key="m.name">
+                    <span v-if="m.status === 'stub'"
+                          style="display:inline-block;min-width:42px;background:#f0ad4e;color:#fff;padding:0 4px;border-radius:2px;margin-right:6px;font-size:10px;text-align:center;vertical-align:1px">STUB</span>
+                    <span v-else
+                          style="display:inline-block;min-width:42px;background:#5cb85c;color:#fff;padding:0 4px;border-radius:2px;margin-right:6px;font-size:10px;text-align:center;vertical-align:1px">FULL</span>
+                    {{m.name}}
+                  </div>
+                </div>
+                <div v-else>
+                  <div v-for="m in stats.methods" :key="m">{{m}}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="col s12 m6">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Test Connection</span>
+              <p>Make a ping request against the running Subsonic endpoint as if a client were connecting. Useful for verifying a mode change took effect.</p>
+              <a v-on:click="runTest()" :disabled="testPending"
+                 class="waves-effect waves-light btn" style="margin-top:8px">
+                {{testPending ? 'Testing…' : 'Test Connection'}}
+              </a>
+              <div v-if="testResult" style="margin-top:16px" :class="testResult.ok ? 'card-panel green lighten-4' : 'card-panel red lighten-4'">
+                <p><b>{{testResult.ok ? 'OK' : 'Failed'}}</b>
+                  <span v-if="testResult.ok"> — {{testResult.latencyMs}}ms, server v{{testResult.serverVersion}}</span>
+                  <span v-else> — {{testResult.reason || testResult.status || 'unknown error'}}</span>
+                </p>
+                <p v-if="testResult.url" style="margin-top:6px"><small><code>{{testResult.url}}</code></small></p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Now-playing strip -->
+      <div v-if="params.mode !== 'disabled'" class="row">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Now Playing</span>
+              <p v-if="stats.nowPlaying.length === 0" style="color:#777"><i>Nobody is streaming right now.</i></p>
+              <table v-else class="striped">
+                <thead>
+                  <tr><th>User</th><th>Track</th><th>Artist</th><th>Album</th><th>Since</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="p in stats.nowPlaying" :key="p.username + ':' + p.trackId">
+                    <td><b>{{p.username}}</b></td>
+                    <td>{{p.title || '(unknown title)'}}</td>
+                    <td>{{p.artist || '—'}}</td>
+                    <td>{{p.album || '—'}}</td>
+                    <td><small>{{formatSince(p.sinceMs)}}</small></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Lyrics cache (LRCLib fallback, V20). Visible regardless of
+           Subsonic mode because /api/v1/lyrics works through the main
+           mStream auth wall (Velvet UI uses that path), so an operator
+           running Subsonic=disabled but Velvet=on still benefits. -->
+      <div v-if="stats.lyrics" class="row">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Lyrics Lookup (LRCLib)</span>
+              <p>
+                When a track has no embedded lyrics and no sibling <code>.lrc</code> / <code>.txt</code> sidecar,
+                mStream can fetch from
+                <a href="https://lrclib.net" target="_blank" rel="noopener">lrclib.net</a> and cache the result.
+              </p>
+              <p style="color:#b26500;background:#fff3e0;padding:8px;border-radius:4px;margin:8px 0">
+                <small><b>Privacy:</b> enabling this sends <code>{artist, title, duration}</code>
+                over HTTPS to lrclib.net for every track that has no local lyrics.
+                No user identity is included. Disable if your server is meant to be fully offline.</small>
+              </p>
+              <p style="margin:12px 0">
+                <span class="chip" :class="stats.lyrics.lrclibEnabled ? 'green lighten-4' : 'grey lighten-3'">
+                  {{stats.lyrics.lrclibEnabled ? 'Enabled' : 'Disabled'}}
+                </span>
+                <a v-on:click="toggleLrclib()" class="btn-flat waves-effect" style="padding:0 8px">
+                  {{stats.lyrics.lrclibEnabled ? 'Disable' : 'Enable'}}
+                </a>
+              </p>
+              <p v-if="stats.lyrics.lrclibEnabled" style="margin:8px 0;padding:8px;background:#f9f9f9;border-radius:4px">
+                <label>
+                  <input type="checkbox" class="filled-in"
+                         :checked="stats.lyrics.writeSidecarEnabled"
+                         v-on:change="toggleWriteSidecar($event.target.checked)" />
+                  <span>
+                    <b>Also write <code>.lrc</code> / <code>.txt</code> sidecar next to the audio file</b><br>
+                    <small style="color:#777">
+                      Default off. When on, a successful LRCLib fetch also drops a sibling sidecar
+                      file so the lyrics travel with the track if it's copied elsewhere.
+                      Never overwrites an existing sidecar; silently skipped on read-only storage.
+                    </small>
+                  </span>
+                </label>
+              </p>
+              <table v-if="stats.lyrics.cache" style="max-width:400px">
+                <tbody>
+                  <tr><td><b>Cached hits</b></td>  <td>{{stats.lyrics.cache.hit}}</td></tr>
+                  <tr><td><b>Cached misses</b></td><td>{{stats.lyrics.cache.miss}}</td></tr>
+                  <tr><td><b>Errors</b></td>       <td>{{stats.lyrics.cache.error}}</td></tr>
+                  <tr><td><b>Pending</b></td>      <td>{{stats.lyrics.cache.pending}}</td></tr>
+                  <tr><td><b>Total rows</b></td>   <td>{{stats.lyrics.cache.total}}</td></tr>
+                </tbody>
+              </table>
+              <p style="margin-top:12px">
+                <a v-on:click="purgeLyricsCache('retry')" class="btn-flat waves-effect" style="padding:0 8px">
+                  Retry errors
+                </a>
+                <a v-on:click="purgeLyricsCache('full')" class="btn-flat waves-effect red-text" style="padding:0 8px">
+                  Purge all
+                </a>
+                <span v-if="lyricsCachePurgeMsg" style="margin-left:12px;color:#5cb85c">
+                  {{lyricsCachePurgeMsg}}
+                </span>
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Jukebox live status -->
+      <div v-if="params.mode !== 'disabled' && jukebox.available" class="row">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Jukebox (Server Audio)</span>
+              <p>
+                <span v-if="jukebox.playing" class="chip green lighten-4" style="font-size:12px">Playing</span>
+                <span v-else-if="jukebox.paused" class="chip orange lighten-4" style="font-size:12px">Paused</span>
+                <span v-else class="chip grey lighten-3" style="font-size:12px">Idle</span>
+                <span v-if="jukebox.queueLength > 0" style="margin-left:12px">
+                  Track {{jukebox.queueIndex + 1}} of {{jukebox.queueLength}}
+                </span>
+              </p>
+              <p v-if="jukebox.currentFile"><b>Current file:</b> <code>{{jukebox.currentFile}}</code></p>
+              <p v-if="jukebox.duration > 0">
+                <b>Position:</b> {{formatSeconds(jukebox.position)}} / {{formatSeconds(jukebox.duration)}}
+              </p>
+              <p>
+                <b>Volume:</b> {{Math.round(jukebox.volume * 100)}}% &middot;
+                <b>Loop:</b> {{jukebox.loopMode}} &middot;
+                <b>Shuffle:</b> {{jukebox.shuffle ? 'on' : 'off'}}
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Token-auth warning log -->
+      <div v-if="params.mode !== 'disabled' && tokenAttempts.length > 0" class="row">
+        <div class="col s12">
+          <div class="card orange lighten-5">
+            <div class="card-content">
+              <span class="card-title" style="color:#bf5700">Token-auth attempts — clients stuck in a login loop</span>
+              <p>mStream cannot support Subsonic's legacy token auth (the server would need the plaintext password to compute the MD5 digest — it only keeps PBKDF2 hashes). Clients that default to token auth get rejected with error 41 and usually loop. Mint an API key for the affected user below and hand it to them.</p>
+              <table class="striped" style="margin-top:12px">
+                <thead>
+                  <tr><th>User</th><th>Client</th><th>When</th><th></th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(a, i) in tokenAttempts" :key="i">
+                    <td><b>{{a.username || '(anonymous)'}}</b></td>
+                    <td>{{a.client || '—'}}</td>
+                    <td><small>{{formatSince(Date.now() - a.at)}} ago</small></td>
+                    <td>
+                      <a v-if="a.username" v-on:click="mintForUser(a.username)"
+                         class="btn-small waves-effect waves-light blue">Generate key for {{a.username}}</a>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="card-action flow-root">
+              <a v-on:click="clearTokenLog()" class="btn-flat waves-effect right">Clear log</a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Admin-minted-key one-time display -->
+      <div v-if="adminMintedForUser.val" class="row">
+        <div class="col s12">
+          <div class="card-panel green lighten-4">
+            <p><b>Key created for user "{{adminMintedForUser.username}}":</b> {{adminMintedForUser.name}}</p>
+            <p style="margin-top:8px">
+              <code style="user-select:all;word-break:break-all;background:#fff;padding:4px 8px;border-radius:4px;display:inline-block">{{adminMintedForUser.val}}</code>
+            </p>
+            <p style="margin-top:8px"><small>Relay this to the user. They paste it as their API key in their Subsonic client.</small></p>
+            <a v-on:click="dismissAdminMintedKey()" class="waves-effect btn-flat">Dismiss</a>
+          </div>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Your Subsonic API Keys</span>
+              <p>API keys are per-user. Each key authenticates Subsonic clients without exposing your mStream password. The full key value is only shown at creation &mdash; copy it into your client immediately, or revoke it and mint a new one.</p>
+
+              <div v-if="lastMintedKey.val" class="card-panel green lighten-4" style="margin-top:16px">
+                <p><b>New key created:</b> {{lastMintedKey.name}}</p>
+                <p style="margin-top:8px">
+                  <code style="user-select:all;word-break:break-all;background:#fff;padding:4px 8px;border-radius:4px;display:inline-block">{{lastMintedKey.val}}</code>
+                </p>
+                <p style="margin-top:8px"><small>This is the only time the full key will be shown. Paste it into your Subsonic client now.</small></p>
+                <a v-on:click="dismissMintedKey()" class="waves-effect btn-flat">Dismiss</a>
+              </div>
+
+              <div style="margin-top:16px">
+                <div class="row" style="margin-bottom:0">
+                  <div class="input-field col s12 m8">
+                    <input id="api-key-name" type="text" v-model="newKeyName" maxlength="100" placeholder="e.g. phone-dsub, laptop-feishin" />
+                    <label for="api-key-name" class="active">New key name</label>
+                  </div>
+                  <div class="col s12 m4" style="padding-top:20px">
+                    <a v-on:click="mintKey()" :disabled="mintPending || !newKeyName.trim()"
+                       class="waves-effect waves-light btn">Generate key</a>
+                  </div>
+                </div>
+              </div>
+
+              <div v-if="apiKeysTS.ts > 0" style="margin-top:16px">
+                <p v-if="apiKeys.length === 0"><i>No API keys yet.</i></p>
+                <table v-else class="striped">
+                  <thead>
+                    <tr><th>Name</th><th>Created</th><th>Last used</th><th></th></tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="k in apiKeys" :key="k.id">
+                      <td>{{k.name || '(unnamed)'}}</td>
+                      <td><small>{{formatTs(k.created_at)}}</small></td>
+                      <td><small>{{formatTs(k.last_used) || '—'}}</small></td>
+                      <td>
+                        <a v-on:click="revokeKey(k)" class="waves-effect waves-red btn-small red lighten-1">Revoke</a>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`,
+  methods: {
+    formatTs: function(s) {
+      if (!s) { return null; }
+      // SQLite stores as "YYYY-MM-DD HH:MM:SS" in UTC.
+      const d = new Date(s.replace(' ', 'T') + 'Z');
+      return isNaN(d.getTime()) ? s : d.toLocaleString();
+    },
+    // "12.3 seconds ago" → "12s", "123s" → "2m", "4000s" → "1h". Tight
+    // formatting for the inline-table durations.
+    formatSince: function(ms) {
+      if (!Number.isFinite(ms) || ms < 0) { return '—'; }
+      const s = Math.floor(ms / 1000);
+      if (s < 60)   { return `${s}s`; }
+      if (s < 3600) { return `${Math.floor(s / 60)}m`; }
+      return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+    },
+    // "1:23" / "62:15" position/duration formatting.
+    formatSeconds: function(s) {
+      if (!Number.isFinite(s) || s < 0) { return '0:00'; }
+      const m = Math.floor(s / 60);
+      const ss = String(Math.floor(s) % 60).padStart(2, '0');
+      return `${m}:${ss}`;
+    },
+    dismissMintedKey: function() {
+      ADMINDATA.lastMintedKey.val = null;
+      ADMINDATA.lastMintedKey.name = null;
+    },
+    dismissAdminMintedKey: function() {
+      this.adminMintedForUser = { val: null, name: null, username: null };
+    },
+    runTest: async function() {
+      this.testPending = true;
+      this.testResult = null;
+      try {
+        this.testResult = await ADMINDATA.testSubsonicConnection();
+      } catch (err) {
+        this.testResult = { ok: false, reason: err.message };
+      } finally {
+        this.testPending = false;
+      }
+    },
+    // V20: LRCLib lyrics-cache controls. Toggle flips the config flag;
+    // purge wipes rows (mode='full' for all, 'retry' for error/pending).
+    // Each call refreshes the stats so the UI counters stay accurate.
+    toggleLrclib: async function() {
+      const enabled = !this.stats.lyrics?.lrclibEnabled;
+      try {
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/subsonic/lyrics-cache/enabled`,
+          data: { enabled },
+        });
+        await ADMINDATA.getSubsonicStats();
+      } catch (err) {
+        iziToast.error({ title: `Failed to ${enabled ? 'enable' : 'disable'}: ${err.message || '?'}`,
+          position: 'topCenter', timeout: 3000 });
+      }
+    },
+    toggleWriteSidecar: async function(enabled) {
+      try {
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/subsonic/lyrics-cache/write-sidecar`,
+          data: { enabled },
+        });
+        await ADMINDATA.getSubsonicStats();
+      } catch (err) {
+        iziToast.error({ title: `Sidecar toggle failed: ${err.message || '?'}`,
+          position: 'topCenter', timeout: 3000 });
+      }
+    },
+    purgeLyricsCache: async function(mode) {
+      try {
+        const r = await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/subsonic/lyrics-cache/purge`,
+          data: { mode },
+        });
+        this.lyricsCachePurgeMsg = `Removed ${r.data.removed} row(s).`;
+        setTimeout(() => { this.lyricsCachePurgeMsg = null; }, 4000);
+        await ADMINDATA.getSubsonicStats();
+      } catch (err) {
+        iziToast.error({ title: `Purge failed: ${err.message || '?'}`,
+          position: 'topCenter', timeout: 3000 });
+      }
+    },
+    mintForUser: async function(username) {
+      // Same prompt shape as iziToast's question so it feels consistent
+      // with the rest of the admin panel's confirm dialogs.
+      const name = `admin-minted-${new Date().toISOString().slice(0, 10)}`;
+      iziToast.question({
+        timeout: 20000, close: false, overlayClose: true, overlay: true,
+        displayMode: 'once', id: 'admin-mint-key', zindex: 99999, layout: 2,
+        title: `Create a Subsonic API key for "${username}"?`,
+        message: `The key will be labelled "${name}". You will see the key value once and must relay it to the user yourself.`,
+        position: 'center',
+        buttons: [
+          [`<button><b>Create key</b></button>`, async (instance, toast) => {
+            try {
+              const data = await ADMINDATA.mintKeyFor(username, name);
+              this.adminMintedForUser = { val: data.key, name: data.name, username: data.username };
+              iziToast.success({ title: `Key created for ${username}`, position: 'topCenter', timeout: 3000 });
+            } catch (err) {
+              iziToast.error({ title: `Failed to create key: ${err.message || 'unknown error'}`, position: 'topCenter', timeout: 4000 });
+            } finally {
+              instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+            }
+          }, true],
+          [`<button>Cancel</button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+          }],
+        ]
+      });
+    },
+    clearTokenLog: async function() {
+      try {
+        await ADMINDATA.clearTokenAuthAttempts();
+      } catch (err) {
+        iziToast.error({ title: 'Failed to clear log', position: 'topCenter', timeout: 3000 });
+      }
+    },
+    mintKey: async function() {
+      const name = this.newKeyName.trim();
+      if (!name) { return; }
+      try {
+        this.mintPending = true;
+        await ADMINDATA.createApiKey(name);
+        this.newKeyName = '';
+        iziToast.success({ title: 'API key created', position: 'topCenter', timeout: 3000 });
+      } catch (err) {
+        iziToast.error({ title: 'Failed to create API key', position: 'topCenter', timeout: 3500 });
+      } finally {
+        this.mintPending = false;
+      }
+    },
+    revokeKey: function(k) {
+      iziToast.question({
+        timeout: 20000, close: false, overlayClose: true, overlay: true,
+        displayMode: 'once', id: 'api-key-revoke', zindex: 99999, layout: 2,
+        title: `Revoke API key "${k.name || '(unnamed)'}"?`,
+        message: 'Any client using this key will stop working. You cannot undo this.',
+        position: 'center',
+        buttons: [
+          [`<button><b>Revoke</b></button>`, async (instance, toast) => {
+            try {
+              await ADMINDATA.revokeApiKey(k.id);
+              iziToast.success({ title: 'Key revoked', position: 'topCenter', timeout: 2500 });
+            } catch (err) {
+              iziToast.error({ title: 'Failed to revoke key', position: 'topCenter', timeout: 3500 });
+            } finally {
+              instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+            }
+          }, true],
+          [`<button>Cancel</button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+          }],
+        ]
+      });
+    },
+    applyMode: async function() {
+      const mode = this.selectedMode;
+      const port = this.selectedPort;
+      const modeLabels = { disabled: 'Disabled', 'same-port': 'Same Port', 'separate-port': 'Separate Port' };
+      iziToast.question({
+        timeout: 20000,
+        close: false,
+        overlayClose: true,
+        overlay: true,
+        displayMode: 'once',
+        id: 'subsonic-question',
+        zindex: 99999,
+        layout: 2,
+        maxWidth: 600,
+        title: `Set Subsonic mode to "${modeLabels[mode] || mode}"?`,
+        message: mode === 'same-port' || this.params.mode === 'same-port'
+          ? 'This will restart the mStream server.'
+          : '',
+        position: 'center',
+        buttons: [
+          [`<button><b>Apply</b></button>`, async (instance, toast) => {
+            try {
+              this.applyPending = true;
+              const data = { mode };
+              if (mode === 'separate-port') { data.port = port; }
+              await API.axios({
+                method: 'POST',
+                url: `${API.url()}/api/v1/admin/subsonic/mode`,
+                data
+              });
+              await ADMINDATA.getSubsonicParams();
+              instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+              iziToast.success({
+                title: `Subsonic mode set to ${modeLabels[mode] || mode}`,
+                position: 'topCenter',
+                timeout: 3500
+              });
+            } catch(err) {
+              iziToast.error({ title: 'Failed to update Subsonic setting', position: 'topCenter', timeout: 3500 });
+            } finally {
+              this.applyPending = false;
+            }
+          }, true],
+          [`<button>Cancel</button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+          }],
+        ]
+      });
+    }
+  }
 });
 
 const vm = new Vue({
@@ -2450,6 +3563,8 @@ const vm = new Vue({
     'info-view': infoView,
     'transcode-view': transcodeView,
     'federation-view': federationView,
+    'dlna-view': dlnaView,
+    'subsonic-view': subsonicView,
     'logs-view': logsView,
     'rpn-view': rpnView,
     'lock-view': lockView,
@@ -2490,11 +3605,11 @@ const fileExplorerModal = Vue.component('file-explorer-modal', {
   template: `
     <div>
       <div class="row">
-        <h5>File Explorer</h5>
+        <h5>{{ t('admin.fileExplorer.title') }}</h5>
         <span>
-          [<a v-on:click="goToDirectory(currentDirectory, '..')">back</a>]
-          [<a v-on:click="goToDirectory('~')">home</a>]
-          [<a v-on:click="goToDirectory(currentDirectory)">refresh</a>]
+          [<a v-on:click="goToDirectory(currentDirectory, '..')">{{ t('admin.fileExplorer.back') }}</a>]
+          [<a v-on:click="goToDirectory('~')">{{ t('admin.fileExplorer.home') }}</a>]
+          [<a v-on:click="goToDirectory(currentDirectory)">{{ t('admin.fileExplorer.refresh') }}</a>]
         </span>
       </div>
       <div v-if="currentDirectory === null || pending === true" class="row">
@@ -2507,7 +3622,7 @@ const fileExplorerModal = Vue.component('file-explorer-modal', {
           </select>
           <h6>{{currentDirectory}}</h6>
         </div>
-        [<a v-on:click="selectDirectory(currentDirectory)">Select Current Directory</a>]
+        [<a v-on:click="selectDirectory(currentDirectory)">{{ t('admin.fileExplorer.selectCurrent') }}</a>]
         <ul class="collection">
           <li v-on:click="goToDirectory(currentDirectory, dir.name)" v-for="dir in contents" class="collection-item">
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" height="32.4px"><path fill="#FFA000" d="M38 12H22l-4-4H8c-2.2 0-4 1.8-4 4v24c0 2.2 1.8 4 4 4h31c1.7 0 3-1.3 3-3V16c0-2.2-1.8-4-4-4z"/><path fill="#FFCA28" d="M42.2 18H15.3c-1.9 0-3.6 1.4-3.9 3.3L8 40h31.7c1.9 0 3.6-1.4 3.9-3.3l2.5-14c.5-2.4-1.4-4.7-3.9-4.7z"/></svg>
@@ -2547,7 +3662,7 @@ const fileExplorerModal = Vue.component('file-explorer-modal', {
         });
       } catch(err) {
         iziToast.error({
-          title: 'Failed to get directory contents',
+          title: t('admin.fileExplorer.contentsFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -2573,7 +3688,7 @@ const fileExplorerModal = Vue.component('file-explorer-modal', {
         M.Modal.getInstance(document.getElementById('admin-modal')).close();
       }catch(err) {
         iziToast.error({
-          title: 'Cannot Select Directory',
+          title: t('admin.fileExplorer.cannotSelect'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -2594,17 +3709,17 @@ const userPasswordView = Vue.component('user-password-view', {
   template: `
     <form @submit.prevent="updatePassword">
       <div class="modal-content">
-        <h4>Password Reset</h4>
-        <p>User: <b>{{currentUser.value}}</b></p>
+        <h4>{{ t('admin.modal.passwordReset') }}</h4>
+        <p>{{ t('admin.modal.user') }} <b>{{currentUser.value}}</b></p>
         <div class="input-field">
           <input v-model="resetPassword" id="reset-password" required type="password">
-          <label for="reset-password">New Password</label>
+          <label for="reset-password">{{ t('admin.modal.newPassword') }}</label>
         </div>
       </div>
       <div class="modal-footer">
-        <a href="#!" class="modal-close waves-effect waves-green btn-flat">Go Back</a>
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
         <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-          {{submitPending === false ? 'Update Password' : 'Updating...'}}
+          {{ submitPending === false ? t('admin.modal.updatePassword') : t('admin.modal.updating') }}
         </button>
       </div>
     </form>`,
@@ -2626,13 +3741,13 @@ const userPasswordView = Vue.component('user-password-view', {
         M.Modal.getInstance(document.getElementById('admin-modal')).close();
 
         iziToast.success({
-          title: 'Password Updated',
+          title: t('admin.modal.passwordUpdated'),
           position: 'topCenter',
           timeout: 3500
         });
       }catch(err) {
         iziToast.error({
-          title: 'Password Reset Failed',
+          title: t('admin.modal.passwordFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -2656,16 +3771,16 @@ const usersVpathsView = Vue.component('user-vpaths-view', {
   template: `
     <form @submit.prevent="updateFolders">
       <div class="modal-content">
-        <h4>Change Folders</h4>
-        <p>User: <b>{{currentUser.value}}</b></p>
+        <h4>{{ t('admin.modal.changeFolders') }}</h4>
+        <p>{{ t('admin.modal.user') }} <b>{{currentUser.value}}</b></p>
         <select :disabled="Object.keys(directories).length === 0" id="edit-user-dirs" multiple>
           <option :selected="users[currentUser.value].vpaths.includes(value)" v-for="(key, value) in directories" :value="value">{{ value }}</option>
         </select>
       </div>
       <div class="modal-footer">
-        <a href="#!" class="modal-close waves-effect waves-green btn-flat">Go Back</a>
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
         <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-          {{submitPending === false ? 'Update' : 'Updating...'}}
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
         </button>
       </div>
     </form>`,
@@ -2696,13 +3811,13 @@ const usersVpathsView = Vue.component('user-vpaths-view', {
           M.Modal.getInstance(document.getElementById('admin-modal')).close();
   
           iziToast.success({
-            title: 'User Permissions Updated',
+            title: t('admin.modal.permissionsUpdated'),
             position: 'topCenter',
             timeout: 3500
           });
         } catch(err) {
           iziToast.error({
-            title: 'Failed to Update Folders',
+            title: t('admin.modal.foldersFailed'),
             position: 'topCenter',
             timeout: 3500
           });
@@ -2721,31 +3836,36 @@ const userAccessView = Vue.component('user-access-view', {
       submitPending: false,
       isAdmin: ADMINDATA.users[ADMINDATA.selectedUser.value].admin,
       allowMkdir: ADMINDATA.users[ADMINDATA.selectedUser.value].allowMkdir !== false,
-      allowUpload: ADMINDATA.users[ADMINDATA.selectedUser.value].allowUpload !== false
+      allowUpload: ADMINDATA.users[ADMINDATA.selectedUser.value].allowUpload !== false,
+      allowServerAudio: ADMINDATA.users[ADMINDATA.selectedUser.value].allowServerAudio !== false
     };
   },
   template: `
     <form @submit.prevent="updateUser">
       <div class="modal-content">
-        <h4>Change User Access</h4>
-        <p>User: <b>{{currentUser.value}}</b></p>
+        <h4>{{ t('admin.modal.changeAccess') }}</h4>
+        <p>{{ t('admin.modal.user') }} <b>{{currentUser.value}}</b></p>
         <div class="pad-checkbox"><label>
           <input type="checkbox" v-model="isAdmin"/>
-          <span>Admin</span>
+          <span>{{ t('admin.modal.admin') }}</span>
         </label></div>
         <div class="pad-checkbox"><label>
           <input type="checkbox" v-model="allowMkdir"/>
-          <span>Create Folders</span>
+          <span>{{ t('admin.modal.createFolders') }}</span>
         </label></div>
         <div class="pad-checkbox"><label>
           <input type="checkbox" v-model="allowUpload"/>
-          <span>Upload Files</span>
+          <span>{{ t('admin.modal.uploadFiles') }}</span>
+        </label></div>
+        <div class="pad-checkbox"><label>
+          <input type="checkbox" v-model="allowServerAudio"/>
+          <span>Allow Server Audio</span>
         </label></div>
       </div>
       <div class="modal-footer">
-        <a href="#!" class="modal-close waves-effect waves-green btn-flat">Go Back</a>
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
         <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-          {{submitPending === false ? 'Update' : 'Updating...'}}
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
         </button>
       </div>
     </form>`,
@@ -2765,7 +3885,8 @@ const userAccessView = Vue.component('user-access-view', {
               username: this.currentUser.value,
               admin: this.isAdmin,
               allowMkdir: this.allowMkdir,
-              allowUpload: this.allowUpload
+              allowUpload: this.allowUpload,
+              allowServerAudio: this.allowServerAudio
             }
           });
 
@@ -2773,18 +3894,19 @@ const userAccessView = Vue.component('user-access-view', {
           Vue.set(ADMINDATA.users[this.currentUser.value], 'admin', this.isAdmin);
           Vue.set(ADMINDATA.users[this.currentUser.value], 'allowMkdir', this.allowMkdir);
           Vue.set(ADMINDATA.users[this.currentUser.value], 'allowUpload', this.allowUpload);
+          Vue.set(ADMINDATA.users[this.currentUser.value], 'allowServerAudio', this.allowServerAudio);
     
           // close & reset the modal
           M.Modal.getInstance(document.getElementById('admin-modal')).close();
   
           iziToast.success({
-            title: 'User Permissions Updated',
+            title: t('admin.modal.permissionsUpdated'),
             position: 'topCenter',
             timeout: 3500
           });
         } catch(err) {
           iziToast.error({
-            title: 'Failed to Update User',
+            title: t('admin.modal.accessFailed'),
             position: 'topCenter',
             timeout: 3500
           });
@@ -2806,20 +3928,20 @@ const editRequestSizeModal = Vue.component('edit-request-size-modal', {
   template: `
     <form @submit.prevent="updatePort">
       <div class="modal-content">
-        <h4>Change Max Request Size</h4>
-        <p>Accepts KB or MB</p>
+        <h4>{{ t('admin.modal.changeMaxRequest') }}</h4>
+        <p>{{ t('admin.modal.acceptsKbMb') }}</p>
         <div class="input-field">
           <input v-model="maxRequestSize" id="edit-max-request-size" required type="text">
-          <label for="edit-port">Edit Max Request Size</label>
+          <label for="edit-port">{{ t('admin.modal.editMaxRequest') }}</label>
         </div>
         <blockquote>
-          Requires a reboot.
+          {{ t('admin.modal.requiresReboot') }}
         </blockquote>
       </div>
       <div class="modal-footer">
-        <a href="#!" class="modal-close waves-effect waves-green btn-flat">Go Back</a>
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
         <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-          {{submitPending === false ? 'Update' : 'Updating...'}}
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
         </button>
       </div>
     </form>`,
@@ -2845,13 +3967,13 @@ const editRequestSizeModal = Vue.component('edit-request-size-modal', {
         M.Modal.getInstance(document.getElementById('admin-modal')).close();
 
         iziToast.success({
-          title: 'Success: Allow the server 30 seconds to reboot',
+          title: t('admin.modal.rebootSuccess'),
           position: 'topCenter',
           timeout: 3500
         });
       } catch(err) {
         iziToast.error({
-          title: 'Failed to Update',
+          title: t('admin.modal.updateFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -2874,19 +3996,19 @@ const editPortModal = Vue.component('edit-port-modal', {
   template: `
     <form @submit.prevent="updatePort">
       <div class="modal-content">
-        <h4>Change Port</h4>
+        <h4>{{ t('admin.modal.changePort') }}</h4>
         <div class="input-field">
           <input v-model="currentPort" id="edit-port" required type="number" min="2" max="65535">
-          <label for="edit-port">Edit Port</label>
+          <label for="edit-port">{{ t('admin.modal.editPort') }}</label>
         </div>
         <blockquote>
-          Requires a reboot.
+          {{ t('admin.modal.requiresReboot') }}
         </blockquote>
       </div>
       <div class="modal-footer">
-        <a href="#!" class="modal-close waves-effect waves-green btn-flat">Go Back</a>
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
         <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-          {{submitPending === false ? 'Update' : 'Updating...'}}
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
         </button>
       </div>
     </form>`,
@@ -2915,13 +4037,13 @@ const editPortModal = Vue.component('edit-port-modal', {
         }, 4000);
 
         iziToast.success({
-          title: 'Port Updated.  You will be redirected shortly',
+          title: t('admin.modal.portUpdated'),
           position: 'topCenter',
           timeout: 3500
         });
       } catch(err) {
         iziToast.error({
-          title: 'Failed to Update Port',
+          title: t('admin.modal.portFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -2943,20 +4065,20 @@ const editAddressModal = Vue.component('edit-address-modal', {
   template: `
     <form @submit.prevent="updateParam">
       <div class="modal-content">
-        <h4>Server Address</h4>
+        <h4>{{ t('admin.modal.serverAddress') }}</h4>
         <div class="input-field">
           <input v-model="editValue" id="edit-server-address" required type="text">
-          <label for="edit-server-address">Server Address</label>
+          <label for="edit-server-address">{{ t('admin.modal.editAddress') }}</label>
         </div>
         <blockquote>
-          Requires a Reboot<br>
-          <b>Don't edit this unless you know what you're doing</b>
+          {{ t('admin.modal.requiresReboot') }}<br>
+          <b>{{ t('admin.modal.dontEditWarning') }}</b>
         </blockquote>
       </div>
       <div class="modal-footer">
-        <a href="#!" class="modal-close waves-effect waves-green btn-flat">Go Back</a>
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
         <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-          {{submitPending === false ? 'Update' : 'Updating...'}}
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
         </button>
       </div>
     </form>`,
@@ -2981,13 +4103,13 @@ const editAddressModal = Vue.component('edit-address-modal', {
         M.Modal.getInstance(document.getElementById('admin-modal')).close();
 
         iziToast.success({
-          title: 'Address Updated.  Server is rebooting',
+          title: t('admin.modal.addressUpdated'),
           position: 'topCenter',
           timeout: 3500
         });
       } catch(err) {
         iziToast.error({
-          title: 'Update Failed',
+          title: t('admin.modal.addressFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -3009,19 +4131,19 @@ const editMaxScanModal = Vue.component('edit-max-scans-modal', {
   template: `
     <form @submit.prevent="updateParam">
       <div class="modal-content">
-        <h4>Max Concurrent Scans</h4>
+        <h4>{{ t('admin.modal.maxScans') }}</h4>
         <div class="input-field">
           <input v-model="editValue" id="edit-max-scans" required type="number" min="1">
-          <label for="edit-max-scans">Edit Max Scans</label>
+          <label for="edit-max-scans">{{ t('admin.modal.editMaxScans') }}</label>
         </div>
         <blockquote>
-          <b>Using a value more than '1' is experimental</b>
+          <b>{{ t('admin.modal.experimentalWarning') }}</b>
         </blockquote>
       </div>
       <div class="modal-footer">
-        <a href="#!" class="modal-close waves-effect waves-green btn-flat">Go Back</a>
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
         <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-          {{submitPending === false ? 'Update' : 'Updating...'}}
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
         </button>
       </div>
     </form>`,
@@ -3046,13 +4168,13 @@ const editMaxScanModal = Vue.component('edit-max-scans-modal', {
         M.Modal.getInstance(document.getElementById('admin-modal')).close();
 
         iziToast.success({
-          title: 'Updated Successfully',
+          title: t('admin.settings.updated'),
           position: 'topCenter',
           timeout: 3500
         });
       } catch(err) {
         iziToast.error({
-          title: 'Update Failed',
+          title: t('admin.modal.updateFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -3074,16 +4196,16 @@ const editBootScanView = Vue.component('edit-boot-scan-delay-modal', {
   template: `
     <form @submit.prevent="updateParam">
       <div class="modal-content">
-        <h4>Boot Scan Delay</h4>
+        <h4>{{ t('admin.modal.bootScanDelay') }}</h4>
         <div class="input-field">
           <input v-model="editValue" id="edit-scan-delay" required type="number" min="1">
-          <label for="edit-scan-delay">Boot Scan Delay</label>
+          <label for="edit-scan-delay">{{ t('admin.modal.bootScanDelay') }}</label>
         </div>
       </div>
       <div class="modal-footer">
-        <a href="#!" class="modal-close waves-effect waves-green btn-flat">Go Back</a>
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
         <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-          {{submitPending === false ? 'Update' : 'Updating...'}}
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
         </button>
       </div>
     </form>`,
@@ -3108,13 +4230,13 @@ const editBootScanView = Vue.component('edit-boot-scan-delay-modal', {
         M.Modal.getInstance(document.getElementById('admin-modal')).close();
 
         iziToast.success({
-          title: 'Updated Successfully',
+          title: t('admin.settings.updated'),
           position: 'topCenter',
           timeout: 3500
         });
       } catch(err) {
         iziToast.error({
-          title: 'Update Failed',
+          title: t('admin.modal.updateFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -3136,17 +4258,17 @@ const editScanIntervalView = Vue.component('edit-scan-interval-modal', {
   template: `
     <form @submit.prevent="updateParam">
       <div class="modal-content">
-        <h4>Edit Scan Interval</h4>
+        <h4>{{ t('admin.modal.editScanInterval') }}</h4>
         <div class="input-field">
           <input v-model="editValue" id="edit-scan-interval" required type="number" min="0">
-          <label for="edit-scan-interval">Scan Interval</label>
-          <span class="helper-text">Set to '0' to disable automatic scans</span>
+          <label for="edit-scan-interval">{{ t('admin.modal.scanInterval') }}</label>
+          <span class="helper-text">{{ t('admin.modal.disableAutoScans') }}</span>
         </div>
       </div>
       <div class="modal-footer">
-        <a href="#!" class="modal-close waves-effect waves-green btn-flat">Go Back</a>
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
         <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-          {{submitPending === false ? 'Update' : 'Updating...'}}
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
         </button>
       </div>
     </form>`,
@@ -3171,13 +4293,13 @@ const editScanIntervalView = Vue.component('edit-scan-interval-modal', {
         M.Modal.getInstance(document.getElementById('admin-modal')).close();
 
         iziToast.success({
-          title: 'Updated Successfully',
+          title: t('admin.settings.updated'),
           position: 'topCenter',
           timeout: 3500
         });
       } catch(err) {
         iziToast.error({
-          title: 'Update Failed',
+          title: t('admin.modal.updateFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -3199,23 +4321,23 @@ const editSslModal =  Vue.component('edit-ssl-modal', {
   template: `
     <form @submit.prevent="updateSSL">
       <div class="modal-content">
-        <h4>Set SSL Files</h4>
+        <h4>{{ t('admin.modal.setSSL') }}</h4>
         <div class="input-field">
           <input v-model="certPath" id="edit-ssl-cert" required type="text">
-          <label for="edit-ssl-cert">Cert File Path</label>
+          <label for="edit-ssl-cert">{{ t('admin.modal.certPath') }}</label>
         </div>
         <div class="input-field">
           <input v-model="keyPath" id="edit-ssl-key" required type="text">
-          <label for="edit-ssl-key">Key File Path</label>
+          <label for="edit-ssl-key">{{ t('admin.modal.keyPath') }}</label>
         </div>
         <blockquote>
-          Requires a Reboot
+          {{ t('admin.modal.requiresReboot') }}
         </blockquote>
       </div>
       <div class="modal-footer">
-        <a href="#!" class="modal-close waves-effect waves-green btn-flat">Go Back</a>
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
         <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-          {{submitPending === false ? 'Update' : 'Updating...'}}
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
         </button>
       </div>
     </form>`,
@@ -3241,13 +4363,13 @@ const editSslModal =  Vue.component('edit-ssl-modal', {
         }, 4000);
 
         iziToast.success({
-          title: 'Updated Successfully. You will be redirected shortly',
+          title: t('admin.settings.updated'),
           position: 'topCenter',
           timeout: 3500
         });
       } catch(err) {
         iziToast.error({
-          title: 'Update Failed',
+          title: t('admin.modal.updateFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -3270,7 +4392,7 @@ const editTranscodeCodecModal = Vue.component('edit-transcode-codec-modal', {
   template: `
     <form @submit.prevent="updateParam">
       <div class="modal-content">
-        <h4>Set Default Codec</h4>
+        <h4>{{ t('admin.modal.setCodec') }}</h4>
         <select v-model="editValue" id="transcode-codec-dropdown">
           <option value="mp3">MP3</option>
           <option value="opus">Opus</option>
@@ -3278,9 +4400,9 @@ const editTranscodeCodecModal = Vue.component('edit-transcode-codec-modal', {
         </select>
       </div>
       <div class="modal-footer">
-        <a href="#!" class="modal-close waves-effect waves-green btn-flat">Go Back</a>
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
         <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-          {{submitPending === false ? 'Update' : 'Updating...'}}
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
         </button>
       </div>
     </form>`,
@@ -3308,13 +4430,13 @@ const editTranscodeCodecModal = Vue.component('edit-transcode-codec-modal', {
         M.Modal.getInstance(document.getElementById('admin-modal')).close();
 
         iziToast.success({
-          title: 'Updated Successfully',
+          title: t('admin.settings.updated'),
           position: 'topCenter',
           timeout: 3500
         });
       } catch(err) {
         iziToast.error({
-          title: 'Update Failed',
+          title: t('admin.modal.updateFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -3337,7 +4459,7 @@ const editTranscodeDefaultBitrate = Vue.component('edit-transcode-bitrate-modal'
   template: `
     <form @submit.prevent="updateParam">
       <div class="modal-content">
-        <h4>Set Default Bitrate</h4>
+        <h4>{{ t('admin.modal.setBitrate') }}</h4>
         <select v-model="editValue" id="transcode-bitrate-dropdown">
           <option value="64k">64k</option>
           <option value="96k">96k</option>
@@ -3346,9 +4468,9 @@ const editTranscodeDefaultBitrate = Vue.component('edit-transcode-bitrate-modal'
         </select>
       </div>
       <div class="modal-footer">
-        <a href="#!" class="modal-close waves-effect waves-green btn-flat">Go Back</a>
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
         <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-          {{submitPending === false ? 'Update' : 'Updating...'}}
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
         </button>
       </div>
     </form>`,
@@ -3376,13 +4498,13 @@ const editTranscodeDefaultBitrate = Vue.component('edit-transcode-bitrate-modal'
         M.Modal.getInstance(document.getElementById('admin-modal')).close();
 
         iziToast.success({
-          title: 'Updated Successfully',
+          title: t('admin.settings.updated'),
           position: 'topCenter',
           timeout: 3500
         });
       } catch(err) {
         iziToast.error({
-          title: 'Update Failed',
+          title: t('admin.modal.updateFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -3428,28 +4550,28 @@ const federationGenerateInvite = Vue.component('federation-generate-invite-modal
     <div class="modal-content">
       <div class="row">
         <div class="col s12 m12 l6">
-          <h4>Generate Invite Token</h4>
+          <h4>{{ t('admin.modal.generateInvite') }}</h4>
           <form @submit.prevent="generateToken">
             <div class="row">
               <div class="input-field col s12">
                 <select class="material-select" :disabled="Object.keys(directories).length === 0" id="fed-invite-dirs" multiple>
-                  <option disabled selected value="" v-if="Object.keys(directories).length === 0">You must add a directory before adding a user</option>
+                  <option disabled selected value="" v-if="Object.keys(directories).length === 0">{{ t('admin.users.noDirsWarning') }}</option>
                   <option selected v-for="(key, value) in directories" :value="value">{{ value }}</option>
                 </select>
-                <label for="fed-invite-dirs">Directories To Share</label>
+                <label for="fed-invite-dirs">{{ t('admin.modal.dirsToShare') }}</label>
               </div>
             </div>
             <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-              {{submitPending === false ? 'Create Invite' : 'Creating ...'}}
+              {{ submitPending === false ? t('admin.modal.createInvite') : t('admin.modal.creating') }}
             </button>
           </form>
         </div>
         <div class="col s12 m12 l6">
           <blockquote>
-            Invite tokens expire in 30 min
+            {{ t('admin.modal.inviteExpiry') }}
           </blockquote>
-          <textarea v-model="federationInviteToken.val" id="fed-textarea" style="height: auto;" rows="6" cols="60" placeholder="Your invite token will be put here" readonly="readonly"></textarea>
-          <a href="#" class="fed-copy-button" data-clipboard-target="#fed-textarea">Copy To Clipboard</a>
+          <textarea v-model="federationInviteToken.val" id="fed-textarea" style="height: auto;" rows="6" cols="60" :placeholder="t('admin.modal.invitePlaceholder')" readonly="readonly"></textarea>
+          <a href="#" class="fed-copy-button" data-clipboard-target="#fed-textarea">{{ t('admin.modal.copyClipboard') }}</a>
         </div>
       </div>
     </div>`,
@@ -3467,7 +4589,7 @@ const federationGenerateInvite = Vue.component('federation-generate-invite-modal
 
         if(selectedDirs.length === 0) {
           iziToast.warning({
-            title: 'Nothing to Federate',
+            title: t('admin.modal.nothingToFederate'),
             position: 'topCenter',
             timeout: 3500
           });
@@ -3489,7 +4611,7 @@ const federationGenerateInvite = Vue.component('federation-generate-invite-modal
       } catch (err) {
         console.log(err)
         iziToast.error({
-          title: 'Failed to make invite',
+          title: t('admin.modal.inviteFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -3516,19 +4638,19 @@ const editRustPlayerPortModal = Vue.component('edit-rust-player-port-modal', {
   template: `
     <form @submit.prevent="updatePort">
       <div class="modal-content">
-        <h4>Change Rust Player Port</h4>
+        <h4>{{ t('admin.modal.changeRustPort') }}</h4>
         <div class="input-field">
           <input v-model="currentPort" id="edit-rust-port" required type="number" min="1" max="65535">
-          <label for="edit-rust-port">Port</label>
+          <label for="edit-rust-port">{{ t('admin.modal.rustPort') }}</label>
         </div>
         <blockquote>
-          Takes effect on next server boot.
+          {{ t('admin.modal.nextBoot') }}
         </blockquote>
       </div>
       <div class="modal-footer">
-        <a href="#!" class="modal-close waves-effect waves-green btn-flat">Go Back</a>
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
         <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-          {{submitPending === false ? 'Update' : 'Updating...'}}
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
         </button>
       </div>
     </form>`,
@@ -3549,13 +4671,13 @@ const editRustPlayerPortModal = Vue.component('edit-rust-player-port-modal', {
 
         M.Modal.getInstance(document.getElementById('admin-modal')).close();
         iziToast.success({
-          title: 'Rust Player Port Updated',
+          title: t('admin.settings.updated'),
           position: 'topCenter',
           timeout: 3500
         });
       } catch(err) {
         iziToast.error({
-          title: 'Failed to Update Port',
+          title: t('admin.modal.portFailed'),
           position: 'topCenter',
           timeout: 3500
         });
@@ -3576,8 +4698,8 @@ const editAlbumArtServicesModal = Vue.component('edit-album-art-services-modal',
   template: `
     <form @submit.prevent="updateServices">
       <div class="modal-content">
-        <h4>Album Art Service Order</h4>
-        <p>Drag to reorder. Services are tried in order until album art is found.</p>
+        <h4>{{ t('admin.modal.albumArtServiceOrder') }}</h4>
+        <p>{{ t('admin.modal.dragToReorder') }}</p>
         <div style="margin:16px 0;">
           <div v-for="(service, index) in services" :key="service" style="display:flex;align-items:center;padding:10px 12px;margin:4px 0;background:#2a2a2a;border-radius:4px;">
             <span style="flex:1;">{{service}}</span>
@@ -3587,9 +4709,9 @@ const editAlbumArtServicesModal = Vue.component('edit-album-art-services-modal',
         </div>
       </div>
       <div class="modal-footer">
-        <a href="#!" class="modal-close waves-effect waves-green btn-flat">Go Back</a>
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
         <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending">
-          {{submitPending ? 'Saving...' : 'Save Order'}}
+          {{ submitPending ? t('admin.modal.saving') : t('admin.modal.saveOrder') }}
         </button>
       </div>
     </form>`,
@@ -3606,9 +4728,9 @@ const editAlbumArtServicesModal = Vue.component('edit-album-art-services-modal',
         });
         Vue.set(ADMINDATA.dbParams, 'albumArtServices', this.services.slice());
         M.Modal.getInstance(document.getElementById('admin-modal')).close();
-        iziToast.success({ title: 'Service order updated', position: 'topCenter', timeout: 3500 });
+        iziToast.success({ title: t('admin.settings.updated'), position: 'topCenter', timeout: 3500 });
       } catch(err) {
-        iziToast.error({ title: 'Failed', position: 'topCenter', timeout: 3500 });
+        iziToast.error({ title: t('admin.settings.failed'), position: 'topCenter', timeout: 3500 });
       } finally {
         this.submitPending = false;
       }

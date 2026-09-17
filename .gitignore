@@ -40,16 +40,30 @@ save/*.json
 frp/*.ini
 
 dist/*
+webapp/dist/*
 
 .env
 
 rust-parser/target/
 rust-server-audio/target/
 
+save/waveforms/*
+!save/waveforms/README.md
+
 waveform-cache/*
 !waveform-cache/README.md
 
+# Integration test fixtures are generated on first run via the bundled ffmpeg;
+# no need to commit the binary MP3 blobs.
+test/fixtures/music/
+
 .claude/*
+
+/TODO.md
+
+# Generated API docs (built from docs/openapi.yaml via `npm run docs:api`;
+# also built+deployed by .github/workflows/publish-api-docs.yml)
+docs/api.html.claude/*
 
 mstream-ssl.crt
 mstream-ssl.key

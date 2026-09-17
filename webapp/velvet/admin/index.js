@@ -437,6 +437,10 @@ const usersView = Vue.component('users-view', {
       makeAdmin: Object.keys(ADMINDATA.users).length === 0 ? true : false,
       allowMkdir: true,
       allowUpload: true,
+      // Opt-in per user. Admins bypass the gate anyway; everyone else
+      // starts without /api/v1/server-playback access and gets it only
+      // when the operator ticks the box explicitly.
+      allowServerAudio: false,
       submitPending: false,
       selectInstance: null
     };
@@ -482,6 +486,10 @@ const usersView = Vue.component('users-view', {
                       <div class="pad-checkbox"><label>
                         <input type="checkbox" v-model="allowUpload"/>
                         <span>Allow Upload</span>
+                      </label></div>
+                      <div class="pad-checkbox"><label>
+                        <input type="checkbox" v-model="allowServerAudio"/>
+                        <span>Allow Server Audio</span>
                       </label></div>
                     </div>
                     <!-- <div class="col s12 m6">
@@ -625,7 +633,8 @@ const usersView = Vue.component('users-view', {
             vpaths: Array.from(selected).map(el => el.value),
             admin: this.makeAdmin,
             allowMkdir: this.allowMkdir,
-            allowUpload: this.allowUpload
+            allowUpload: this.allowUpload,
+            allowServerAudio: this.allowServerAudio
           };
 
           await API.axios({
@@ -634,7 +643,7 @@ const usersView = Vue.component('users-view', {
             data: data
           });
 
-          Vue.set(ADMINDATA.users, this.newUsername, { vpaths: data.vpaths, admin: data.admin, allowMkdir: data.allowMkdir, allowUpload: data.allowUpload });
+          Vue.set(ADMINDATA.users, this.newUsername, { vpaths: data.vpaths, admin: data.admin, allowMkdir: data.allowMkdir, allowUpload: data.allowUpload, allowServerAudio: data.allowServerAudio });
           this.newUsername = '';
           this.newPassword = '';
 
@@ -1838,12 +1847,6 @@ const transcodeView = Vue.component('transcode-view', {
               <table>
                 <tbody>
                   <tr>
-                    <td><b>Transcoding:</b> {{params.enabled === true ? 'Enabled' : 'Disabled'}}</td>
-                    <td>
-                      [<a v-on:click="toggleEnabled()">edit</a>]
-                    </td>
-                  </tr>
-                  <tr>
                     <td><b>FFmpeg Directory:</b> {{params.ffmpegDirectory}}</td>
                     <td>
                       [<a v-on:click="changeFolder()">edit</a>]
@@ -1875,53 +1878,6 @@ const transcodeView = Vue.component('transcode-view', {
       </div>
     </div>`,
   methods: {
-    toggleEnabled: function() {
-      iziToast.question({
-        timeout: 20000,
-        close: false,
-        overlayClose: true,
-        overlay: true,
-        displayMode: 'once',
-        id: 'question',
-        zindex: 99999,
-        layout: 2,
-        maxWidth: 600,
-        title: `<b>${this.params.enabled === true ? 'Disable' : 'Enable'} Transcoding?</b>`,
-        message: 'Enabling this will download FFmpeg',
-        position: 'center',
-        buttons: [
-          [`<button><b>${this.params.enabled === true ? 'Disable' : 'Enable'}</b></button>`, async (instance, toast) => {
-            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
-            try {
-              await API.axios({
-                method: 'POST',
-                url: `${API.url()}/api/v1/admin/transcode/enable`,
-                data: { enable: !this.params.enabled }
-              });
-              Vue.set(ADMINDATA.transcodeParams, 'enabled', !this.params.enabled);
-
-              // download ffmpeg
-              if (this.params.enabled === true) { this.downloadFFMpeg(); }
-
-              iziToast.success({
-                title: 'Updated Successfully',
-                position: 'topCenter',
-                timeout: 3500
-              });
-            } catch (err) {
-              iziToast.error({
-                title: 'Failed',
-                position: 'topCenter',
-                timeout: 3500
-              });
-            }
-          }, true],
-          ['<button>Go Back</button>', (instance, toast) => {
-            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
-          }],
-        ]
-      });
-    },
     changeCodec: function() {
       modVM.currentViewModal = 'edit-transcode-codec-modal';
       M.Modal.getInstance(document.getElementById('admin-modal')).open();
@@ -2721,7 +2677,8 @@ const userAccessView = Vue.component('user-access-view', {
       submitPending: false,
       isAdmin: ADMINDATA.users[ADMINDATA.selectedUser.value].admin,
       allowMkdir: ADMINDATA.users[ADMINDATA.selectedUser.value].allowMkdir !== false,
-      allowUpload: ADMINDATA.users[ADMINDATA.selectedUser.value].allowUpload !== false
+      allowUpload: ADMINDATA.users[ADMINDATA.selectedUser.value].allowUpload !== false,
+      allowServerAudio: ADMINDATA.users[ADMINDATA.selectedUser.value].allowServerAudio !== false
     };
   },
   template: `
@@ -2740,6 +2697,10 @@ const userAccessView = Vue.component('user-access-view', {
         <div class="pad-checkbox"><label>
           <input type="checkbox" v-model="allowUpload"/>
           <span>Upload Files</span>
+        </label></div>
+        <div class="pad-checkbox"><label>
+          <input type="checkbox" v-model="allowServerAudio"/>
+          <span>Allow Server Audio</span>
         </label></div>
       </div>
       <div class="modal-footer">
@@ -2765,7 +2726,8 @@ const userAccessView = Vue.component('user-access-view', {
               username: this.currentUser.value,
               admin: this.isAdmin,
               allowMkdir: this.allowMkdir,
-              allowUpload: this.allowUpload
+              allowUpload: this.allowUpload,
+              allowServerAudio: this.allowServerAudio
             }
           });
 
@@ -2773,6 +2735,7 @@ const userAccessView = Vue.component('user-access-view', {
           Vue.set(ADMINDATA.users[this.currentUser.value], 'admin', this.isAdmin);
           Vue.set(ADMINDATA.users[this.currentUser.value], 'allowMkdir', this.allowMkdir);
           Vue.set(ADMINDATA.users[this.currentUser.value], 'allowUpload', this.allowUpload);
+          Vue.set(ADMINDATA.users[this.currentUser.value], 'allowServerAudio', this.allowServerAudio);
     
           // close & reset the modal
           M.Modal.getInstance(document.getElementById('admin-modal')).close();

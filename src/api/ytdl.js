@@ -68,13 +68,9 @@ function lookupMetadata(url) {
 export function setup(mstream) {
   mstream.post("/api/v1/ytdl/", async (req, res) => {
     if (config.program.noUpload === true) { throw new WebError('Uploading Disabled'); }
-    if (req.user.allowUpload === false) { throw new WebError('Uploading Disabled', 403); }
+    if (req.user.allow_upload === false || req.user.allow_upload === 0) { throw new WebError('Uploading Disabled', 403); }
 
-    if (!config.program.transcode || config.program.transcode.enabled !== true) {
-      return res.status(500).json({ error: 'transcoding disabled' });
-    }
-
-    if(!transcode.isDownloaded()) {
+    if (!transcode.isDownloaded()) {
       return res.status(500).json({ error: 'FFmpeg not downloaded yet' });
     }
 
@@ -317,9 +313,10 @@ export function setup(mstream) {
           metadata = { track: { no: null, of: null }, disk: { no: null, of: null } };
         }
 
-        // Compute file hash
-        const fileBuffer = await fs.readFile(downloadedFile);
-        const hash = crypto.createHash('md5').update(fileBuffer).digest('hex');
+        // Compute both whole-file and audio-region hashes. The scanner uses
+        // the same helper so ytdl-inserted rows are identity-compatible with
+        // scanned rows.
+        const { fileHash: hash, audioHash } = await (await import('../db/audio-hash.js')).computeHashes(downloadedFile);
 
         // Build DB record matching the scanner schema
         // User-submitted metadata overrides take priority over parsed file metadata
@@ -335,6 +332,7 @@ export function setup(mstream) {
           disk: metadata.disk?.no || null,
           modified: downloadedStat.mtime.getTime(),
           hash: hash,
+          audioHash: audioHash,
           aaFile: null,
           vpath: pathInfo.vpath,
           ts: Math.floor(Date.now() / 1000),
@@ -383,12 +381,12 @@ export function setup(mstream) {
           const albumId = db.findOrCreateAlbum(data.album, artistId, data.year);
           d.prepare(
             `INSERT OR REPLACE INTO tracks (filepath, library_id, title, artist_id, album_id, track_number,
-             disc_number, year, format, file_hash, album_art_file, genre, replaygain_track_db,
+             disc_number, year, format, file_hash, audio_hash, album_art_file, genre, replaygain_track_db,
              modified, scan_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).run(
             data.filepath, lib.id, data.title || null, artistId, albumId,
-            data.track, data.disk, data.year, data.format, data.hash,
+            data.track, data.disk, data.year, data.format, data.hash, data.audioHash || null,
             data.aaFile, data.genre || null, data.replaygainTrackDb, data.modified, 'ytdl'
           );
         }
@@ -478,11 +476,8 @@ export function setup(mstream) {
     if (config.program.noUpload === true) {
       return res.status(403).json({ error: 'Uploading Disabled' });
     }
-    if (req.user.allowUpload === false) {
+    if (req.user.allow_upload === false || req.user.allow_upload === 0) {
       return res.status(403).json({ error: 'Uploading Disabled' });
-    }
-    if (!config.program.transcode || config.program.transcode.enabled !== true) {
-      return res.status(500).json({ error: 'Transcoding disabled' });
     }
     if (!transcode.isDownloaded()) {
       return res.status(500).json({ error: 'FFmpeg not downloaded yet' });
@@ -624,8 +619,9 @@ export function setup(mstream) {
       metadata = { track: { no: null, of: null }, disk: { no: null, of: null } };
     }
 
-    const fileBuffer = await fs.readFile(downloadedFile);
-    const hash = crypto.createHash('md5').update(fileBuffer).digest('hex');
+    // Dual-hash: file_hash (whole file) + audio_hash (audio region only,
+    // stable across tag edits). See src/db/audio-hash.js.
+    const { fileHash: hash, audioHash } = await (await import('../db/audio-hash.js')).computeHashes(downloadedFile);
     const relativePath = path.relative(pathInfo.basePath, downloadedFile).replace(/\\/g, '/');
 
     // Extract album art
@@ -658,14 +654,14 @@ export function setup(mstream) {
       const albumId = db.findOrCreateAlbum(userMeta.album || metadata.album || null, artistId, metadata.year || null);
       d.prepare(
         `INSERT OR REPLACE INTO tracks (filepath, library_id, title, artist_id, album_id, track_number,
-         disc_number, year, format, file_hash, album_art_file, genre, replaygain_track_db,
+         disc_number, year, format, file_hash, audio_hash, album_art_file, genre, replaygain_track_db,
          modified, scan_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         relativePath, lib.id,
         userMeta.title || metadata.title || null, artistId, albumId,
         metadata.track?.no || null, metadata.disk?.no || null,
-        metadata.year || null, expectedExt, hash,
+        metadata.year || null, expectedExt, hash, audioHash || null,
         aaFile, metadata.genre?.[0] || null, null,
         Date.now(), 'ytdl'
       );

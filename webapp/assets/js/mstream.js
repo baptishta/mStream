@@ -212,6 +212,7 @@ function renderPlaylist(playlistName) {
   return `<div data-playlistname="${encodeURIComponent(playlistName)}" class="playlist_row_container">
     <span data-playlistname="${encodeURIComponent(playlistName)}" class="playlistz force-width" onclick="onPlaylistClick(this);">${escapeHtml(playlistName)}</span>
     <div class="song-button-box">
+      <span data-playlistname="${encodeURIComponent(playlistName)}" class="renamePlaylist" onclick="renamePlaylist(this);">Rename</span>
       <span data-playlistname="${encodeURIComponent(playlistName)}" class="deletePlaylist" onclick="deletePlaylist(this);">Delete</span>
     </div>
   </div>`;
@@ -530,6 +531,72 @@ function deletePlaylist(el) {
         ['<button>Go Back</button>', (instance, toast) => {
           instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
         }],
+    ]
+  });
+}
+
+function renamePlaylist(el) {
+  const oldName = decodeURIComponent(el.getAttribute('data-playlistname'));
+
+  iziToast.question({
+    timeout: false,
+    close: false,
+    overlayClose: true,
+    overlay: true,
+    displayMode: 'once',
+    id: 'rename-playlist-question',
+    zindex: 99999,
+    title: `Rename '${oldName}'`,
+    position: 'center',
+    inputs: [
+      [`<input type="text" class="rename-playlist-input" value="${escapeHtml(oldName)}" maxlength="120">`, 'keyup', (instance, toast, input, e) => {
+        // Commit on Enter, cancel on Escape.
+        if (e.key === 'Enter') { toast.querySelector('.iziToast-buttons button.rename-ok').click(); }
+        if (e.key === 'Escape') { instance.hide({ transitionOut: 'fadeOut' }, toast, 'button'); }
+      }, true]
+    ],
+    onOpened: (instance, toast) => {
+      // iziToast attaches mousedown/touchstart handlers to the toast for
+      // drag-to-dismiss and calls preventDefault on them, which blocks the
+      // input from receiving focus, positioning the cursor, or supporting
+      // click-drag selection. Stop propagation before those handlers fire.
+      const input = toast.querySelector('.rename-playlist-input');
+      if (!input) { return; }
+      const stop = (e) => e.stopPropagation();
+      input.addEventListener('mousedown', stop);
+      input.addEventListener('touchstart', stop, { passive: true });
+      input.addEventListener('click', stop);
+      // Pre-select the full name so the user can type to replace it.
+      input.focus();
+      input.select();
+    },
+    buttons: [
+      ['<button class="rename-ok"><b>Rename</b></button>', (instance, toast) => {
+        const input = toast.querySelector('.rename-playlist-input');
+        const newName = (input.value || '').trim();
+        if (!newName || newName === oldName) {
+          instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+          return;
+        }
+        MSTREAMAPI.renamePlaylist(oldName, newName, (response, error) => {
+          if (error !== false) {
+            return boilerplateFailure(response, error);
+          }
+          // Update the row in-place so the user doesn't have to reload.
+          const row = document.querySelector('div[data-playlistname="' + encodeURIComponent(oldName) + '"]');
+          if (row) {
+            const encoded = encodeURIComponent(newName);
+            row.setAttribute('data-playlistname', encoded);
+            row.querySelectorAll('[data-playlistname]').forEach(child => child.setAttribute('data-playlistname', encoded));
+            const label = row.querySelector('.playlistz');
+            if (label) { label.textContent = newName; }
+          }
+        });
+        instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+      }, false],
+      ['<button>Cancel</button>', (instance, toast) => {
+        instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+      }],
     ]
   });
 }

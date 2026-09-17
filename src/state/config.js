@@ -4,7 +4,7 @@ import crypto from 'crypto';
 import Joi from 'joi';
 import winston from 'winston';
 import { getDirname } from '../util/esm-helpers.js';
-import { getTransAlgos, getTransCodecs, getTransBitrates } from '../api/transcode.js';
+import { getTransCodecs, getTransBitrates } from '../api/transcode.js';
 
 const __dirname = getDirname(import.meta.url);
 
@@ -13,6 +13,9 @@ const storageJoi = Joi.object({
   dbDirectory: Joi.string().default(path.join(__dirname, '../../save/db')),
   logsDirectory: Joi.string().default(path.join(__dirname, '../../save/logs')),
   syncConfigDirectory:  Joi.string().default(path.join(__dirname, '../../save/sync')),
+  // Persistent by default — lives under save/ so Docker users who only mount
+  // save/ keep their cache across restarts instead of regenerating every scan.
+  waveformCacheDirectory: Joi.string().default(path.join(__dirname, '../../save/waveforms')),
 });
 
 const scanOptions = Joi.object({
@@ -21,13 +24,13 @@ const scanOptions = Joi.object({
   bootScanDelay: Joi.number().default(3),
   maxConcurrentTasks: Joi.number().integer().min(1).default(1),
   compressImage: Joi.boolean().default(true),
-  scanBatchSize: Joi.number().integer().min(1).default(100),
+  scanCommitInterval: Joi.number().integer().min(1).default(25),
   autoAlbumArt: Joi.boolean().default(true),
   albumArtWriteToFolder: Joi.boolean().default(false),
   albumArtWriteToFile: Joi.boolean().default(false),
   albumArtServices: Joi.array().items(
     Joi.string().valid('musicbrainz', 'itunes', 'deezer')
-  ).default(['musicbrainz', 'itunes', 'deezer'])
+  ).default(['musicbrainz', 'itunes', 'deezer']),
 });
 
 const dbOptions = Joi.object({
@@ -35,8 +38,6 @@ const dbOptions = Joi.object({
 });
 
 const transcodeOptions = Joi.object({
-  algorithm: Joi.string().valid(...getTransAlgos()).optional(), // deprecated — kept for config compat
-  enabled: Joi.boolean().default(false),
   ffmpegDirectory: Joi.string().default(path.join(__dirname, '../../bin/ffmpeg')),
   defaultCodec: Joi.string().valid(...getTransCodecs()).default('opus'),
   defaultBitrate: Joi.string().valid(...getTransBitrates()).default('96k')
@@ -69,6 +70,64 @@ const federationOptions = Joi.object({
   federateUsersMode: Joi.boolean().default(false),
 });
 
+const dlnaOptions = Joi.object({
+  mode: Joi.string().valid('disabled', 'same-port', 'separate-port').default('disabled'),
+  name: Joi.string().default('mStream Music'),
+  uuid: Joi.string().optional(),
+  port: Joi.number().integer().min(1).max(65535).default(3011),
+  browse: Joi.string().valid('flat', 'dirs', 'artist', 'album', 'genre').default('dirs'),
+});
+
+const subsonicOptions = Joi.object({
+  mode: Joi.string().valid('disabled', 'same-port', 'separate-port').default('disabled'),
+  port: Joi.number().integer().min(1).max(65535).default(3012),
+});
+
+// External lyrics lookup via LRCLib (https://lrclib.net). Opt-in
+// because it sends `{artist, title, duration}` for every cache-miss
+// track over the public internet — operators who run mStream for
+// privacy reasons want that off by default. When `lrclib=false` the
+// cache table stays empty; handlers serve only embedded + sidecar
+// lyrics (Phase 2 behaviour).
+//
+// TTLs are how long a cached row is considered fresh. After the TTL
+// elapses, the next request re-enqueues a fetch (the stale row
+// continues to be served in the meantime so we never regress from
+// "had lyrics" to "empty" on a single network blip).
+//   cacheTtlHitsMs   — successful fetches. 7 days: LRCLib corrections
+//                      eventually propagate; long enough to be quiet.
+//   cacheTtlMissesMs — "no lyrics found" responses. 1 day: new tracks
+//                      get indexed on LRCLib over weeks, so a same-
+//                      day re-check isn't useful.
+//   cacheTtlErrorsMs — network/timeout/5xx. 1 hour: transient failures
+//                      shouldn't burn a full day of no-retry.
+//   concurrency      — in-flight fetches cap. LRCLib is generous but
+//                      a fresh-scan burst shouldn't spam them.
+const lyricsOptions = Joi.object({
+  lrclib:           Joi.boolean().default(false),
+  cacheTtlHitsMs:   Joi.number().integer().min(0).default(7 * 24 * 60 * 60 * 1000),
+  cacheTtlMissesMs: Joi.number().integer().min(0).default(    24 * 60 * 60 * 1000),
+  cacheTtlErrorsMs: Joi.number().integer().min(0).default(         60 * 60 * 1000),
+  concurrency:      Joi.number().integer().min(1).max(16).default(2),
+  // Per-call fetch timeout in ms. Read fresh on each fetch so admins
+  // can tune without restarting. Raise if you're on a satellite
+  // connection; lower if you want LRCLib failures to surface faster.
+  fetchTimeoutMs:   Joi.number().integer().min(500).max(60000).default(8000),
+  // When true, successful LRCLib fetches ALSO write a sibling
+  // `<basename>.lrc` (or `.txt` for plain-only hits) next to the
+  // audio file. Default off: the SQLite cache already serves lyrics
+  // instantly, and operators running off read-only storage (cloud
+  // shares, Docker volumes with ro mounts) can't write sidecars.
+  //
+  // Safety: never clobbers an existing `.lrc` / `.txt` sibling — user
+  // curation always wins. Silently skipped if the audio file moved
+  // or the parent dir isn't writable. A future scan picks up the
+  // written sidecar and populates tracks.lyrics_synced_lrc naturally,
+  // at which point the cache entry becomes redundant (still free to
+  // serve either side).
+  writeSidecar:     Joi.boolean().default(false),
+});
+
 const schema = Joi.object({
   address: Joi.string().ip({ cidr: 'forbidden' }).default('::'),
   port: Joi.number().default(3000),
@@ -88,10 +147,17 @@ const schema = Joi.object({
   writeLogs: Joi.boolean().default(false),
   lockAdmin: Joi.boolean().default(false),
   storage: storageJoi.default(storageJoi.validate({}).value),
-  ui: Joi.string().valid('default', 'velvet').default('default'),
+  // 'default'  — mStream's classic UI (webapp/alpha/)
+  // 'velvet'   — mStream's alternative UI (webapp/velvet/)
+  // 'subsonic' — bundled Airsonic Refix (webapp/subsonic/), a third-party
+  //              Subsonic web client pointed at our own /rest/* endpoints.
+  //              Users log in with their mStream username + password;
+  //              every HTTP call from the UI speaks Subsonic.
+  ui: Joi.string().valid('default', 'velvet', 'subsonic').default('default'),
   webAppDirectory: Joi.string().default(path.join(__dirname, '../../webapp')),
   rpn: rpnOptions.default(rpnOptions.validate({}).value),
   transcode: transcodeOptions.default(transcodeOptions.validate({}).value),
+  lyrics: lyricsOptions.default(lyricsOptions.validate({}).value),
   secret: Joi.string().optional(),
   maxRequestSize: Joi.string().pattern(/[0-9]+(KB|MB)/i).default('1MB'),
   db: dbOptions.default(dbOptions.validate({}).value),
@@ -120,6 +186,8 @@ const schema = Joi.object({
     cert: Joi.string().allow('').optional()
   }).optional(),
   federation: federationOptions.default(federationOptions.validate({}).value),
+  dlna: dlnaOptions.default(dlnaOptions.validate({}).value),
+  subsonic: subsonicOptions.default(subsonicOptions.validate({}).value),
   autoBootServerAudio: Joi.boolean().default(false),
   rustPlayerPort: Joi.number().integer().min(1).max(65535).default(3333),
 });
@@ -164,6 +232,33 @@ export async function setup(configFileArg) {
   }
 
   program = await schema.validateAsync(programData, { allowUnknown: true });
+
+  // Enforce the `ui=subsonic` <-> Subsonic same-port constraint: the
+  // bundled Airsonic Refix SPA is configured to talk to the SAME origin
+  // it was served from (env.js SERVER_URL=""). If Subsonic is disabled
+  // or on a separate port, the SPA loads fine but every /rest/* call
+  // 404s and the user sees a "no server" splash with no indication why.
+  // Auto-coerce to same-port + log a loud warning so the operator sees
+  // what we did.
+  if (program.ui === 'subsonic') {
+    if (program.subsonic.mode !== 'same-port') {
+      winston.warn(
+        `[config] ui='subsonic' requires subsonic.mode='same-port' (had '${program.subsonic.mode}'); ` +
+        `forcing same-port so the bundled Refix client can reach the /rest/* API it was built against. ` +
+        `Set ui='default' or ui='velvet' if you need Subsonic disabled/separate-port.`
+      );
+      program.subsonic.mode = 'same-port';
+    }
+  }
+
+  // Persist a stable DLNA UUID so renderers recognise the server across reboots
+  if (!program.dlna.uuid) {
+    program.dlna.uuid = crypto.randomUUID();
+    const rawConfig = JSON.parse(await fs.readFile(configFileArg, 'utf8'));
+    if (!rawConfig.dlna) { rawConfig.dlna = {}; }
+    rawConfig.dlna.uuid = program.dlna.uuid;
+    await fs.writeFile(configFileArg, JSON.stringify(rawConfig, null, 2), 'utf8');
+  }
 }
 
 export function getDefaults() {

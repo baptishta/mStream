@@ -21,7 +21,94 @@ body {
   font-size: 12px;
   max-height: 20vh;
   overflow: auto;
-  z-index: 1000;
+
+}
+
+/* mStream logo inside the top bar (left-aligned). Sized to fit the 48px bar. */
+.nav-bar-logo {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  flex-shrink: 0;
+  /* Override #nav-bar div's padding-left: 4px so the logo sits flush */
+  padding: 0 !important;
+}
+
+.nav-bar-logo svg {
+  height: 32px;
+  width: auto;
+  display: block;
+}
+
+.nav-bar-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* ── "Hide top bar" layout state ──────────────────────────────────────────
+   When the user disables the top bar in the Layout panel:
+   - #nav-bar is hidden entirely
+   - The sidenav logo returns to its original spot (shown again)
+   - The sidenav-spacer-bottom expands to push later sidenav children down
+   - #content / #sidenav reclaim the 48px the nav bar occupied
+   The corresponding rules that show the sidenav-bottom language picker
+   live in lang-dropdown.css alongside the dropdown styles themselves.
+
+   The `.side-nav-header.sidenav-logo` selector is used instead of plain
+   `.sidenav-logo` because the sidenav logo div has both classes and
+   `.side-nav-header { display: flex }` (defined later in this file) would
+   otherwise win the specificity tie. */
+.side-nav-header.sidenav-logo,
+.sidenav-spacer-bottom {
+  display: none;
+}
+
+body.top-bar-hidden #nav-bar {
+  display: none;
+}
+
+body.top-bar-hidden .side-nav-header.sidenav-logo {
+  display: flex;
+}
+
+body.top-bar-hidden .sidenav-spacer-bottom {
+  display: block;
+  flex-grow: 1;
+}
+
+body.top-bar-hidden #content {
+  height: calc(var(--vh, 1vh) * 100);
+}
+
+@media screen and (min-width: 768px) {
+  body.top-bar-hidden #sidenav {
+    height: calc(var(--vh, 1vh) * 100);
+  }
+}
+
+/* Shared style for icon links in the top nav-bar (GitHub, Discord, etc.) */
+.nav-icon-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 4px;
+  color: #F5F7FA;
+  opacity: 0.75;
+  transition: opacity 0.15s, background-color 0.15s;
+}
+
+.nav-icon-link:hover {
+  opacity: 1;
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+.nav-icon-link svg {
+  fill: currentColor;
+  display: block;
 }
 
 #media-player-spacer {
@@ -35,6 +122,45 @@ body {
 
 .determinate {
   background-color: #fa832b !important;
+}
+
+/* Waveform canvas — overlays the progress bar */
+.waveform-canvas {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 2;
+  display: none;
+}
+/* `wf-enabled` applies when the operator has the waveform-bar setting
+   turned on, regardless of whether the data for this track has loaded
+   yet. It reserves the full 28px-tall strip up front so the bar
+   doesn't grow/shift the moment waveform data arrives for the track
+   (previously the plain progress bar sat short, then jumped taller
+   when `wf-active` kicked in — a visible layout shake every song).
+   The plain orange `.determinate` fill continues to render inside the
+   tall strip while data loads. */
+.progress.wf-enabled {
+  padding-top: 28px;
+  margin-top: 12px;
+}
+/* `wf-active` is the narrower "data is actually loaded, show the
+   canvas" state. Hides the plain determinate fill and swaps in the
+   waveform overlay. Layers on top of `wf-enabled` so the tall
+   strip stays put. */
+.progress.wf-active .waveform-canvas { display: block; }
+.progress.wf-active .determinate { visibility: hidden; }
+.progress.wf-active {
+  background-color: transparent !important;
+}
+/* Keep time indicators above the waveform */
+.progress-wrapper .left,
+.progress-wrapper .right {
+  position: relative;
+  z-index: 3;
 }
 
 #media-player-button-bar {
@@ -216,7 +342,7 @@ body {
 
 @media screen and (min-width: 768px) {
   #sidenav {
-    /* height: calc(calc(var(--vh, 1vh) * 100) - 20px);
+    /* height: calc(calc(var(--vh, 1vh) * 100) - 48px);
     overflow-y: auto; */
     /* flex-grow: 0; */     /* do not grow   - initial value: 0 */
     /* flex-shrink: 0; */  /* do not shrink - initial value: 1 */
@@ -471,7 +597,7 @@ body {
   padding: 6px 8px;
   gap: 10px;
   border-bottom: 1px solid rgba(255,255,255,.06);
-  cursor: default;
+  cursor: pointer;
   transition: background .12s;
 }
 
@@ -507,7 +633,6 @@ body {
 .np-queue-info {
   flex: 1;
   min-width: 0;
-  cursor: pointer;
 }
 
 .np-queue-title {
@@ -841,6 +966,46 @@ body {
   padding-left: 7px;
   padding-right: 7px;
   border-bottom-left-radius: 3px;
+}
+
+.renamePlaylist {
+  background-color: rgba(70, 130, 200, .75);
+  line-height: 100% !important;
+  padding-left: 7px;
+  padding-right: 7px;
+  margin-right: 2px;
+}
+
+.renamePlaylist:hover {
+  opacity: 1;
+  background-color: rgba(70, 130, 200, .9);
+}
+
+.rename-playlist-input {
+  width: 260px;
+  padding: 6px 8px;
+  font-size: 14px;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  box-sizing: border-box;
+}
+
+/* iziToast sets `user-select: none` on the entire toast so the toast body
+   itself isn't selectable. That cascades into child inputs too and blocks
+   double-click-to-select inside our text fields. Re-enable selection for
+   any text-like input living inside an iziToast. */
+.iziToast input[type="text"],
+.iziToast input[type="search"],
+.iziToast input[type="email"],
+.iziToast input[type="url"],
+.iziToast input[type="password"],
+.iziToast input[type="number"],
+.iziToast textarea {
+  -webkit-user-select: text;
+  -moz-user-select: text;
+  -ms-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
 }
 
 .downloadPlaylistSong, .recursiveAddDir, .addFileplaylist {

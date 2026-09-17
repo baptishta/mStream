@@ -20,17 +20,25 @@ import * as sharedApi from './api/shared.js';
 import * as scrobblerApi from './api/scrobbler.js';
 import * as config from './state/config.js';
 import * as logger from './logger.js';
-import * as transode from './api/transcode.js';
+import * as transcode from './api/transcode.js';
 import * as dbManager from './db/manager.js';
 import * as syncthing from './state/syncthing.js';
 import * as federationApi from './api/federation.js';
 // scanner.js removed — parser now writes directly to SQLite
 import * as ytdlApi from './api/ytdl.js';
+import * as dlnaApi from './api/dlna.js';
+import * as dlnaSsdp from './dlna/ssdp.js';
+import * as dlnaServer from './dlna/dlna-server.js';
+import * as subsonicApi from './api/subsonic/index.js';
+import * as subsonicServer from './subsonic/subsonic-server.js';
+import * as userApiKeysApi from './api/user-api-keys.js';
 import * as serverPlaybackApi from './api/server-playback.js';
 import * as albumArtApi from './api/album-art.js';
+import * as waveformApi from './api/waveform.js';
+import * as lyricsApi from './api/lyrics.js';
+import * as lyricsLrclib from './api/lyrics-lrclib.js';
 // Velvet UI modules — dynamically imported only when ui='velvet' is active
 import WebError from './util/web-error.js';
-import { sanitizeFilename } from './util/validation.js';
 
 const require = createRequire(import.meta.url);
 const packageJson = require('../package.json');
@@ -134,9 +142,12 @@ export async function serveIt(configFile) {
       return next();
     }
 
-    // VELVET ONLY: skip login redirect — Velvet has a built-in login screen
-    // TODO: standardize login flow so both UIs handle auth the same way
-    if (config.program.ui === 'velvet') {
+    // Velvet and the bundled Subsonic client both handle auth inside
+    // the SPA (Velvet shows an inline form; Refix submits creds via
+    // ping/getArtists on first nav). Skip the server-side /login
+    // redirect for those — let the SPA decide what to render.
+    // TODO: standardize login flow so all UIs handle auth the same way
+    if (config.program.ui === 'velvet' || config.program.ui === 'subsonic') {
       return next();
     }
 
@@ -149,8 +160,9 @@ export async function serveIt(configFile) {
   });
 
   mstream.get('/login', (req, res, next) => {
-    // VELVET ONLY: redirect /login to / since Velvet handles login inline
-    if (config.program.ui === 'velvet') {
+    // Velvet / Subsonic both own their login UI — a server-side hit on
+    // /login is meaningless for them, so redirect back to the SPA root.
+    if (config.program.ui === 'velvet' || config.program.ui === 'subsonic') {
       return res.redirect(302, '/');
     }
 
@@ -169,16 +181,56 @@ export async function serveIt(configFile) {
   // Server-remote route (must be before static middleware to intercept /server-remote)
   serverPlaybackApi.setupBeforeAuth(mstream);
 
-  // Give access to public folder
-  // VELVET ONLY: serve webapp/velvet/ instead of webapp/ when ui='velvet'
+  // Give access to public folder. Three supported UIs — default, velvet,
+  // and the bundled Subsonic web client (Airsonic Refix). Subsonic UI
+  // talks to our own /rest/* endpoints so nothing else needs wiring
+  // differently.
   const webappDir = config.program.ui === 'velvet'
     ? path.join(config.program.webAppDirectory, 'velvet')
-    : config.program.webAppDirectory;
+    : config.program.ui === 'subsonic'
+      ? path.join(config.program.webAppDirectory, 'subsonic')
+      : config.program.webAppDirectory;
   mstream.use('/', express.static(webappDir));
+
+  // Subsonic-UI SPA fallback: the bundled client is a Vue SPA with
+  // history-mode routing (/servers, /albums, /artists, /playlists/...),
+  // so a reload of any route other than `/` must serve index.html and
+  // let the client-side router take over. Inserted right after the
+  // static middleware so it catches unmatched GETs BEFORE the mStream
+  // auth wall 401s them — the SPA handles its own auth by calling
+  // /rest/ping. Scoped to `ui === 'subsonic'` so the default and
+  // velvet UIs keep their 404 behaviour.
+  //
+  // Explicitly skip API namespaces so those fall through to their
+  // real handlers (and 404 properly when the method doesn't exist).
+  if (config.program.ui === 'subsonic') {
+    const SPA_SKIP = /^\/(rest|api|media|album-art|server-remote|shared|dlna)(\/|$)/;
+    const indexPath = path.join(webappDir, 'index.html');
+    // Read the shell once at boot — it's ~800B and never changes while
+    // the process is up.
+    const indexHtml = fs.readFileSync(indexPath, 'utf8');
+    mstream.get(/.*/, (req, res, next) => {
+      if (SPA_SKIP.test(req.path)) { return next(); }
+      // Request explicitly asks for a non-HTML resource — let it 404.
+      const accept = String(req.get('accept') || '');
+      if (accept && !accept.includes('text/html') && !accept.includes('*/*')) {
+        return next();
+      }
+      res.type('html').send(indexHtml);
+    });
+  }
 
   // Public APIs
   remoteApi.setupBeforeAuth(mstream, server);
   await sharedApi.setupBeforeSecurity(mstream);
+  // DLNA routes must be before the auth wall — only needed in same-port mode
+  if (config.program.dlna.mode === 'same-port') { dlnaApi.setup(mstream); }
+
+  // Subsonic REST API — sits before the auth wall because it carries its own
+  // credentials (u/p query string or apiKey) and populates req.user itself.
+  // Only mount when configured for same-port; separate-port uses its own
+  // http.Server started in the post-boot hook below.
+  if (config.program.subsonic.mode === 'same-port') { subsonicApi.setup(mstream); }
 
   // Everything below this line requires authentication
   authApi.setup(mstream);
@@ -188,7 +240,7 @@ export async function serveIt(configFile) {
   playlistApi.setup(mstream);
   downloadApi.setup(mstream);
   fileExplorerApi.setup(mstream);
-  transode.setup(mstream);
+  transcode.setup(mstream);
   scrobblerApi.setup(mstream);
   remoteApi.setupAfterAuth(mstream, server);
   sharedApi.setupAfterSecurity(mstream);
@@ -196,18 +248,25 @@ export async function serveIt(configFile) {
   federationApi.setup(mstream);
   ytdlApi.setup(mstream);
   albumArtApi.setup(mstream);
+  waveformApi.setup(mstream);
+  lyricsApi.setup(mstream);
+  // V20 housekeeping: clean up 'pending' lyrics_cache rows from any
+  // previous process that crashed mid-fetch, and start the periodic
+  // orphan sweep. Both are opt-in-cheap (single UPDATE / DELETE on
+  // a table that starts empty and is usually tiny).
+  lyricsLrclib.onBoot();
   serverPlaybackApi.setup(mstream);
+  userApiKeysApi.setup(mstream);
 
   // VELVET ONLY: additional API modules loaded only when ui='velvet'
   // These provide features specific to the Velvet UI (ListenBrainz, smart playlists,
-  // waveform, stats tracking, user settings, Discogs, cue points).
+  // stats tracking, user settings, Discogs, cue points).
   // TODO: evaluate which of these should be promoted to core /v1 APIs
   if (config.program.ui === 'velvet') {
-    const [listenbrainzApi, smartPlaylistsApi, waveformApi, wrappedApi,
+    const [listenbrainzApi, smartPlaylistsApi, wrappedApi,
            userSettingsApi, discogsApi, cuepointsApi, velvetStubs] = await Promise.all([
       import('./api/listenbrainz.js'),
       import('./api/smart-playlists.js'),
-      import('./api/waveform.js'),
       import('./api/wrapped.js'),
       import('./api/user-settings.js'),
       import('./api/discogs.js'),
@@ -216,7 +275,6 @@ export async function serveIt(configFile) {
     ]);
     listenbrainzApi.setup(mstream);
     smartPlaylistsApi.setup(mstream);
-    waveformApi.setup(mstream);
     wrappedApi.setup(mstream);
     userSettingsApi.setup(mstream);
     discogsApi.setup(mstream);
@@ -228,21 +286,7 @@ export async function serveIt(configFile) {
   mstream.get('/api/', (req, res) => res.json({ "server": packageJson.version, "apiVersions": ["1"] }));
 
   // album art folder
-  mstream.get('/album-art/:file', (req, res) => {
-    if (!req.params.file) {
-      throw new WebError('Missing Error', 404);
-    }
-
-    // ideally we should be checking this filename against a DB entry
-    const filename = sanitizeFilename(req.params.file);
-
-    const compressedFilePath = path.join(config.program.storage.albumArtDirectory, `z${req.query.compress}-${filename}`);
-    if (req.query.compress && fs.existsSync(compressedFilePath)) {
-      return res.sendFile(compressedFilePath);
-    }
-
-    res.sendFile(path.join(config.program.storage.albumArtDirectory, filename));
-  });
+  mstream.get('/album-art/:file', albumArtApi.serveAlbumArtFile);
 
   // TODO: determine if user has access to the exact file
   // mstream.all('/media/*', (req, res, next) => {
@@ -282,8 +326,19 @@ export async function serveIt(configFile) {
     const taskQueue = await import('./db/task-queue.js');
     taskQueue.runAfterBoot();
 
-    // Auto-boot the Rust server audio player if configured
-    serverPlaybackApi.bootRustPlayer();
+    if (config.program.dlna.mode !== 'disabled') {
+      dlnaSsdp.start();
+    }
+    if (config.program.dlna.mode === 'separate-port') {
+      dlnaServer.start();
+    }
+    if (config.program.subsonic.mode === 'separate-port') {
+      subsonicServer.start();
+    }
+
+    // Boot server audio (Rust preferred, CLI fallback) — runs CLI detection
+    // eagerly so the admin endpoint has fresh data by the time it's called.
+    serverPlaybackApi.bootRustPlayer().catch(() => {});
   });
 }
 
@@ -292,18 +347,38 @@ export function reboot() {
     winston.info('Rebooting Server');
     logger.reset();
     scrobblerApi.reset();
-    transode.reset();
+    transcode.reset();
 
     if (config.program.federation.enabled === false) {
       syncthing.kill2();
     }
 
+    dlnaSsdp.stop();
+    dlnaServer.stop();
+    subsonicServer.stop();
     serverPlaybackApi.killRustPlayer();
+    // Tear down the /remote WebSocket server — any open WS client
+    // otherwise keeps the HTTP server alive and server.close() below
+    // never fires its callback, leaving the user with "server stopped
+    // but never rebooted".
+    remoteApi.stop();
 
-    // Close the server
+    // Close the server. server.close() waits for every in-flight HTTP
+    // request AND every idle keep-alive socket to drain. The admin
+    // client that just issued the UI-switch POST has an open
+    // keep-alive socket; without closeAllConnections() we'd wait up
+    // to the agent's keep-alive timeout (tens of seconds) before the
+    // callback fires. Force the close after a short grace period so
+    // in-flight writes get a chance to finish but stragglers don't
+    // block the restart.
     server.close(() => {
       serveIt(config.configFile);
     });
+    setTimeout(() => {
+      if (typeof server.closeAllConnections === 'function') {
+        try { server.closeAllConnections(); } catch (_) {}
+      }
+    }, 1000);
   } catch (err) {
     winston.error('Reboot Failed', { stack: err });
     process.exit(1);

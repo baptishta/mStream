@@ -1,6 +1,6 @@
 {
   "name": "mstream",
-  "version": "6.0.0",
+  "version": "6.5.1",
   "description": "music streaming server",
   "type": "module",
   "main": "cli-boot-wrapper.js",
@@ -17,7 +17,12 @@
     "wizard": "npm install --only=prod && node cli-boot-wrapper.js",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "build-rust": "cd rust-parser && cargo build --release"
+    "build-rust": "cd rust-parser && cargo build --release",
+    "docs:api": "redocly build-docs docs/openapi.yaml -o docs/api.html",
+    "docs:api:validate": "redocly lint docs/openapi.yaml",
+    "test": "node --test --test-reporter=spec test/dlna.test.mjs test/subsonic.test.mjs test/subsonic-modes.test.mjs test/subsonic-phase3.test.mjs test/subsonic-jukebox.test.mjs test/subsonic-polish.test.mjs test/subsonic-multi-artist.test.mjs test/subsonic-client-flow.test.mjs test/subsonic-info-endpoints.test.mjs test/subsonic-lyrics.test.mjs test/subsonic-lyrics-lrclib.test.mjs test/subsonic-ui.test.mjs test/admin-subsonic-ui.test.mjs test/hash-migration.test.mjs test/scanner-follow-symlinks.test.mjs test/audio-hash-parity.test.mjs test/lyrics-parity.test.mjs test/waveform.test.mjs",
+    "test:dlna": "node --test --test-reporter=spec test/dlna.test.mjs",
+    "test:subsonic": "node --test --test-reporter=spec test/subsonic.test.mjs test/subsonic-modes.test.mjs test/subsonic-phase3.test.mjs test/subsonic-jukebox.test.mjs test/subsonic-polish.test.mjs test/subsonic-multi-artist.test.mjs test/subsonic-client-flow.test.mjs test/subsonic-info-endpoints.test.mjs test/subsonic-lyrics.test.mjs test/subsonic-lyrics-lrclib.test.mjs test/subsonic-ui.test.mjs test/admin-subsonic-ui.test.mjs"
   },
   "repository": {
     "type": "git",
@@ -39,11 +44,18 @@
       "!docs/*",
       "!dist/*",
       "!image-cache/*",
+      "!waveform-cache/*",
       "!save/*",
       "!bin/*",
       "!.git/*",
+      "!.git*",
       "!.vscode/*",
-      "!package-lock.json"
+      "!.claude/*",
+      "!rust-parser/*",
+      "!rust-server-audio/*",
+      "!test/*",
+      "!package-lock.json",
+      "!TODO.md"
     ],
     "mac": {
       "files": [
@@ -73,7 +85,7 @@
     },
     "linux": {
       "files": [
-        "bin/syncthng/syncthing-linux",
+        "bin/syncthing/syncthing-linux",
         "bin/rust-parser/rust-parser-linux-*",
         "bin/rust-server-audio/rust-server-audio-linux-*"
       ],
@@ -120,6 +132,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@redocly/cli": "^2.29.0",
     "electron-builder": "^26.7.0",
     "eslint": "^10.0.0",
     "globals": "^17.3.0"
