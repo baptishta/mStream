@@ -1,6 +1,6 @@
 {
   "name": "mstream",
-  "version": "6.28.0",
+  "version": "6.28.1",
   "description": "music streaming server",
   "type": "module",
   "main": "cli-boot-wrapper.js",
@@ -43,7 +43,8 @@
     "test:smoke:boot-probe:win51": "powershell -NoProfile -ExecutionPolicy Bypass -File test/smoke/boot-probe-51-smoke.ps1",
     "fetch-p2p-sidecar": "node scripts/fetch-p2p-sidecar.mjs",
     "fetch-mstream-player": "node scripts/fetch-mstream-player.mjs",
-    "test:smoke:sidecar-volume": "bash test/smoke/docker/p2p-sidecar-volume-smoke.sh"
+    "test:smoke:sidecar-volume": "bash test/smoke/docker/p2p-sidecar-volume-smoke.sh",
+    "test:smoke:api-errors": "node test/smoke/api-error-codes-smoke.mjs"
   },
   "repository": {
     "type": "git",
@@ -70,6 +71,7 @@
     "mime-types": "^3.0.2",
     "music-metadata": "^11.15.0",
     "nanoid": "^6.0.1",
+    "onnxruntime-web": "1.29.0",
     "tree-kill": "^1.2.2",
     "winston": "^3.19.0",
     "ws": "^8.21.3"

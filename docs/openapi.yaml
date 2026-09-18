@@ -1017,7 +1017,7 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
     Forbidden:
-      description: Validation error or permission denied.
+      description: Permission denied — authenticated, but not allowed (admin role, per-user flag or library access missing). Validation failures answer 400, never 403.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -1150,6 +1150,13 @@ paths:
                       discoveryP2p:
                         type: boolean
                         description: The discovery network feature is enabled.
+                      discoveryPlugins:
+                        type: boolean
+                        description: >
+                          At least one discovery plug-in is switched on, so
+                          recommendation rows have actions to offer —
+                          `GET /api/v1/discovery/plugins` lists them. A flag,
+                          never a probe.
                       sync:
                         type: boolean
                         description: >
@@ -1228,6 +1235,7 @@ paths:
                   discoveryReady: true
                   discovery: true
                   discoveryP2p: false
+                  discoveryPlugins: true
                   sync: true
                   transcode: false
                   supportedAudioFiles: { mp3: true, flac: true }
@@ -1475,6 +1483,15 @@ paths:
                             unit:
                               type: string
                               enum: [tracks, albums]
+                            runtime:
+                              type: string
+                              nullable: true
+                              description: |
+                                Discovery pass only — which ONNX Runtime build the last embedding run used:
+                                `native` (the onnxruntime-node addon) or `wasm` (the WebAssembly build shipped
+                                with mStream, used by every standalone bundle and wherever the addon cannot
+                                load; a few times slower per track). Null before the first run. Absent for
+                                other passes.
                             done: { type: integer }
                             remaining:
                               type: integer
@@ -2208,6 +2225,123 @@ paths:
         "403": { description: "Discovery is disabled on this server (or nothing has been embedded yet)." }
         "404": { description: "A path does not resolve in the caller's libraries (uniform)." }
 
+  /api/v1/discovery/plugins:
+    get:
+      tags: [Discovery]
+      summary: Discovery plug-ins switched on here
+      description: |
+        What a user may do with a recommendation — a recording the discovery
+        network surfaced that this library does not have. Each plug-in
+        declares capabilities: `links` and `preview` answer
+        `POST /api/v1/discovery/plugins/{name}/resolve`; `acquire` and
+        `handoff` get their own routes when they land. Only enabled plug-ins
+        are listed; the admin panel sees all of them through
+        `GET /api/v1/admin/config`. Gate on `features.discoveryPlugins`
+        from `GET /api/` first — flags, never probes.
+      responses:
+        "200":
+          description: The enabled plug-ins.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  plugins:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string, example: links }
+                        title: { type: string, example: Open elsewhere }
+                        description: { type: string }
+                        capabilities:
+                          type: array
+                          items: { type: string, enum: [links, preview, play, acquire, handoff] }
+                        scope: { type: string, enum: [server, user], description: "server = admin configuration only; user = needs per-user credentials" }
+                        enabled: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/discovery/plugins/{name}/resolve:
+    post:
+      tags: [Discovery]
+      summary: Run a links/preview plug-in on one recommendation
+      description: |
+        Hands one recommendation (a row from `/api/v1/discovery/p2p/similar`
+        or `/api/v1/discovery/federation/similar`, passed through as-is —
+        unknown keys are stripped) to a plug-in and returns what it found.
+        The response also carries the normalised recommendation and its
+        persistence `key` (`mbid:<recording-mbid>` when known, else a
+        `text:` digest over artist, title and album) so a client can dedupe
+        the same song offered by several peers.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string, pattern: "^[a-z0-9][a-z0-9-]{0,31}$" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [recommendation]
+              properties:
+                recommendation:
+                  type: object
+                  description: Every field optional and nullable; a plug-in degrades to what is known.
+                  properties:
+                    artist: { type: string, nullable: true }
+                    title: { type: string, nullable: true }
+                    album: { type: string, nullable: true }
+                    year: { type: integer, nullable: true }
+                    isrc: { type: string, nullable: true, description: "12 alphanumerics" }
+                    releaseGroupMbid: { type: string, nullable: true }
+                    recordingMbid: { type: string, nullable: true }
+                    duration: { type: number, nullable: true }
+                    exportId: { type: string, nullable: true }
+                    filepath: { type: string, nullable: true, description: "The PEER's vpath-form path (federation rows)" }
+                    source: { type: string, enum: [p2p, federation, local], default: p2p }
+                    peer:
+                      type: object
+                      nullable: true
+                      properties:
+                        endpointId: { type: string, nullable: true }
+                        id:
+                          description: "The paired peer's numeric id (federation rows); absent or null for network rows."
+                          oneOf:
+                            - { type: integer, nullable: true }
+                            - { type: string, nullable: true }
+                        name: { type: string, nullable: true }
+      responses:
+        "200":
+          description: The plug-in's result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  plugin: { type: string }
+                  capabilities: { type: array, items: { type: string } }
+                  key: { type: string, example: "text:3f2a…" }
+                  recommendation: { type: object, description: The normalised recommendation. }
+                  result:
+                    type: object
+                    description: >
+                      Shape depends on the capability. `links`:
+                      `{ links: [{ id, label, url, kind: canonical|search }] }`.
+                      `preview`: `{ preview: { provider, url, seconds, title,
+                      artist, album, link, artwork, attribution, match } | null }`
+                      — null when the catalogue has no confident match; show
+                      `attribution` next to the clip. `play`: `{ play: { kind:
+                      stream, url, peer, title, artist, album, duration } | null }`
+                      — `url` is server-relative and tokenless; append the same
+                      `?token=` the /media URLs use.
+        "400": { description: "Malformed body, or the plug-in does not resolve recommendations." }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: "Unknown or disabled plug-in (disabled plug-ins are invisible, not forbidden)." }
+        "429": { description: "The plug-in's own request budget for its catalogue is spent — try again shortly." }
+        "502": { description: "The plug-in failed to resolve this recommendation (a catalogue was unreachable); the cause is logged server-side." }
+
   # ── Search ───────────────────────────────────────────────────────────────
 
   /api/v1/db/search:
@@ -2370,6 +2504,16 @@ paths:
         "200": { $ref: "#/components/responses/EmptySuccess" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: >-
+            The track's library is not among the caller's libraries or does
+            not exist (`User does not have access to path <vpath>` — the
+            same 404 as `/api/v1/file-explorer`, so existence is not
+            revealed), or the track is not in the database (`File Not
+            Found`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /api/v1/db/recent/added:
     post:
@@ -3426,8 +3570,30 @@ paths:
                   path: { type: string }
                   directories: { type: array, items: { type: object } }
                   files: { type: array, items: { type: object } }
+        "400":
+          description: >-
+            The folder cannot be read (`EACCES`, `EPERM`, …) or the path is
+            malformed (a NUL byte → `ERR_INVALID_ARG_VALUE`) — message
+            `Cannot read directory "<virtual path>" (<code>)`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: >-
+            The path's library is not among the caller's libraries, or does
+            not exist — message `User does not have access to path <vpath>`
+            or `Library '<vpath>' not found`. Deliberately 404 rather than
+            403 for the access case, so a caller cannot tell whether a
+            library they lack exists (the same choice `/media/<vpath>/`
+            makes). Every route that resolves a virtual path answers the
+            same way. Also 404 when the folder itself is gone or is a file
+            — message `Cannot read directory "<virtual path>" (ENOENT|ENOTDIR)`,
+            never the library's path on disk.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /api/v1/file-explorer/recursive:
     post:
@@ -3451,6 +3617,25 @@ paths:
                 type: array
                 items: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "400":
+          description: >-
+            The folder cannot be read (`EACCES`, `EPERM`, …) or the path is
+            malformed (a NUL byte → `ERR_INVALID_ARG_VALUE`) — message
+            `Cannot read directory "<virtual path>" (<code>)`. Only the requested
+            folder itself can fail this way: an unreadable or vanished
+            subfolder is skipped (logged) and the rest is still listed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: >-
+            The path's library is not among the caller's libraries or does not exist (`User does not have access to path <vpath>` — the same 404 as `/api/v1/file-explorer`, existence not revealed);
+            or the folder is gone or is a file — message
+            `Cannot read directory "<virtual path>" (ENOENT|ENOTDIR)`, never the
+            library's path on disk.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /api/v1/file-explorer/mkdir:
     post:
@@ -3470,6 +3655,7 @@ paths:
         "200": { $ref: "#/components/responses/EmptySuccess" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /api/v1/file-explorer/upload:
     post:
@@ -3498,6 +3684,7 @@ paths:
         "200": { $ref: "#/components/responses/EmptySuccess" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /api/v1/file-explorer/m3u:
     post:
@@ -3530,6 +3717,23 @@ paths:
                         name: { type: string }
                         path: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "400":
+          description: >-
+            `path` missing (validation), or the playlist cannot be read (`EACCES`, `EPERM`, …) or the path is
+            malformed (a NUL byte → `ERR_INVALID_ARG_VALUE`) — message
+            `Cannot read playlist "<virtual path>" (<code>)`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: >-
+            The path's library is not among the caller's libraries or does not exist (`User does not have access to path <vpath>` — the same 404 as `/api/v1/file-explorer`, existence not revealed);
+            or the playlist file is missing or is a folder — message
+            `Cannot read playlist "<virtual path>" (ENOENT|EISDIR)`, never the
+            library's path on disk.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   # ── Download ─────────────────────────────────────────────────────────────
 
@@ -3553,6 +3757,23 @@ paths:
             application/zip:
               schema: { type: string, format: binary }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "400":
+          description: >-
+            The playlist cannot be read (`EACCES`, `EPERM`, …) or the path is
+            malformed (a NUL byte → `ERR_INVALID_ARG_VALUE`) — message
+            `Cannot read playlist "<virtual path>" (<code>)`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: >-
+            The path's library is not among the caller's libraries or does not exist (`User does not have access to path <vpath>` — the same 404 as `/api/v1/file-explorer`, existence not revealed);
+            or the playlist file is missing or is a folder — message
+            `Cannot read playlist "<virtual path>" (ENOENT|EISDIR)`, never the
+            library's path on disk.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /api/v1/download/directory:
     post:
@@ -3574,6 +3795,23 @@ paths:
             application/zip:
               schema: { type: string, format: binary }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "400":
+          description: >-
+            Not a directory (`Not A Directory`), or the folder cannot be read (`EACCES`, `EPERM`, …) or the path is
+            malformed (a NUL byte → `ERR_INVALID_ARG_VALUE`) — message
+            `Cannot read directory "<virtual path>" (<code>)`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: >-
+            The path's library is not among the caller's libraries or does not exist (`User does not have access to path <vpath>` — the same 404 as `/api/v1/file-explorer`, existence not revealed);
+            or the folder is gone or is a file — message
+            `Cannot read directory "<virtual path>" (ENOENT|ENOTDIR)`, never the
+            library's path on disk.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /api/v1/download/shared:
     get:
@@ -4936,6 +5174,13 @@ paths:
                 allowUpload: { type: boolean, default: true }
       responses:
         "200": { $ref: "#/components/responses/EmptySuccess" }
+        "409":
+          description: >-
+            A user named `username` already exists — message
+            `'<username>' already exists`. Nothing is changed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "405": { $ref: "#/components/responses/AdminLocked" }
     delete:
       tags: [Admin - Users]
@@ -4951,6 +5196,13 @@ paths:
                 username: { type: string }
       responses:
         "200": { $ref: "#/components/responses/EmptySuccess" }
+        "404":
+          description: >-
+            No user named `username` — message `'<username>' does not exist`.
+            Nothing is changed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "405": { $ref: "#/components/responses/AdminLocked" }
 
   /api/v1/admin/users/password:
@@ -4969,6 +5221,13 @@ paths:
                 password: { type: string }
       responses:
         "200": { $ref: "#/components/responses/EmptySuccess" }
+        "404":
+          description: >-
+            No user named `username` — message `'<username>' does not exist`.
+            Nothing is changed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "405": { $ref: "#/components/responses/AdminLocked" }
 
   /api/v1/admin/users/lastfm:
@@ -4989,6 +5248,13 @@ paths:
                 lasftfmPassword: { type: string }
       responses:
         "200": { $ref: "#/components/responses/EmptySuccess" }
+        "404":
+          description: >-
+            No user named `username` — message `'<username>' does not exist`.
+            Nothing is changed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "405": { $ref: "#/components/responses/AdminLocked" }
 
   /api/v1/admin/users/vpaths:
@@ -5009,6 +5275,13 @@ paths:
                   items: { type: string }
       responses:
         "200": { $ref: "#/components/responses/EmptySuccess" }
+        "404":
+          description: >-
+            No user named `username` — message `'<username>' does not exist`.
+            Nothing is changed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "405": { $ref: "#/components/responses/AdminLocked" }
 
   /api/v1/admin/users/access:
@@ -5030,6 +5303,13 @@ paths:
                 allowFileModify: { type: boolean, default: true }
       responses:
         "200": { $ref: "#/components/responses/EmptySuccess" }
+        "404":
+          description: >-
+            No user named `username` — message `'<username>' does not exist`.
+            Nothing is changed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "405": { $ref: "#/components/responses/AdminLocked" }
 
   # ── Admin - Libraries ────────────────────────────────────────────────────
@@ -5070,7 +5350,13 @@ paths:
               type: object
               required: [directory, vpath]
               properties:
-                directory: { type: string, description: "Absolute filesystem path." }
+                directory:
+                  type: string
+                  description: >-
+                    Absolute path of an existing directory. A leading `~`
+                    (alone or before a path separator, e.g. `~/Music`)
+                    expands to the server's home directory, and the expanded
+                    path is what gets stored.
                 vpath:
                   type: string
                   pattern: "[a-zA-Z0-9-]+"
@@ -5086,6 +5372,24 @@ paths:
                     scan the add queues).
       responses:
         "200": { $ref: "#/components/responses/EmptySuccess" }
+        "400":
+          description: >-
+            `directory` is not an absolute path to an existing directory
+            after `~` expansion — message
+            `"directory" must be an absolute path that exists (<why>)`,
+            where `<why>` is `not an absolute path`, `not a directory`,
+            or the stat errno (`ENOENT`, `EACCES`, …) — or `vpath` is
+            not a slug.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: >-
+            A library named `vpath` already exists — message
+            `'<vpath>' already exists`. Nothing is changed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "405": { $ref: "#/components/responses/AdminLocked" }
     delete:
       tags: [Admin - Libraries]
@@ -5103,6 +5407,13 @@ paths:
                   pattern: "[a-zA-Z0-9-]+"
       responses:
         "200": { $ref: "#/components/responses/EmptySuccess" }
+        "404":
+          description: >-
+            No library named `vpath` — message `'<vpath>' not found`.
+            Nothing is removed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "405": { $ref: "#/components/responses/AdminLocked" }
 
   # ── Admin - Config ───────────────────────────────────────────────────────
@@ -5634,7 +5945,12 @@ paths:
               type: object
               required: [directory]
               properties:
-                directory: { type: string, description: "Absolute path, or `~` for home." }
+                directory:
+                  type: string
+                  description: >-
+                    Absolute path, or `~` / `~/…` (`~\…` on Windows) for
+                    the server's home directory and paths under it. The
+                    response `path` is the expanded absolute path.
                 joinDirectory: { type: string }
       responses:
         "200":
@@ -5647,6 +5963,21 @@ paths:
                   path: { type: string }
                   directories: { type: array, items: { type: object } }
                   files: { type: array, items: { type: object } }
+        "400":
+          description: >-
+            The directory cannot be read (`EACCES`, `EPERM`, …) or the path
+            is malformed (a NUL byte → `ERR_INVALID_ARG_VALUE`); the code is
+            in the message, e.g. `Cannot read directory "/root" (EACCES)`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: >-
+            No such directory (`ENOENT`), or the path is a file (`ENOTDIR`);
+            the errno is in the message.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "405": { $ref: "#/components/responses/AdminLocked" }
 
   /api/v1/admin/file-explorer/win-drives:
@@ -5692,7 +6023,7 @@ paths:
                 followSymlinks: { type: boolean }
       responses:
         "200": { description: Flag updated. }
-        "403": { description: Validation error. }
+        "400": { description: Validation error. }
         "404": { description: Library not found. }
         "405": { $ref: "#/components/responses/AdminLocked" }
 
