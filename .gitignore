@@ -1,4 +1,6 @@
 node_modules/*
+# build-bun.yml installs the VersionInfo stamper (resedit) here on the win-x64 leg
+scripts/node_modules/
 webapp/node_modules/*
 
 image-cache/*
@@ -18,14 +20,43 @@ save/sync-cdn/*
 
 bin/ffmpeg/*
 !bin/ffmpeg/README.md
+# The committed pin set the bootstrap downloads against (binaries stay ignored).
+!bin/ffmpeg/manifest.json
 
 bin/rust-parser/*
 !bin/rust-parser/README.md
 !bin/rust-parser/rust-parser-*
+# Provenance stamps committed alongside the binaries (build-rust-parser.yml /
+# build-rust-parser-musl.yml write them; build-bun's tag build asserts them).
+!bin/rust-parser/.source-tree
+!bin/rust-parser/.source-tree-musl
 
-bin/rust-server-audio/*
-!bin/rust-server-audio/README.md
-!bin/rust-server-audio/rust-server-audio-*
+bin/rust-launcher/*
+!bin/rust-launcher/mstream-launcher-*
+# Provenance stamp committed alongside the binaries (build-rust-launcher.yml
+# writes it; build-bun.yml's tag build asserts it matches the tag's source).
+!bin/rust-launcher/.source-tree
+
+# mstream-player (server audio) binaries are FETCHED, not committed — the
+# crate left git for IrosTheBeggar/mstream-terminal-player (the in-tree
+# rust-server-audio was a stale fork of it). Only the committed pin
+# manifest and the README live in git; .fetched.json is the runtime
+# fetcher's install receipt.
+bin/mstream-player/*
+!bin/mstream-player/README.md
+!bin/mstream-player/manifest.json
+
+# p2p-sidecar binaries are FETCHED, not committed — the crate lives in its
+# own repo (IrosTheBeggar/mstream-p2p-sidecar) and its versioned releases
+# hold the binaries (each CI refresh of the old in-tree 9-binary set added
+# ~172 MB of undeltifiable blobs to history). Only the committed manifests
+# that pin a release — and the README — are tracked; fetched binaries, the
+# install receipt, and staging files land here on checkouts whose data root
+# is the app root and must stay out of `git status`.
+bin/p2p-sidecar/*
+!bin/p2p-sidecar/README.md
+!bin/p2p-sidecar/manifest.json
+!bin/p2p-sidecar/manifest-musl.json
 
 save/*.json
 
@@ -37,6 +68,10 @@ save/*.json
 *.db-wal
 *.db-shm
 .migrated-from-loki
+# Legacy residue: pre-6.20 servers wrote a per-boot identity secret for the
+# retired macOS relaunch probe. Nothing writes these anymore, but existing
+# checkouts and data dirs still carry one — keep it out of `git status`.
+.instance-nonce
 frp/*.ini
 
 dist/*
@@ -48,7 +83,16 @@ bun.lock
 .env
 
 rust-parser/target/
-rust-server-audio/target/
+rust-launcher/target/
+# The sidecar crate moved to its own repo; the dev loop is cloning it INTO
+# this checkout as p2p-sidecar/ (see bin/p2p-sidecar/README.md), so the
+# whole nested clone stays untracked. ANCHORED to the repo root: an
+# unanchored `p2p-sidecar/` also matches bin/p2p-sidecar/ — a directory
+# exclusion that file negations cannot pierce — and silently swallowed the
+# committed manifests (caught by a post-commit ls-tree check).
+/p2p-sidecar/
+# Same dev-loop rule for the player repo (see bin/mstream-player/README.md).
+/mstream-terminal-player/
 
 save/waveforms/*
 !save/waveforms/README.md
@@ -78,7 +122,9 @@ save/waveform-cache-smoke/
 
 # Generated API docs (built from docs/openapi.yaml via `npm run docs:api`;
 # also built+deployed by .github/workflows/publish-api-docs.yml)
-docs/api.html.claude/*
+docs/api.html
+model-cache/
 
-mstream-ssl.crt
-mstream-ssl.key
+# Scratch files left in the repo root by `bun build --compile`; one per build.
+.*.bun-build
+

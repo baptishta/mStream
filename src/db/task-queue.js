@@ -8,9 +8,16 @@ import * as db from './manager.js';
 import { addToKillQueue, removeFromKillQueue } from '../state/kill-list.js';
 import { writeScannerPidfile, clearScannerPidfile } from './scan-pidfile.js';
 import { SCHEMA_VERSION } from './schema.js';
+import { HASH_GENERATION } from './audio-hash.js';
 import { getDirname, appRoot } from '../util/esm-helpers.js';
 import { launchWorker, workerReaperMarker } from '../util/worker-process.js';
+import { ffmpegBin, ffprobeBin, ensureFfmpeg, getResolvedSource } from '../util/ffmpeg-bootstrap.js';
 import * as dlnaApi from '../api/dlna.js';
+import * as discoveryDb from './discovery-db.js';
+import * as libraryWatcher from '../util/library-watcher.js';
+import * as waveformLib from './waveform-lib.js';
+import * as waveformFallback from './waveform-fallback.js';
+import { invalidateCoverageCache } from './enrichment-status-lib.js';
 
 const __dirname = getDirname(import.meta.url);
 
@@ -82,6 +89,15 @@ let anyScansChanged = false;
 // (queue drain) is decoupled from where we learn a scan finished (per-scan
 // close), and N library scans should collapse to one pass.
 let albumArtEnqueuePending = false;
+// Parallel flag for the lyrics backfill pass — set on a clean scan, consumed
+// (after album-art) once the batch drains. Same collapse-N-scans-to-one-pass
+// rationale as albumArtEnqueuePending.
+let lyricsEnqueuePending = false;
+// Same deferred-enqueue pattern as albumArtEnqueuePending, for the essentia
+// BPM/key analysis pass — set on a clean scan, consumed once the batch drains.
+let audioAnalysisEnqueuePending = false;
+let discoveryEnqueuePending = false;
+let acoustidEnqueuePending = false;
 // True between runAfterBoot noticing a `.rescan-pending` migration marker
 // and the resulting rescan draining the queue. The marker is only
 // unlinked once this flag is set AND the queue empties — if the process
@@ -119,9 +135,32 @@ let rustParserBin = null;
 let rustBinaryReady = false;
 let rustParserDisabled = false;
 
+// Capability probe: which hashing generation does this scanner binary
+// stamp? New binaries answer `--hash-generation` with a bare integer;
+// anything older falls into the main JSON-input path and exits non-zero
+// (→ null). Exported for the unit test in test/task-queue.test.mjs.
+export function probeHashGeneration(binPath) {
+  try {
+    const probe = child.spawnSync(binPath, ['--hash-generation'],
+      { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 });
+    if (probe.status !== 0) { return null; }
+    const gen = parseInt((probe.stdout || '').toString().trim(), 10);
+    return Number.isInteger(gen) ? gen : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Sticky negative for the generation gate below: once every candidate
+// binary has been rejected, skip re-probing (and re-warning) on every
+// later scan this process runs. A rebuilt/updated binary is picked up
+// on the next server start, same as rustBinaryReady's positive cache.
+let generationGateFailed = false;
+
 function findRustParser() {
   if (rustParserDisabled) { return false; }
   if (rustBinaryReady) { return true; }
+  if (generationGateFailed) { return false; }
 
   const markReady = (binPath) => {
     rustParserBin = binPath;
@@ -133,25 +172,53 @@ function findRustParser() {
     return true;
   };
 
+  // Generation gate, applied to EVERY candidate binary (local build and
+  // prebuilt): a scanner that stamps a different hashing generation than
+  // this server must not scan at all. Behind the server it loops the V60
+  // convergence epoch forever (it can never stamp rows current); ahead
+  // of or behind it post-epoch, its UPSERT DO UPDATE overwrites hashes
+  // with another scheme's values while the row's hash_v stamp survives —
+  // a silent mislabel no later boot can detect or heal. The JS fallback
+  // scanner ships with the server and is always generation-correct, so
+  // rejecting here degrades to slower-but-correct scans until the binary
+  // catches up (CI rebuilds bin/ on merge; `npm run build-rust` locally).
+  const generationCurrent = (binPath, label) => {
+    const gen = probeHashGeneration(binPath);
+    if (gen === HASH_GENERATION) { return true; }
+    winston.warn(`${label} rust-parser at ${binPath} stamps hash generation `
+      + `${gen ?? 'unknown (pre-probe build)'} but this server is on generation ${HASH_GENERATION} — `
+      + `refusing it to protect track identities; scans use the JS scanner until the binary updates.`);
+    return false;
+  };
+
   // Check local build first (may be newer than prebuilt during
-  // development). Probe it with `--waveform <nonexistent>` — the
-  // subcommand is a recent addition, so a stale local build that
-  // pre-dates it falls through to the main JSON-input path and
-  // exits 1 with "Invalid JSON Input". If that happens, skip the
-  // stale local build and let the newer prebuilt bin take over.
-  // Without this, an old `cargo build --release` output would
-  // silently shadow the CI-shipped binary and break scans.
-  if (fs.existsSync(localBuildBin)) {
-    try {
-      const probe = child.spawnSync(localBuildBin, ['--waveform', path.join(rustParserDir, 'NONEXISTENT_PROBE_FILE')],
-        { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 });
-      const stderr = (probe.stderr || '').toString();
-      if (!/Invalid JSON Input/.test(stderr)) { return markReady(localBuildBin); }
-      winston.warn(`Local rust-parser build at ${localBuildBin} pre-dates the --waveform subcommand; ` +
-        `falling through to the prebuilt binary. Rebuild with \`npm run build-rust\` to clear this warning.`);
-    } catch (_) { /* probe failed — try the prebuilt */ }
+  // development). A stale local build fails the generation gate and
+  // falls through to the prebuilt bin — without this, an old
+  // `cargo build --release` output would silently shadow the
+  // CI-shipped binary.
+  if (fs.existsSync(localBuildBin) && generationCurrent(localBuildBin, 'Local')) {
+    return markReady(localBuildBin);
   }
-  if (fs.existsSync(prebuiltBin)) { return markReady(prebuiltBin); }
+  if (fs.existsSync(prebuiltBin) && generationCurrent(prebuiltBin, 'Prebuilt')) {
+    return markReady(prebuiltBin);
+  }
+  // Old-glibc salvage: on hosts where the shipped glibc binary can't
+  // even exec (needs a newer GLIBC, so the probe itself fails), the
+  // fully-static musl sibling runs anywhere — try it through the same
+  // gate. Mirrors tryMuslRetry's conditions; probing here catches the
+  // exec failure up front instead of at scan time.
+  if (process.platform === 'linux' && libcSuffix !== '-musl') {
+    const muslBin = path.join(appRoot, `bin/rust-parser/rust-parser-${process.platform}-${process.arch}-musl${ext}`);
+    if (fs.existsSync(muslBin) && generationCurrent(muslBin, 'Static-musl')) {
+      return markReady(muslBin);
+    }
+  }
+  if (fs.existsSync(prebuiltBin) || fs.existsSync(localBuildBin)) {
+    // Binaries exist but none passed the gate — fall straight to the JS
+    // scanner rather than attempting a from-source build on every scan.
+    generationGateFailed = true;
+    return false;
+  }
 
   // Try to build from source
   winston.info('Rust parser binary not found — building from source...');
@@ -189,6 +256,14 @@ function tryMuslRetry(scanObj, reason) {
   if (rustParserBin !== prebuiltBin) { return false; }
   const muslBin = path.join(appRoot, `bin/rust-parser/rust-parser-${process.platform}-${process.arch}-musl${ext}`);
   if (!fs.existsSync(muslBin)) { return false; }
+  // Same generation gate as findRustParser — the musl sibling is built
+  // by the same CI pass as the glibc binary, but never swap in a binary
+  // that stamps a different hashing generation.
+  if (probeHashGeneration(muslBin) !== HASH_GENERATION) {
+    winston.warn(`Static-musl rust-parser at ${muslBin} does not stamp hash generation `
+      + `${HASH_GENERATION} — skipping the musl retry; scans use the JS scanner.`);
+    return false;
+  }
 
   muslRetryTried = true;
   try { fs.chmodSync(muslBin, 0o755); } catch (_) { /* best-effort; spawn will surface a real failure */ }
@@ -213,6 +288,23 @@ function tryMuslRetry(scanObj, reason) {
 // scattered across the file (scanner stdout, scanner stderr, backup
 // stdout, backup stderr) and any tweak to the buffering invariant had
 // to be made in all four places.
+// Forked-worker stderr → log level. Node runtime chatter (the
+// "(node:PID) ExperimentalWarning: …" banner and its "(Use `node
+// --trace-warnings …" follow-up) is not a worker failure — it was painting
+// red error lines over every fresh boot via the node:sqlite experimental
+// warning. Real errors stay error-level.
+function logWorkerStderr(prefix, line) {
+  if (!line) { return; }
+  if (/^\(node:\d+\)/.test(line) || line.startsWith('(Use `node ')
+      || line.startsWith('[winston]')) {
+    winston.debug(`${prefix}: ${line}`);
+  } else if (line.startsWith('Warning:')) {
+    winston.warn(`${prefix}: ${line}`);
+  } else {
+    winston.error(`${prefix} error: ${line}`);
+  }
+}
+
 function bufferLines(stream, onLine) {
   let buffer = '';
   stream.on('data', (chunk) => {
@@ -251,24 +343,266 @@ function bufferLines(stream, onLine) {
 function nextTask() {
   while (activeTask === null && taskQueue.length > 0) {
     const candidate = taskQueue.shift();
-    if (candidate.task === 'scan')          { runScan(candidate); }
-    else if (candidate.task === 'backup')   { runBackupTask(candidate); }
-    else if (candidate.task === 'waveform') { runWaveformTask(candidate); }
-    else if (candidate.task === 'albumart') { runAlbumArtTask(candidate); }
+    // Per-task try/catch: nextTask runs inside child-process 'close'
+    // handlers, where a synchronous throw from a runX dispatcher (a DB
+    // hiccup while creating the history row, a bad task object) would
+    // surface as an uncaught exception and take down the whole server.
+    // Dropping the one broken task and moving on keeps the queue alive;
+    // the error is logged with the task payload for diagnosis.
+    try {
+      if (candidate.task === 'scan')          { runScan(candidate); }
+      else if (candidate.task === 'backup')   { runBackupTask(candidate); }
+      else if (candidate.task === 'waveform') { runWaveformTask(candidate); }
+      else if (candidate.task === 'albumart') { runAlbumArtTask(candidate); }
+      else if (candidate.task === 'lyrics')   { runLyricsTask(candidate); }
+      else if (candidate.task === 'audioanalysis') { runAudioAnalysisTask(candidate); }
+      else if (candidate.task === 'discovery') { runDiscoveryTask(candidate); }
+      else if (candidate.task === 'acoustid') { runAcoustidTask(candidate); }
+    } catch (err) {
+      winston.error(`Task dispatch failed for ${JSON.stringify(candidate)} — dropping the task`, { stack: err });
+    }
   }
 }
 
-// The two enrichment-pass task kinds. They share semantics everywhere the
+// The enrichment-pass task kinds. They share semantics everywhere the
 // queue makes a decision: they don't count against "drained" (the side
 // effects below are about the SCAN batch), they don't surface as `locked`
 // (isScanning), and they run strictly serial like everything else.
-const ENRICHMENT_KINDS = ['waveform', 'albumart'];
+const ENRICHMENT_KINDS = ['waveform', 'albumart', 'lyrics', 'discovery', 'audioanalysis', 'acoustid'];
+
+// ── Enrichment status registry ──────────────────────────────────────────────
+//
+// Per-pass runtime state for the status API (GET /api/v1/scan/status).
+// The workers already narrate their lives as structured stdout events —
+// this registry just retains the latest one per pass instead of letting
+// it evaporate into the log. In-memory ON PURPOSE: unlike the library
+// scanner (a separate process that needs the scan_progress table as IPC),
+// enrichment events arrive in this process, and the queue they describe
+// is itself in-memory — a restart clears both consistently. Durable
+// "how enriched is the library" numbers come from the DB instead (see
+// src/db/enrichment-status-lib.js).
+//
+// Shape per kind:
+//   state    — 'idle' | 'queued' | 'running'. ('disabled' is derived at
+//              read time from the config gates; it never lives here, so a
+//              pass that is mid-run when its toggle flips off keeps
+//              reporting the truthful 'running' until it exits.)
+//   progress — { attempted, total } from the latest *Progress event, or
+//              null when not running.
+//   lastRun  — summary of the last time a worker actually ran this
+//              process lifetime, or null. Run-time gate bails (config
+//              flipped off while queued) deliberately do NOT overwrite
+//              it — the previous real run stays visible.
+const enrichmentStatus = {};
+for (const kind of ENRICHMENT_KINDS) {
+  enrichmentStatus[kind] = { state: 'idle', progress: null, lastRun: null };
+}
+
+function reportEnrichment(kind, patch) {
+  Object.assign(enrichmentStatus[kind], patch);
+}
+
+// Shared end-of-run bookkeeping for every enrichment closeOnce handler.
+// Must run BEFORE any hitCap re-enqueue in the same handler, so the
+// 'queued' state a re-enqueue sets isn't clobbered back to 'idle'.
+function finishEnrichment(kind, code, signal, completeEvt) {
+  // The pass just changed the world the coverage counts describe — drop
+  // the status API's memo so its next poll reflects the run immediately
+  // instead of after the TTL.
+  invalidateCoverageCache();
+  const counts = completeEvt ? { ...completeEvt } : null;
+  if (counts) { delete counts.event; delete counts.hitCap; }
+  reportEnrichment(kind, {
+    state: 'idle',
+    progress: null,
+    lastRun: {
+      finishedAt: Date.now(),
+      // 'killed' covers deliberate kills (shutdown, operator) — reported
+      // distinctly because it says nothing about the pass being broken.
+      outcome: signal ? 'killed' : (code === 0 ? 'completed' : 'failed'),
+      // More work remained when the per-run cap / wall-clock budget hit;
+      // the close handler queues a follow-up batch.
+      hitCap: !!(completeEvt && completeEvt.hitCap),
+      counts,
+    },
+  });
+}
 
 // Drained-queue side effects shared by onScanClose + onBackupClose.
 // Centralised here because the DLNA bump and the migration-rescan marker
 // cleanup both depend on "all queued and active work finished," which can
 // be triggered by either kind of close after the unified-queue change.
 function checkQueueDrainedSideEffects() {
+  // Never throw out of here: like nextTask, this runs inside child
+  // 'close' handlers where an escaped exception kills the server.
+  try { checkQueueDrainedSideEffectsInner(); }
+  catch (err) { winston.error('Queue-drained side effects failed', { stack: err }); }
+}
+
+// Drain the V60 hash-transition ledger (see the call site in
+// checkQueueDrainedSideEffectsInner for the rationale). Fully guarded:
+// any failure leaves the ledger in place for the next drain. Covered
+// end-to-end (real drain hook, real discovery.db, discovery-off server)
+// by test/integration/hash-transition-applier.test.mjs.
+//
+// Async + chunked since the 2026-07 audit (M1): the first drain of a
+// hash epoch used to apply the whole ledger as one synchronous
+// transaction (~4.4 s at 15k transitions) and then walk a sync rename
+// loop that threw ~15k ENOENTs (~44 s on NTFS) — all on the event loop.
+// Now the discovery re-key commits in bounded chunks with a yield
+// between them, and the waveform re-key enumerates the cache dir ONCE
+// and only touches files that exist, through fs.promises. The ledger
+// DELETE still happens only after everything applied; a crash mid-way
+// re-applies cleanly (moved groups have no live sources → no-ops).
+let hashTransitionsInFlight = false;
+// 250 groups ≈ 250 ms of block per chunk on the rig (each move pays a
+// per-row export-id re-derivation); 500 measured ~2× that.
+const HASH_TRANSITION_CHUNK = 250;
+const RENAME_CONCURRENCY = 16;
+
+async function applyHashTransitions() {
+  if (hashTransitionsInFlight) { return; }
+  hashTransitionsInFlight = true;
+  try {
+    await applyHashTransitionsInner();
+  } finally {
+    hashTransitionsInFlight = false;
+  }
+}
+
+async function applyHashTransitionsInner() {
+  try {
+    const mdb = db.getDB();
+    if (!mdb) { return; }
+    const rows = mdb.prepare('SELECT old_hash, new_hash FROM hash_transitions').all();
+    if (rows.length === 0) { return; }
+
+    // Collapse chains to each terminal identity, grouping every source
+    // that lands there. Cycles (edit-then-revert sequences recorded
+    // before a drain) can't self-resolve from the ledger — the tracks
+    // table is the ground truth for which identity in the loop is
+    // current; when none (or several) of the loop's identities are
+    // live, leave those rows in place rather than guess.
+    const next = new Map(rows.map((r) => [r.old_hash, r.new_hash]));
+    const liveStmt = mdb.prepare(
+      'SELECT 1 FROM tracks WHERE audio_hash = ? OR file_hash = ? LIMIT 1');
+    const finalOf = (start) => {
+      const seen = new Set([start]);
+      let cur = start;
+      while (next.has(cur)) {
+        const n = next.get(cur);
+        if (seen.has(n)) {
+          const alive = [...seen].filter((h) => liveStmt.get(h, h));
+          return alive.length === 1 ? alive[0] : start;
+        }
+        seen.add(n);
+        cur = n;
+      }
+      return cur;
+    };
+    const groups = new Map();  // target -> [sources]
+    for (const { old_hash } of rows) {
+      const target = finalOf(old_hash);
+      if (target === old_hash) { continue; }
+      if (!groups.has(target)) { groups.set(target, []); }
+      groups.get(target).push(old_hash);
+    }
+    const groupList = [...groups].map(([target, sources]) => ({ target, sources }));
+
+    // Discovery first (it can throw → ledger stays for a clean retry).
+    // openDiscoveryDbIfExists, NOT the throwing getter: with the feature
+    // off (the default) the ledger must still drain — and a dormant
+    // discovery.db left by a since-disabled collection still gets its
+    // embeddings re-keyed rather than stranded. Chunked: each slice is
+    // its own transaction (applyHashTransitionGroups keeps its
+    // atomicity per chunk; re-applying an already-moved group is a
+    // no-op) with a yield between slices so the event loop breathes.
+    const ddb = discoveryDb.openDiscoveryDbIfExists();
+    let applied = null;
+    if (ddb) {
+      applied = { moved: 0, dropped: 0 };
+      for (let i = 0; i < groupList.length; i += HASH_TRANSITION_CHUNK) {
+        const part = discoveryDb.applyHashTransitionGroups(
+          groupList.slice(i, i + HASH_TRANSITION_CHUNK));
+        applied.moved += part.moved;
+        applied.dropped += part.dropped;
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    }
+
+    // Waveform cache artifacts follow the re-key on disk ({hash}.bin +
+    // {hash}.failed). Done HERE, not scanner-side: the drain runs after
+    // every row's transaction committed (a scanner-side rename could
+    // survive a rollback and strand the cache at an identity the DB
+    // never adopted), one implementation covers ledger rows from either
+    // engine, and the live config supplies the directory (the scan
+    // payload's waveformCacheDir is a stale-binary transition field).
+    // Same-content sources share one waveform, so first-in wins and
+    // later sources are dropped.
+    //
+    // The dir is enumerated ONCE and only files that exist are touched —
+    // the old per-source existsSync/rename walk threw ~15k ENOENTs per
+    // drain (most re-keyed tracks have no waveform yet) at ~3 ms per
+    // sync syscall on NTFS. What remains runs through fs.promises with
+    // bounded concurrency.
+    const waveDir = config.program?.storage?.waveformCacheDirectory;
+    let renamed = 0;
+    if (waveDir) {
+      let present = null;
+      try { present = new Set(await fs.promises.readdir(waveDir)); }
+      catch (err) {
+        if (err.code !== 'ENOENT') {
+          winston.warn(`Waveform cache re-key: dir unreadable: ${err.message}`);
+        }
+      }
+      if (present) {
+        const ops = [];
+        for (const { target, sources } of groupList) {
+          for (const src of sources) {
+            for (const toPath of [waveformLib.cacheFilePath, waveformLib.failedMarkerPath,
+                                  waveformLib.deferredMarkerPath]) {
+              const from = toPath(waveDir, src);
+              const to = toPath(waveDir, target);
+              const fromName = path.basename(from);
+              if (!present.has(fromName)) { continue; }
+              const toName = path.basename(to);
+              if (present.has(toName)) {
+                ops.push({ kind: 'unlink', from });
+              } else {
+                ops.push({ kind: 'rename', from, to });
+                present.add(toName);   // later sources of this target unlink
+              }
+              present.delete(fromName);
+            }
+          }
+        }
+        for (let i = 0; i < ops.length; i += RENAME_CONCURRENCY) {
+          await Promise.all(ops.slice(i, i + RENAME_CONCURRENCY).map(async (op) => {
+            try {
+              if (op.kind === 'unlink') { await fs.promises.unlink(op.from); }
+              else { await fs.promises.rename(op.from, op.to); }
+              renamed++;
+            } catch (err) {
+              if (err.code !== 'ENOENT') {
+                winston.warn(`Waveform cache re-key ${op.from} failed: ${err.message}`);
+              }
+            }
+          }));
+        }
+      }
+    }
+
+    mdb.prepare('DELETE FROM hash_transitions').run();
+    winston.info(`Applied ${rows.length} hash transition(s) (${groupList.length} identity group(s))`
+      + (applied ? ` — discovery rows moved: ${applied.moved}, superseded: ${applied.dropped}`
+        : ' (discovery inactive — drained)')
+      + (renamed > 0 ? `; ${renamed} waveform artifact(s) re-keyed` : ''));
+  } catch (err) {
+    winston.warn(`Hash-transition apply failed (will retry on next drain): ${err.message}`);
+  }
+}
+
+function checkQueueDrainedSideEffectsInner() {
   // Enrichment passes (waveform decode, art download) don't count against
   // "drained": the side effects below are about the SCAN batch — the
   // passes change no library content the DLNA caches care about, and they
@@ -316,6 +650,18 @@ function checkQueueDrainedSideEffects() {
     }
   }
 
+  // Apply the hash-transition ledger (V60) to keyspaces the scanner
+  // can't safely reach: discovery.db keys embeddings + its lookup
+  // ledger by canonical hash (orphaning them on a re-key would force a
+  // full CPU-heavy re-embed), and the on-disk waveform cache is keyed
+  // the same way. Chains are collapsed per identity group (A→B then
+  // B→C: the row at A must land at C), cycles resolve against the
+  // tracks table, and collisions are canonical-wins with freshness.
+  // Rows are drained after applying; when discovery has no DB (feature
+  // off) only the waveform renames apply — embeddings that were never
+  // collected have nothing to follow.
+  applyHashTransitions();
+
   // Hand the now-idle stretch to the album-art download pass if a scan in
   // this drained batch asked for it. Done HERE — after the DLNA bump and
   // the rescan-marker cleanup — so it runs once per batch and only after
@@ -327,6 +673,42 @@ function checkQueueDrainedSideEffects() {
     albumArtEnqueuePending = false;
     maybeEnqueueAlbumArt();
   }
+
+  // Then the lyrics backfill pass — after album-art, so the two enrichment
+  // passes run strictly one-then-the-other (never two children on the SQLite
+  // writer at once). maybeEnqueueLyrics re-checks config + eligibility.
+  if (lyricsEnqueuePending) {
+    lyricsEnqueuePending = false;
+    maybeEnqueueLyrics();
+  }
+
+  // Then the discovery-embedding pass (separate discovery.db) — ahead of the
+  // BPM/key pass: its embeddings feed the user-visible Discover panel and
+  // Auto-DJ sonic mode, and since the BPM/key pass went windowed it is no
+  // longer the cheaper of the two. maybeEnqueueDiscovery re-checks config +
+  // ffmpeg + whether anything actually lacks a current-model embedding
+  // before forking.
+  if (discoveryEnqueuePending) {
+    discoveryEnqueuePending = false;
+    maybeEnqueueDiscovery();
+  }
+
+  // Then the essentia BPM/key analysis pass. Separate flag + enqueue so it
+  // runs once per batch, serialised behind the passes above;
+  // maybeEnqueueAudioAnalysis re-checks config + eligibility + ffmpeg
+  // before forking.
+  if (audioAnalysisEnqueuePending) {
+    audioAnalysisEnqueuePending = false;
+    maybeEnqueueAudioAnalysis();
+  }
+
+  // AcoustID identification (network-bound, cheap CPU): fingerprints
+  // un-identified tracks and fills MusicBrainz recording MBIDs.
+  // maybeEnqueueAcoustid re-checks config + key + binary + eligibility.
+  if (acoustidEnqueuePending) {
+    acoustidEnqueuePending = false;
+    maybeEnqueueAcoustid();
+  }
 }
 
 // ── Scan task management ────────────────────────────────────────────────────
@@ -336,7 +718,7 @@ function checkQueueDrainedSideEffects() {
 // and the scanner can skip rows it already re-parsed this epoch (resume).
 // Omitted everywhere else → a fresh per-scan nanoid (every other scan is
 // independent and gets its own id).
-function addScanTask(vpath, forceRescan = false, scanId = null) {
+function addScanTask(vpath, forceRescan = false, scanId = null, hashEpoch = false) {
   // Dedup: drop if a scan for this vpath is already running, and merge
   // forceRescan upgrade into a queued one. Without this, a scan that
   // outlasts scanInterval (24h default) lets the periodic timer pile up
@@ -359,7 +741,7 @@ function addScanTask(vpath, forceRescan = false, scanId = null) {
     }
     return;
   }
-  taskQueue.push({ task: 'scan', vpath, id: scanId || nanoid(8), forceRescan });
+  taskQueue.push({ task: 'scan', vpath, id: scanId || nanoid(8), forceRescan, hashEpoch });
   nextTask();
 }
 
@@ -410,10 +792,13 @@ function scanAll() {
 // stable id so an interrupted rescan resumes on the next boot instead of
 // restarting from file zero. When omitted (manual admin force-rescan),
 // each library gets a fresh id — a one-shot full re-parse, as before.
-function rescanAll(scanId = null) {
+// hashEpoch: generation-scoped convergence epoch (V60) — the scanners
+// re-parse only rows stamped below the current hashing generation
+// instead of force-re-parsing everything.
+function rescanAll(scanId = null, hashEpoch = false) {
   const libraries = db.getAllLibraries();
   for (const lib of libraries) {
-    addScanTask(lib.name, true, scanId);
+    addScanTask(lib.name, !hashEpoch, scanId, hashEpoch);
   }
 }
 
@@ -450,6 +835,12 @@ function handleScannerLine(scanObj, line) {
           parts.push(`${evt.filesUnchanged} unchanged`);
         }
         parts.push(`${evt.staleEntriesRemoved} stale entries removed`);
+        // Undefined-tolerant like filesUnchanged: a stale prebuilt
+        // rust-parser binary predates the move re-homing fields.
+        if (evt.movedTracksRehomed > 0) {
+          parts.push(`${evt.movedTracksRehomed} moved track(s) re-homed ` +
+            `(${evt.movedRefsRehomed} reference(s) rewritten)`);
+        }
         const tail = evt.filesScanned != null ? ` (${evt.filesScanned} scanned)` : '';
         winston.info(`Scan complete: ${parts.join(', ')}${tail}`);
         if (evt.walkErrors > 0) {
@@ -499,11 +890,7 @@ function attachScanHandlers(forkedScan, scanObj) {
   // (metadata parse failures fall back to null tags; the track still gets
   // indexed) and are logged at warn level so a library with malformed ID3
   // tags doesn't flood error-level log streams. Anything else is a real error.
-  bufferLines(forkedScan.stderr, (line) => {
-    if (!line) { return; }
-    if (line.startsWith('Warning:')) { winston.warn(`File scan: ${line}`); }
-    else { winston.error(`File scan error: ${line}`); }
-  });
+  bufferLines(forkedScan.stderr, (line) => logWorkerStderr('File scan', line));
 }
 
 function onScanClose(forkedScan, scanObj, code) {
@@ -529,6 +916,10 @@ function onScanClose(forkedScan, scanObj, code) {
   try {
     db.getDB()?.prepare('DELETE FROM scan_progress WHERE scan_id = ?').run(scanObj.id);
   } catch (_) {}
+
+  // A scan changes the track/album pools every coverage count is built
+  // over — drop the status API's memo like the enrichment passes do.
+  invalidateCoverageCache();
 
   // Merge FTS5 segments accumulated by this scan's writes. The triggers
   // create a fresh index segment per track-row write — over a long scan
@@ -592,6 +983,16 @@ function onScanClose(forkedScan, scanObj, code) {
     // migration rescan). Only after a CLEAN scan: a crashed or
     // shutdown-killed scan shouldn't spawn follow-up network work.
     albumArtEnqueuePending = true;
+    // Same clean-scan gate: queue a lyrics backfill pass for once the batch
+    // drains (after album-art).
+    lyricsEnqueuePending = true;
+    // Same for the essentia BPM/key pass — fill analysed bpm/musical_key for
+    // tag-less tracks once the batch drains.
+    audioAnalysisEnqueuePending = true;
+    // Same for the discovery-embedding pass (new/changed files need vectors).
+    discoveryEnqueuePending = true;
+    // And the AcoustID identification pass (new files may lack MBIDs).
+    acoustidEnqueuePending = true;
   }
 
   nextTask();
@@ -627,20 +1028,53 @@ export function addWaveformTask() {
   // One queued pass is enough — it sweeps the whole DB when it runs.
   if (taskQueue.some((t) => t.task === 'waveform')) { return; }
   taskQueue.push({ task: 'waveform', id: nanoid(8) });
+  // Before nextTask: dispatch is synchronous, and runWaveformTask owns the
+  // 'running' transition — set here so a task parked behind a long scan
+  // reads 'queued' the whole time it waits.
+  reportEnrichment('waveform', { state: 'queued' });
   nextTask();
 }
 
 function runWaveformTask(taskObj) {
+  // The task left the queue — whether it runs or gate-bails below, it is
+  // no longer 'queued'. A successful claim flips this to 'running'.
+  reportEnrichment('waveform', { state: 'idle', progress: null });
   // Re-check at run time: the admin toggle may have flipped while this
   // sat queued, and findRustParser() stays false for the process
   // lifetime once the binary was found dead.
   if (config.program.scanOptions.generateWaveforms === false) { return; }
+
+  // The rust half and the ffmpeg half are INDEPENDENT producers. Both
+  // bails below skip only the rust half and then run the ffmpeg half
+  // standalone: it is plain JS plus bin/ffmpeg, reads the same DB and
+  // cache dir, and imports CACHE_EXT from this server — it cannot be
+  // wrong about a generation it defines. Returning outright (as the gate
+  // first did) made a stale prebuilt disable the very Opus coverage this
+  // pass exists to add, on every deployment between merge and the CI
+  // binary rebuild.
   if (!findRustParser()) {
     winston.info(
-      'Waveform pass skipped — no usable rust-parser binary (the on-demand ' +
-      'endpoint will generate waveforms lazily on first play)');
-    return;
+      'Waveform pass: no usable rust-parser binary — running the ffmpeg half only');
+    return void runWaveformFallbackOnly();
   }
+  // Waveform-generation gate, same idea as the hash-generation gate in
+  // findRustParser: the cache filenames are a contract between this server
+  // and the binary. A binary one generation behind writes names the boot
+  // sweep deletes, so running it re-decodes the whole library every boot
+  // for artifacts nothing ever reads. Probed per pass rather than latched:
+  // dropping in a rebuilt binary heals on the next scan without a restart.
+  const binWfGen = waveformLib.probeWaveformGeneration(rustParserBin);
+  if (binWfGen !== waveformLib.CACHE_EXT) {
+    waveformGenerationMismatch = true;
+    winston.warn(
+      `Waveform pass: rust-parser writes waveform generation ` +
+      `'${binWfGen ?? 'pre-w2'}' but this server expects '${waveformLib.CACHE_EXT}' — ` +
+      `skipping the rust half and running the ffmpeg half only. ` +
+      `Update bin/rust-parser (CI rebuilds it on pushes to master) or rebuild ` +
+      `rust-parser/target with cargo.`);
+    return void runWaveformFallbackOnly();
+  }
+  waveformGenerationMismatch = false;
 
   const payload = {
     dbPath: path.join(config.program.storage.dbDirectory, 'mstream.db'),
@@ -661,11 +1095,13 @@ function runWaveformTask(taskObj) {
   const killFn = () => { try { wfChild.kill(); } catch (_) { /* already gone */ } };
   addToKillQueue(killFn);
   activeTask = { kind: 'waveform', taskObj, child: wfChild, killFn };
+  reportEnrichment('waveform', { state: 'running' });
 
   // Any stdout proves the binary knows the subcommand — the banner is
   // its first statement, printed before config parsing. Read by
   // closeOnce to tell "ran and failed" from "pre-dates --waveform-scan".
   let sawOutput = false;
+  let completeEvt = null;
   bufferLines(wfChild.stdout, (line) => {
     if (!line) { return; }
     sawOutput = true;
@@ -673,14 +1109,20 @@ function runWaveformTask(taskObj) {
       try {
         const evt = JSON.parse(line);
         if (evt?.event === 'waveformScanStart') { return; }     // liveness banner
-        if (evt?.event === 'waveformScanProgress') { return; }  // too chatty for info
+        if (evt?.event === 'waveformScanProgress') {
+          // Too chatty for the log, but exactly what the status API wants.
+          reportEnrichment('waveform', { progress: { attempted: evt.done ?? 0, total: evt.total ?? null } });
+          return;
+        }
         if (evt?.event === 'waveformScanPlan') {
+          reportEnrichment('waveform', { progress: { attempted: 0, total: evt.total ?? null } });
           if (evt.total > 0) {
             winston.info(`Waveform pass: ${evt.total} track(s) need waveforms`);
           }
           return;
         }
         if (evt?.event === 'waveformScanComplete') {
+          completeEvt = evt;
           winston.info(
             `Waveform pass complete: ${evt.generated} generated, ` +
             `${evt.failed} failed (${evt.total} planned)`);
@@ -690,11 +1132,7 @@ function runWaveformTask(taskObj) {
     }
     winston.info(line);
   });
-  bufferLines(wfChild.stderr, (line) => {
-    if (!line) { return; }
-    if (line.startsWith('Warning:')) { winston.warn(`Waveform pass: ${line}`); }
-    else { winston.error(`Waveform pass error: ${line}`); }
-  });
+  bufferLines(wfChild.stderr, (line) => logWorkerStderr('Waveform pass', line));
 
   let closed = false;
   const closeOnce = (code, signal) => {
@@ -721,18 +1159,162 @@ function runWaveformTask(taskObj) {
       winston.error(`Waveform pass FAILED with exit code ${code}`);
     }
     clearScannerPidfile(config.program.storage.dbDirectory);
-    if (activeTask?.child === wfChild) {
-      removeFromKillQueue(activeTask.killFn);
-      activeTask = null;
-    }
-    nextTask();
-    checkQueueDrainedSideEffects();
+
+    // Releasing activeTask is what makes the queue look idle, so it stays
+    // held until the ffmpeg half below has finished too — otherwise a scan
+    // could start alongside it, against the single-task rule, and an
+    // observer could read 'idle' before finishEnrichment had landed.
+    const done = () => {
+      if (activeTask?.child === wfChild) {
+        removeFromKillQueue(activeTask.killFn);
+        activeTask = null;
+      }
+      finishEnrichment('waveform', code, signal, completeEvt);
+      nextTask();
+      checkQueueDrainedSideEffects();
+    };
+    // symphonia can't decode Opus, so the rust pass leaves those keys
+    // uncached by design. Sweep them (and anything else it gave up on)
+    // with ffmpeg before the pass counts as finished — otherwise every
+    // first play of an Opus track pays a cold decode. Skipped when the
+    // pass was killed (shutdown shouldn't start new work) or failed
+    // (a broken/stale binary means lazy generation is already the only
+    // producer, and the endpoint still covers it).
+    if (signal || code !== 0) { return done(); }
+    runWaveformFfmpegFallback().then(done, done);
   };
   wfChild.on('error', (err) => {
     winston.error(`Waveform pass failed to start: ${err.message}`);
     closeOnce(-1, null);
   });
   wfChild.on('close', (code, signal) => closeOnce(code, signal));
+}
+
+// Backlog of the previous CHAINED fallback round — shouldChain() requires
+// the eligible set to strictly shrink between chained rounds, so any
+// future non-shrinking work source degrades to once-per-scan instead of a
+// hot loop. null = the last round did not chain.
+let lastFallbackBacklog = null;
+
+// Latched when the resolved binary writes a different waveform cache
+// generation than this server reads. Surfaced through the enrichment gate
+// so the admin panel says WHY the rust half stopped contributing instead
+// of showing an enabled pass that silently never runs. Cleared the moment
+// a probe matches, so a dropped-in rebuild clears the badge too.
+let waveformGenerationMismatch = false;
+
+// The ffmpeg half on its own, for when the rust half can't run. Mirrors
+// runWaveformTask's bookkeeping: hold the queue slot, report running, and
+// finish through the same reporting path so lastRun/coverage stay honest.
+function runWaveformFallbackOnly() {
+  // Placeholder so activeTask has the same shape the rust path gives it.
+  // The REAL abort is registered inside runWaveformFfmpegFallback, in the
+  // same synchronous tick, so shutdown still stops the work.
+  const killFn = () => {};
+  activeTask = { kind: 'waveform', taskObj: null, child: null, killFn };
+  addToKillQueue(killFn);
+  reportEnrichment('waveform', { state: 'running' });
+
+  const finish = (res) => {
+    removeFromKillQueue(killFn);
+    if (activeTask && activeTask.kind === 'waveform' && !activeTask.child) {
+      activeTask = null;
+    }
+    if (res) {
+      // Report the ffmpeg half's own numbers. Shape matches the rust
+      // pass's waveformScanComplete payload so the status API and its
+      // consumers don't have to care which half did the work.
+      finishEnrichment('waveform', 0, null,
+        { generated: res.generated, failed: res.failed, total: res.total });
+    } else {
+      // Nothing ran (ffmpeg unresolved, or the half threw). Return to idle
+      // and refresh coverage, but do NOT write a synthetic 'completed'
+      // lastRun over the previous real one — same rule finishEnrichment's
+      // own contract states for a run-time gate bail.
+      invalidateCoverageCache();
+      reportEnrichment('waveform', { state: 'idle', progress: null });
+    }
+    nextTask();
+    checkQueueDrainedSideEffects();
+  };
+
+  // Both settle paths go through finish: if it ever rejected, activeTask
+  // would never be released and the whole task queue would wedge for the
+  // process lifetime.
+  return runWaveformFfmpegFallback().then(finish, (err) => {
+    winston.warn(`Waveform ffmpeg fallback (standalone) failed: ${err.message}`);
+    finish(null);
+  });
+}
+
+// True when the resolved rust binary exists AND writes the same waveform
+// cache generation this server reads. Exported for tests that need to
+// know whether the real pass can run at all (a stale prebuilt in the
+// window before CI rebuilds bin/ answers the probe wrong, and the pass
+// correctly refuses to run — tests must skip rather than fail there).
+export function waveformPassBinaryReady() {
+  if (!findRustParser()) { return false; }
+  return waveformLib.probeWaveformGeneration(rustParserBin) === waveformLib.CACHE_EXT;
+}
+
+// Second half of the waveform pass: covers content symphonia structurally
+// cannot decode (Opus) plus anything it failed on, using the same ffmpeg
+// generator the on-demand endpoint uses. Runs in-process — ffmpeg does the
+// work in its own process and this side is bookkeeping — under its own kill
+// registration so a shutdown between the rust child closing and this
+// finishing stops it promptly. Never rejects: the rust pass's outcome is
+// what the enrichment status reports, and a fallback failure must not turn
+// a successful pass into a failed one.
+async function runWaveformFfmpegFallback() {
+  // Readiness check, not a bootstrap: ensureFfmpeg() may go and DOWNLOAD a
+  // toolchain, which is not something a background enrichment pass should
+  // trigger. If ffmpeg isn't resolved yet the pass simply skips — the
+  // on-demand endpoint still covers these tracks, and the next pass runs
+  // with it resolved.
+  if (!getResolvedSource()) {
+    winston.info('Waveform ffmpeg fallback skipped — ffmpeg not resolved yet');
+    return null;
+  }
+  const abort = { stopped: false };
+  const killFn = () => { abort.stopped = true; };
+  addToKillQueue(killFn);
+  try {
+    const res = await waveformFallback.run({
+      db: db.getDB(),
+      cacheDir: config.program.storage.waveformCacheDirectory,
+      ffmpegBin: ffmpegBin(),
+      abort,
+      onProgress: (done, total) => reportEnrichment('waveform',
+        { progress: { attempted: done, total } }),
+    });
+    if (res.total > 0) {
+      winston.info(
+        `Waveform ffmpeg fallback: ${res.generated} generated, ${res.failed} failed ` +
+        `(${res.total} of ${res.backlog} eligible)` +
+        (res.capped ? '; more remain' : ''));
+      invalidateCoverageCache();
+    }
+    // Chain another pass so a backlog larger than one run's cap drains on
+    // its own instead of waiting for N more scans — but only on DURABLE
+    // progress, judged by shouldChain(): the first version of this gate
+    // counted mere attempts and re-forked the whole pass forever on an
+    // unwritable cache dir (nothing landed, so the plan never shrank).
+    // The backlog handed to shouldChain is from the previous CHAINED
+    // round, so a run that stops chaining also resets the comparison.
+    if (!abort.stopped && waveformFallback.shouldChain(res, lastFallbackBacklog)) {
+      lastFallbackBacklog = res.backlog;
+      addWaveformTask();
+    } else {
+      lastFallbackBacklog = null;
+    }
+    return res;
+  } catch (err) {
+    winston.warn(`Waveform ffmpeg fallback failed: ${err.message}`);
+    lastFallbackBacklog = null;
+    return null;
+  } finally {
+    removeFromKillQueue(killFn);
+  }
 }
 
 // ── Album-art download task ─────────────────────────────────────────────────
@@ -793,10 +1375,12 @@ function addAlbumArtTask() {
   if (activeTask?.kind === 'albumart') { return; }
   if (taskQueue.some((t) => t.task === 'albumart')) { return; }
   taskQueue.push({ task: 'albumart', id: nanoid(8) });
+  reportEnrichment('albumart', { state: 'queued' });
   nextTask();
 }
 
 function runAlbumArtTask(taskObj) {
+  reportEnrichment('albumart', { state: 'idle', progress: null });
   const opts = config.program.scanOptions;
   // Re-check ALL the gates at run time: config may have flipped while
   // this sat queued, and run-time gating is what keeps every enqueue
@@ -808,6 +1392,12 @@ function runAlbumArtTask(taskObj) {
     dbPath: path.join(config.program.storage.dbDirectory, 'mstream.db'),
     albumArtDirectory: config.program.storage.albumArtDirectory,
     compressImage: opts.compressImage,
+    // Thumbnails are produced by ffmpeg in a child process — never by an
+    // in-process decoder (see src/util/image-thumbs.js). The worker has no
+    // config state, so the resolved binaries are passed in; without them it
+    // simply skips thumbnails.
+    ffmpegPath: ffmpegBin() || undefined,
+    ffprobePath: ffprobeBin() || undefined,
     services: opts.albumArtServices || ['musicbrainz', 'itunes', 'deezer'],
     mode: opts.autoAlbumArtMode || 'missing',
     writeToFolder: opts.autoAlbumArtWriteToFolder === true,
@@ -831,8 +1421,9 @@ function runAlbumArtTask(taskObj) {
   addToKillQueue(killFn);
   // `observers.hitCap` is set by the stdout 'albumArtComplete' event so
   // the close handler can decide whether to queue another batch.
-  const observers = { hitCap: false };
+  const observers = { hitCap: false, completeEvt: null };
   activeTask = { kind: 'albumart', taskObj, child: forked, killFn, observers };
+  reportEnrichment('albumart', { state: 'running' });
 
   bufferLines(forked.stdout, (line) => {
     if (!line) { return; }
@@ -841,6 +1432,7 @@ function runAlbumArtTask(taskObj) {
         const evt = JSON.parse(line);
         if (evt.event === 'albumArtComplete') {
           observers.hitCap = !!evt.hitCap;
+          observers.completeEvt = evt;
           if (evt.attempted > 0) {
             winston.info(`Album-art download pass complete: ${evt.updated} fetched, `
               + `${evt.deduped} already-had, ${evt.notFound} not found, `
@@ -849,6 +1441,7 @@ function runAlbumArtTask(taskObj) {
           return;
         }
         if (evt.event === 'albumArtProgress') {
+          reportEnrichment('albumart', { progress: { attempted: evt.attempted ?? 0, total: evt.total ?? null } });
           winston.info(`Album-art download: ${evt.attempted}/${evt.total} albums attempted`);
           return;
         }
@@ -860,11 +1453,7 @@ function runAlbumArtTask(taskObj) {
     }
     winston.info(line);
   });
-  bufferLines(forked.stderr, (line) => {
-    if (!line) { return; }
-    if (line.startsWith('Warning:')) { winston.warn(`Album-art download: ${line}`); }
-    else { winston.error(`Album-art download error: ${line}`); }
-  });
+  bufferLines(forked.stderr, (line) => logWorkerStderr('Album-art download', line));
 
   // Same close/error double-fire latch as the backup + waveform workers.
   let closed = false;
@@ -883,6 +1472,7 @@ function runAlbumArtTask(taskObj) {
       removeFromKillQueue(activeTask.killFn);
       activeTask = null;
     }
+    finishEnrichment('albumart', code, signal, observers.completeEvt);
     // hitCap: the worker stopped at maxPerRun with (probably) more to do —
     // queue another batch so a large first-run backlog drains in this idle
     // stretch, while still yielding the slot to any scan/backup queued
@@ -896,6 +1486,738 @@ function runAlbumArtTask(taskObj) {
   };
   forked.on('error', (err) => {
     winston.error(`Album-art download pass failed to start: ${err.message}`);
+    closeOnce(-1, null);
+  });
+  forked.on('close', (code, signal) => closeOnce(code, signal));
+}
+
+// ── Lyrics backfill enrichment pass ─────────────────────────────────────────
+//
+// The fourth enrichment pass (scan → waveforms → album-art → this). Fills
+// lyrics for tracks that have none (no embedded tag, no sidecar) from the
+// configured providers. Mirrors the album-art downloader's lifecycle exactly;
+// the differences are: config gates (lyrics.backfill + a non-empty providers
+// list), eligibility (lyric-less tracks with title+artist), event names, and
+// an optimizeFts() after a pass that added lyrics (lyrics writes touch the
+// fts_tracks.lyrics column — album-art never touches an FTS-indexed column).
+
+const LYRICS_SCRIPT_PATH = path.join(__dirname, './lyrics-backfill.mjs');
+
+// Enqueue the lyrics backfill pass unless the feature is off or nothing is
+// eligible. The coarse pre-check avoids forking a no-op child after every
+// quiet scan; the worker re-checks with the full per-track cooldown logic.
+// Exported: the admin /lyrics/backfill toggle routes through here so every
+// entry point honours the same gates.
+export function maybeEnqueueLyrics() {
+  const opts = config.program.lyrics || {};
+  if (opts.backfill !== true) { return; }
+  // An empty provider list is "feature off", not a worker crash.
+  if (!Array.isArray(opts.providers) || opts.providers.length === 0) { return; }
+
+  try {
+    const database = db.getDB();
+    if (!database) { return; }
+    // Mirrors the worker's eligibility query: a lyric-less track with the
+    // artist + title a provider needs. Tracks missing either can't be looked
+    // up, so they don't keep the pass alive.
+    const row = database.prepare(
+      `SELECT 1 FROM tracks
+        WHERE lyrics_embedded IS NULL AND lyrics_synced_lrc IS NULL
+          AND title IS NOT NULL AND TRIM(title) != ''
+          AND artist_id IS NOT NULL
+        LIMIT 1`
+    ).get();
+    if (!row) { return; }
+  } catch (err) {
+    // Fail safe: a pre-check hiccup must never wedge the task queue.
+    winston.warn('Lyrics backfill pre-check failed; skipping enqueue', { stack: err });
+    return;
+  }
+
+  addLyricsTask();
+}
+
+function addLyricsTask() {
+  // One pass at a time — a global sweep over eligible tracks.
+  if (activeTask?.kind === 'lyrics') { return; }
+  if (taskQueue.some((t) => t.task === 'lyrics')) { return; }
+  taskQueue.push({ task: 'lyrics', id: nanoid(8) });
+  reportEnrichment('lyrics', { state: 'queued' });
+  nextTask();
+}
+
+function runLyricsTask(taskObj) {
+  reportEnrichment('lyrics', { state: 'idle', progress: null });
+  const opts = config.program.lyrics || {};
+  // Re-check the gates at run time: config may have flipped while queued.
+  if (opts.backfill !== true) { return; }
+  if (!Array.isArray(opts.providers) || opts.providers.length === 0) { return; }
+
+  const jsonLoad = {
+    dbPath: path.join(config.program.storage.dbDirectory, 'mstream.db'),
+    providers: opts.providers,
+    writeSidecar: opts.writeSidecar === true,
+    maxPerRun: opts.backfillMaxPerRun || 100,
+    expectedSchemaVersion: SCHEMA_VERSION,
+    // Cooldowns + inter-request throttle use the worker's own defaults.
+  };
+
+  const forked = launchWorker('lyrics', LYRICS_SCRIPT_PATH, JSON.stringify(jsonLoad));
+  winston.info('Lyrics backfill pass started');
+  // Boot-reaper contract, same as album-art: this child WRITES the DB, so an
+  // orphan surviving a hard kill must be reapable on the next boot — the
+  // command-line marker the reaper matches (the role flag under Bun
+  // self-dispatch, the script path under Node).
+  if (Number.isInteger(forked.pid)) {
+    writeScannerPidfile(config.program.storage.dbDirectory, forked.pid,
+      process.execPath, 'js', workerReaperMarker('lyrics', LYRICS_SCRIPT_PATH));
+  }
+
+  const killFn = () => { try { forked.kill(); } catch (_) { /* already gone */ } };
+  addToKillQueue(killFn);
+  // hitCap → re-enqueue another batch; updated → whether to optimise FTS.
+  const observers = { hitCap: false, updated: 0, completeEvt: null };
+  activeTask = { kind: 'lyrics', taskObj, child: forked, killFn, observers };
+  reportEnrichment('lyrics', { state: 'running' });
+
+  bufferLines(forked.stdout, (line) => {
+    if (!line) { return; }
+    if (line[0] === '{') {
+      try {
+        const evt = JSON.parse(line);
+        if (evt.event === 'lyricsComplete') {
+          observers.hitCap = !!evt.hitCap;
+          observers.updated = evt.updated || 0;
+          observers.completeEvt = evt;
+          if (evt.attempted > 0) {
+            winston.info(`Lyrics backfill pass complete: ${evt.updated} added, `
+              + `${evt.notFound} not found, ${evt.errors} error(s) (${evt.attempted} attempted)`);
+          }
+          return;
+        }
+        if (evt.event === 'lyricsProgress') {
+          reportEnrichment('lyrics', { progress: { attempted: evt.attempted ?? 0, total: evt.total ?? null } });
+          winston.info(`Lyrics backfill: ${evt.attempted}/${evt.total} tracks attempted`);
+          return;
+        }
+        if (evt.event === 'error') {
+          winston.error(`Lyrics backfill: ${evt.message}`);
+          return;
+        }
+      } catch (_) { /* not a structured event — log as plain text */ }
+    }
+    winston.info(line);
+  });
+  bufferLines(forked.stderr, (line) => logWorkerStderr('Lyrics backfill', line));
+
+  // Same close/error double-fire latch as the album-art + waveform workers.
+  let closed = false;
+  const closeOnce = (code, signal) => {
+    if (closed) { return; }
+    closed = true;
+    if (signal) {
+      winston.info(`Lyrics backfill pass terminated by ${signal}`);
+    } else if (code === 3) {
+      winston.warn('Lyrics backfill pass aborted: DB schema changed under it (another instance migrating?)');
+    } else if (code !== 0 && code !== null) {
+      winston.warn(`Lyrics backfill pass exited with code ${code}`);
+    }
+    clearScannerPidfile(config.program.storage.dbDirectory);
+    if (activeTask?.child === forked) {
+      removeFromKillQueue(activeTask.killFn);
+      activeTask = null;
+    }
+    finishEnrichment('lyrics', code, signal, observers.completeEvt);
+    // Merge the FTS5 segments the lyrics writes accumulated (album-art never
+    // touches an FTS-indexed column, so it skips this). Only on a successful
+    // pass that actually added lyrics.
+    if (code === 0 && !signal && observers.updated > 0) {
+      try { db.optimizeFts(); }
+      catch (err) { winston.warn('Lyrics backfill: FTS optimize failed', { stack: err }); }
+    }
+    // hitCap re-enqueue: terminates because every attempted track gets a
+    // cooldown row in lyrics_cache, so a later run finding only cooled-down
+    // tracks clears hitCap.
+    if (code === 0 && !signal && observers.hitCap) {
+      maybeEnqueueLyrics();
+    }
+    nextTask();
+    checkQueueDrainedSideEffects();
+  };
+  forked.on('error', (err) => {
+    winston.error(`Lyrics backfill pass failed to start: ${err.message}`);
+    closeOnce(-1, null);
+  });
+  forked.on('close', (code, signal) => closeOnce(code, signal));
+}
+
+// ── Essentia BPM/key analysis task ──────────────────────────────────────────
+//
+// The last enrichment pass (scan → waveforms → album-art → lyrics → this). A
+// forked child (src/db/audio-analysis-backfill.mjs) decodes each track that has no
+// analysed bpm/musical_key via the bundled ffmpeg and estimates tempo + key
+// with essentia.js. CPU-bound, so the worker self-bounds with a per-run cap AND
+// a wall-clock budget and re-enqueues while hitCap persists — same slot-yield
+// etiquette as the album-art pass so queued scans/backups interleave. See
+// audio-analysis-backfill.mjs for the cooldown/dedupe design.
+//
+// AGPL: essentia.js is AGPL-3.0 — the pass is forked only when
+// scanOptions.analyzeBpm is on. That flag now defaults ON (Auto-DJ mixing
+// out of the box), so this AGPL-covered pass runs by default; operators who
+// need to avoid the AGPL code path set scanOptions.analyzeBpm=false.
+
+const AUDIO_ANALYSIS_SCRIPT_PATH = path.join(__dirname, './audio-analysis-backfill.mjs');
+
+// Coarse eligibility window for the enqueue pre-check (mirrors the worker's
+// duration defaults). Kept loose on purpose — the worker re-checks with the
+// full genre/cooldown logic; this just avoids forking a no-op child after
+// every quiet scan.
+const ANALYSIS_MIN_DURATION_SEC = 30;
+const ANALYSIS_MAX_DURATION_SEC = 30 * 60;
+
+// First-boot race: a small scan can drain BEFORE ffmpeg-bootstrap has
+// resolved a binary (its download/probe takes seconds; six files scan in
+// two). The old behavior silently postponed the enrichment pass to the
+// NEXT scan — a day away at the default scanInterval. Instead, piggyback
+// on the (already in-flight, promise-cached) ensureFfmpeg() and re-run the
+// enqueue when it settles. Set-dedup so a burst of scan-drains registers
+// one retry per gate.
+const ffmpegRetryWaiters = new Set();
+function retryWhenFfmpegResolves(retryFn) {
+  if (ffmpegRetryWaiters.has(retryFn)) { return; }
+  ffmpegRetryWaiters.add(retryFn);
+  ensureFfmpeg().catch(() => null).then(() => {
+    ffmpegRetryWaiters.delete(retryFn);
+    if (ffmpegBin()) { retryFn(); }
+    else { winston.warn('Enrichment pass skipped — no working ffmpeg could be resolved'); }
+  });
+}
+
+// Enqueue unless the feature is off, ffmpeg isn't resolved, or nothing is
+// eligible. Exported so the admin analyze-bpm toggle routes through the same
+// gates as the scan-drain trigger.
+export function maybeEnqueueAudioAnalysis() {
+  if (config.program.scanOptions.analyzeBpm !== true) { return; }
+  if (!ffmpegBin()) {
+    winston.info('Audio-analysis pass deferred — waiting for ffmpeg to resolve');
+    retryWhenFfmpegResolves(maybeEnqueueAudioAnalysis);
+    return;
+  }
+
+  try {
+    const database = db.getDB();
+    if (!database) { return; }
+    const row = database.prepare(
+      `SELECT 1 FROM tracks
+        WHERE (bpm IS NULL OR musical_key IS NULL)
+          AND duration IS NOT NULL AND duration >= ? AND duration <= ?
+          AND COALESCE(audio_hash, file_hash) IS NOT NULL
+        LIMIT 1`
+    ).get(ANALYSIS_MIN_DURATION_SEC, ANALYSIS_MAX_DURATION_SEC);
+    if (!row) { return; }
+  } catch (err) {
+    // Fail safe: a pre-check hiccup must never wedge the task queue.
+    winston.warn('Audio-analysis pre-check failed; skipping enqueue', { stack: err });
+    return;
+  }
+
+  addAudioAnalysisTask();
+}
+
+function addAudioAnalysisTask() {
+  // One pass at a time — it's a global sweep, so a second concurrent or queued
+  // run would only duplicate work.
+  if (activeTask?.kind === 'audioanalysis') { return; }
+  if (taskQueue.some((t) => t.task === 'audioanalysis')) { return; }
+  taskQueue.push({ task: 'audioanalysis', id: nanoid(8) });
+  reportEnrichment('audioanalysis', { state: 'queued' });
+  nextTask();
+}
+
+function runAudioAnalysisTask(taskObj) {
+  reportEnrichment('audioanalysis', { state: 'idle', progress: null });
+  // Re-check the gate at run time: config may have flipped while this sat
+  // queued (admin toggle), and ffmpeg may have gone away.
+  if (config.program.scanOptions.analyzeBpm !== true) { return; }
+  const ffPath = ffmpegBin();
+  if (!ffPath) {
+    winston.info('Audio-analysis pass skipped — no resolved ffmpeg binary');
+    return;
+  }
+
+  const jsonLoad = {
+    dbPath: path.join(config.program.storage.dbDirectory, 'mstream.db'),
+    ffmpegPath: ffPath,
+    maxPerRun: config.program.scanOptions.analyzeBpmPerRun || 200,
+    // Speed knobs (admin-editable, applied on the next pass): BPM method and
+    // the mid-track analysis window. undefined falls through to the worker
+    // defaults (JSON.stringify drops the key).
+    bpmMethod: config.program.scanOptions.analyzeBpmMethod,
+    windowSec: config.program.scanOptions.analyzeBpmWindowSec,
+    expectedSchemaVersion: SCHEMA_VERSION,
+    // Duration window / confidence floors / cooldowns use the worker defaults.
+  };
+
+  // launchWorker (not raw child.fork) so the pass also works under the Bun
+  // --compile self-dispatch path, exactly like the album-art / lyrics / scanner
+  // workers — a raw fork re-runs the embedded server entrypoint there.
+  const forked = launchWorker('audioanalysis', AUDIO_ANALYSIS_SCRIPT_PATH, JSON.stringify(jsonLoad));
+  winston.info('Audio-analysis (BPM/key) pass started');
+  // Boot-reaper contract: this child WRITES the DB (bpm/key + lookup rows), so
+  // an orphan surviving a hard kill must be reapable. workerReaperMarker yields
+  // the right command-line marker for whichever runtime launched it.
+  if (Number.isInteger(forked.pid)) {
+    writeScannerPidfile(config.program.storage.dbDirectory, forked.pid,
+      process.execPath, 'js', workerReaperMarker('audioanalysis', AUDIO_ANALYSIS_SCRIPT_PATH));
+  }
+
+  const killFn = () => { try { forked.kill(); } catch (_) { /* already gone */ } };
+  addToKillQueue(killFn);
+  const observers = { hitCap: false, completeEvt: null };
+  activeTask = { kind: 'audioanalysis', taskObj, child: forked, killFn, observers };
+  reportEnrichment('audioanalysis', { state: 'running' });
+
+  bufferLines(forked.stdout, (line) => {
+    if (!line) { return; }
+    if (line[0] === '{') {
+      try {
+        const evt = JSON.parse(line);
+        if (evt.event === 'audioAnalysisComplete') {
+          observers.hitCap = !!evt.hitCap;
+          observers.completeEvt = evt;
+          if (evt.attempted > 0) {
+            const pace = evt.avgMsPerTrack > 0 ? `, ~${evt.avgMsPerTrack} ms/track` : '';
+            winston.info(`Audio-analysis pass complete: ${evt.analyzed} analysed, `
+              + `${evt.lowconf} low-confidence, ${evt.errors} error(s) (${evt.attempted} attempted${pace})`);
+          }
+          return;
+        }
+        if (evt.event === 'audioAnalysisProgress') {
+          reportEnrichment('audioanalysis', { progress: { attempted: evt.attempted ?? 0, total: evt.total ?? null } });
+          winston.info(`Audio-analysis: ${evt.attempted}/${evt.total} tracks attempted`);
+          return;
+        }
+        if (evt.event === 'error') {
+          winston.error(`Audio-analysis: ${evt.message}`);
+          return;
+        }
+      } catch (_) { /* not a structured event — log as plain text */ }
+    }
+    winston.info(line);
+  });
+  bufferLines(forked.stderr, (line) => logWorkerStderr('Audio-analysis', line));
+
+  let closed = false;
+  const closeOnce = (code, signal) => {
+    if (closed) { return; }
+    closed = true;
+    if (signal) {
+      winston.info(`Audio-analysis pass terminated by ${signal}`);
+    } else if (code === 3) {
+      winston.warn('Audio-analysis pass aborted: DB schema changed under it (another instance migrating?)');
+    } else if (code !== 0 && code !== null) {
+      winston.warn(`Audio-analysis pass exited with code ${code}`);
+    }
+    clearScannerPidfile(config.program.storage.dbDirectory);
+    if (activeTask?.child === forked) {
+      removeFromKillQueue(activeTask.killFn);
+      activeTask = null;
+    }
+    finishEnrichment('audioanalysis', code, signal, observers.completeEvt);
+    // hitCap: the worker stopped at the per-run cap or wall-clock budget with
+    // (probably) more to do — queue another batch so a large backlog drains in
+    // this idle stretch while still yielding to any scan/backup queued
+    // meanwhile. Terminates: every attempted track gets a cooldown row, so a
+    // later run finding only cooled-down tracks clears hitCap.
+    if (code === 0 && !signal && observers.hitCap) {
+      maybeEnqueueAudioAnalysis();
+    }
+    nextTask();
+    checkQueueDrainedSideEffects();
+  };
+  forked.on('error', (err) => {
+    winston.error(`Audio-analysis pass failed to start: ${err.message}`);
+    closeOnce(-1, null);
+  });
+  forked.on('close', (code, signal) => closeOnce(code, signal));
+}
+
+// ── Discovery-embedding enrichment task ─────────────────────────────────────
+//
+// The 5th enrichment pass: populates the SEPARATE discovery.db with one
+// audio embedding per canonical track (src/db/discovery-backfill.mjs). The
+// model is pluggable (scanOptions.discoveryModel → the registry in
+// discovery-features-lib.js); the worker re-embeds rows pinned to a
+// different model, so a model swap migrates the dataset in place across
+// passes. Gated by scanOptions.collectDiscoveryData (default OFF).
+
+const DISCOVERY_SCRIPT_PATH = path.join(__dirname, './discovery-backfill.mjs');
+
+// Coarse duration window for the enqueue pre-check (mirrors the worker's
+// defaults; the worker re-checks with full genre/cooldown logic).
+const DISCOVERY_MIN_DURATION_SEC = 30;
+const DISCOVERY_MAX_DURATION_SEC = 30 * 60;
+
+// Enqueue unless the feature is off, ffmpeg isn't resolved, or every
+// eligible track already has a current-model embedding. Exported so the
+// admin collect-discovery-data toggle routes through the same gates as the
+// scan-drain trigger.
+// Latched true when the embedding worker reports the environment can't
+// load onnxruntime-node at all (exit code 4 — e.g. musl/Alpine images,
+// where onnxruntime's glibc-only binaries can never load). A structural
+// failure, identical on every retry, so the pass stays off until restart
+// instead of failing (and error-logging) on every scan drain.
+let discoveryRuntimeUnavailable = false;
+
+export function maybeEnqueueDiscovery() {
+  if (config.program.scanOptions.collectDiscoveryData !== true) { return; }
+  if (discoveryRuntimeUnavailable) { return; }
+  if (!ffmpegBin()) {
+    winston.info('Discovery-embedding pass deferred — waiting for ffmpeg to resolve');
+    retryWhenFfmpegResolves(maybeEnqueueDiscovery);
+    return;
+  }
+
+  try {
+    // The pre-check needs both DBs: a track is work iff its canonical hash
+    // has no current-model embedding row. The main process's discovery
+    // handle ATTACHes the library DB briefly — same pattern as the export
+    // builder's snapshot ATTACH, and single-threaded like it, so the two
+    // can't interleave mid-statement.
+    const ddb = discoveryDb.openDiscoveryDbIfExists();
+    if (!ddb) { return; }   // toggle/boot creates it when the flag is on
+    const libPath = path.join(config.program.storage.dbDirectory, 'mstream.db').replace(/'/g, "''");
+    ddb.exec(`ATTACH DATABASE '${libPath}' AS precheck_lib`);
+    let row;
+    try {
+      row = ddb.prepare(`
+        SELECT 1 FROM precheck_lib.tracks t
+         WHERE COALESCE(t.audio_hash, t.file_hash) IS NOT NULL
+           AND t.duration IS NOT NULL AND t.duration >= ? AND t.duration <= ?
+           AND NOT EXISTS (
+                 SELECT 1 FROM main.discovery_tracks dt
+                  WHERE dt.audio_hash = COALESCE(t.audio_hash, t.file_hash)
+                    AND dt.embedding IS NOT NULL
+                    AND dt.model_id = ?
+               )
+         LIMIT 1
+      `).get(DISCOVERY_MIN_DURATION_SEC, DISCOVERY_MAX_DURATION_SEC,
+        config.program.scanOptions.discoveryModel);
+    } finally {
+      ddb.exec('DETACH DATABASE precheck_lib');
+    }
+    if (!row) { return; }
+  } catch (err) {
+    // Fail safe: a pre-check hiccup must never wedge the task queue.
+    winston.warn('Discovery pre-check failed; skipping enqueue', { stack: err });
+    return;
+  }
+
+  addDiscoveryTask();
+}
+
+function addDiscoveryTask() {
+  // One pass at a time — it's a global sweep, so a second concurrent or
+  // queued run would only duplicate work.
+  if (activeTask?.kind === 'discovery') { return; }
+  if (taskQueue.some((t) => t.task === 'discovery')) { return; }
+  taskQueue.push({ task: 'discovery', id: nanoid(8) });
+  reportEnrichment('discovery', { state: 'queued' });
+  nextTask();
+}
+
+function runDiscoveryTask(taskObj) {
+  reportEnrichment('discovery', { state: 'idle', progress: null });
+  // Re-check the gate at run time: config may have flipped while this sat
+  // queued (admin toggle), and ffmpeg may have gone away.
+  if (config.program.scanOptions.collectDiscoveryData !== true) { return; }
+  const ffPath = ffmpegBin();
+  if (!ffPath) {
+    winston.info('Discovery-embedding pass skipped — no resolved ffmpeg binary');
+    return;
+  }
+
+  const jsonLoad = {
+    discoveryDbPath: discoveryDb.discoveryDbPath(),
+    libraryDbPath: path.join(config.program.storage.dbDirectory, 'mstream.db'),
+    ffmpegPath: ffPath,
+    model: config.program.scanOptions.discoveryModel,
+    // Weights cache lives under an operator-configurable dir — NOT inside
+    // node_modules (transformers.js's default), which updates would wipe.
+    modelCacheDir: config.program.storage.modelCacheDirectory,
+    maxPerRun: config.program.scanOptions.discoveryPerRun || 50,
+    expectedSchemaVersion: SCHEMA_VERSION,
+    // Duration window / cooldowns / budget use the worker defaults.
+  };
+
+  const forked = launchWorker('discovery', DISCOVERY_SCRIPT_PATH, JSON.stringify(jsonLoad));
+  winston.info(`Discovery-embedding pass started (model: ${jsonLoad.model})`);
+  // Boot-reaper contract: this child WRITES a DB (discovery.db), so an
+  // orphan surviving a hard kill must be reapable.
+  if (Number.isInteger(forked.pid)) {
+    writeScannerPidfile(config.program.storage.dbDirectory, forked.pid,
+      process.execPath, 'js', workerReaperMarker('discovery', DISCOVERY_SCRIPT_PATH));
+  }
+
+  const killFn = () => { try { forked.kill(); } catch (_) { /* already gone */ } };
+  addToKillQueue(killFn);
+  const observers = { hitCap: false, completeEvt: null };
+  activeTask = { kind: 'discovery', taskObj, child: forked, killFn, observers };
+  reportEnrichment('discovery', { state: 'running' });
+
+  bufferLines(forked.stdout, (line) => {
+    if (!line) { return; }
+    if (line[0] === '{') {
+      try {
+        const evt = JSON.parse(line);
+        if (evt.event === 'discoveryComplete') {
+          observers.hitCap = !!evt.hitCap;
+          observers.completeEvt = evt;
+          if (evt.attempted > 0) {
+            winston.info(`Discovery-embedding pass complete: ${evt.embedded} embedded, `
+              + `${evt.errors} error(s) (${evt.attempted} attempted)`);
+          }
+          return;
+        }
+        if (evt.event === 'discoveryProgress') {
+          reportEnrichment('discovery', { progress: { attempted: evt.attempted ?? 0, total: evt.total ?? null } });
+          winston.info(`Discovery-embedding: ${evt.attempted}/${evt.total} tracks attempted`);
+          return;
+        }
+        if (evt.event === 'error') {
+          winston.error(`Discovery-embedding: ${evt.message}`);
+          return;
+        }
+      } catch (_) { /* not a structured event — log as plain text */ }
+    }
+    winston.info(line);
+  });
+  bufferLines(forked.stderr, (line) => logWorkerStderr('Discovery-embedding', line));
+
+  let closed = false;
+  const closeOnce = (code, signal) => {
+    if (closed) { return; }
+    closed = true;
+    if (signal) {
+      winston.info(`Discovery-embedding pass terminated by ${signal}`);
+    } else if (code === 3) {
+      winston.warn('Discovery-embedding pass aborted: library schema changed under it (another instance migrating?)');
+    } else if (code === 4) {
+      // The environment can't load onnxruntime-node at all (worker exit
+      // contract: RUNTIME_UNAVAILABLE_EXIT). Retrying every batch would
+      // fail identically and spam the log — latch it off until restart.
+      // Typical causes: the optional dep never installed, or a musl system
+      // without a working glibc compat layer for onnxruntime's glibc-only
+      // binaries. Modern musl images are NOT categorically broken —
+      // verified 2026-07: Alpine 3.24 + gcompat (the linuxserver.io image)
+      // loads and runs it fine on x64 and arm64; older/leaner musl setups
+      // are what land here.
+      discoveryRuntimeUnavailable = true;
+      winston.error(
+        'Discovery-embedding pass halted: this environment cannot load onnxruntime-node, '
+        + 'so the embedding model cannot run (optional dependency missing, or a musl/Alpine '
+        + 'system without a working glibc compat layer — install/update gcompat, or use a '
+        + 'glibc-based image such as Debian/Ubuntu). Recommendations will not build here. '
+        + 'The pass is disabled until the server restarts.');
+    } else if (code !== 0 && code !== null) {
+      winston.warn(`Discovery-embedding pass exited with code ${code}`);
+    }
+    clearScannerPidfile(config.program.storage.dbDirectory);
+    if (activeTask?.child === forked) {
+      removeFromKillQueue(activeTask.killFn);
+      activeTask = null;
+    }
+    finishEnrichment('discovery', code, signal, observers.completeEvt);
+    // hitCap: stopped at the per-run cap or wall-clock budget with more to
+    // do — queue another batch. Terminates: every attempt either writes an
+    // embedding (drops out of the eligible set) or an error-cooldown row.
+    if (code === 0 && !signal && observers.hitCap) {
+      maybeEnqueueDiscovery();
+    }
+    // Backlog drained (no follow-up batch got queued — covers both the
+    // terminal pass and the backlog-size-divisible-by-cap edge where the
+    // re-enqueue pre-check finds nothing left): publish the results to the
+    // discovery network. No-ops unless p2p is enabled and the dataset
+    // actually advanced past the last announced snapshot.
+    if (code === 0 && !signal && !taskQueue.some((t) => t.task === 'discovery')) {
+      import('../state/discovery-p2p.js')
+        .then((p2p) => p2p.maybeAutoPublishSnapshot())
+        .catch((err) => winston.warn(`discovery auto-publish after embedding pass failed: ${err.message}`));
+    }
+    nextTask();
+    checkQueueDrainedSideEffects();
+  };
+  forked.on('error', (err) => {
+    winston.error(`Discovery-embedding pass failed to start: ${err.message}`);
+    closeOnce(-1, null);
+  });
+  forked.on('close', (code, signal) => closeOnce(code, signal));
+}
+
+// ── AcoustID identification task ─────────────────────────────────────────────
+//
+// External-ID Phase 2: fingerprint un-identified tracks (rust-parser
+// --fingerprint) and resolve them against AcoustID into MusicBrainz
+// recording MBIDs (src/db/acoustid-backfill.mjs). Fills
+// tracks.mbz_recording_id / acoustid_id with mbz_id_source='acoustid' and
+// upgrades discovery.db export_ids from anon: to mbid:. Gated by
+// scanOptions.analyzeAcoustid (default OFF — it sends acoustic fingerprints
+// to an external service).
+
+const ACOUSTID_SCRIPT_PATH = path.join(__dirname, './acoustid-backfill.mjs');
+
+const ACOUSTID_MIN_DURATION_SEC = 10;
+const ACOUSTID_MAX_DURATION_SEC = 2 * 60 * 60;
+// Enqueue pre-check retry horizon: the worker applies real per-outcome
+// cooldowns; this only has to avoid pointless no-op forks, so it uses the
+// SHORTEST cooldown (error, 24h) as "could anything be retryable".
+const ACOUSTID_PRECHECK_RETRY_SEC = 24 * 60 * 60;
+
+// Enqueue unless the feature is off, there's no API key or rust-parser, or
+// nothing could possibly be eligible. Exported so the admin toggle routes
+// through the same gates as the scan-drain trigger.
+export function maybeEnqueueAcoustid() {
+  if (config.program.scanOptions.analyzeAcoustid !== true) { return; }
+  if (!config.program.scanOptions.acoustidApiKey) { return; }
+  if (!findRustParser()) {
+    winston.info('AcoustID pass skipped — no usable rust-parser binary');
+    return;
+  }
+
+  try {
+    const database = db.getDB();
+    if (!database) { return; }
+    const row = database.prepare(`
+      SELECT 1 FROM tracks t
+       WHERE t.mbz_recording_id IS NULL
+         AND COALESCE(t.audio_hash, t.file_hash) IS NOT NULL
+         AND t.duration IS NOT NULL AND t.duration >= ? AND t.duration <= ?
+         AND NOT EXISTS (
+               SELECT 1 FROM acoustid_lookups la
+                WHERE la.audio_hash = COALESCE(t.audio_hash, t.file_hash)
+                  AND la.last_attempt_at >= ?
+             )
+       LIMIT 1
+    `).get(ACOUSTID_MIN_DURATION_SEC, ACOUSTID_MAX_DURATION_SEC,
+      Math.floor(Date.now() / 1000) - ACOUSTID_PRECHECK_RETRY_SEC);
+    if (!row) { return; }
+  } catch (err) {
+    winston.warn('AcoustID pre-check failed; skipping enqueue', { stack: err });
+    return;
+  }
+
+  addAcoustidTask();
+}
+
+function addAcoustidTask() {
+  if (activeTask?.kind === 'acoustid') { return; }
+  if (taskQueue.some((t) => t.task === 'acoustid')) { return; }
+  taskQueue.push({ task: 'acoustid', id: nanoid(8) });
+  reportEnrichment('acoustid', { state: 'queued' });
+  nextTask();
+}
+
+function runAcoustidTask(taskObj) {
+  reportEnrichment('acoustid', { state: 'idle', progress: null });
+  // Re-check gates at run time — config may have flipped while queued.
+  if (config.program.scanOptions.analyzeAcoustid !== true) { return; }
+  if (!config.program.scanOptions.acoustidApiKey) { return; }
+  if (!findRustParser()) {
+    winston.info('AcoustID pass skipped — no usable rust-parser binary');
+    return;
+  }
+
+  const jsonLoad = {
+    dbPath: path.join(config.program.storage.dbDirectory, 'mstream.db'),
+    rustParserPath: rustParserBin,
+    apiKey: config.program.scanOptions.acoustidApiKey,
+    apiUrl: config.program.scanOptions.acoustidApiUrl,
+    maxPerRun: config.program.scanOptions.acoustidPerRun || 200,
+    expectedSchemaVersion: SCHEMA_VERSION,
+  };
+  // Matched ids propagate into discovery.db (export_id anon:→mbid:) when
+  // collection has ever created one.
+  const ddbPath = discoveryDb.discoveryDbPath();
+  if (fs.existsSync(ddbPath)) { jsonLoad.discoveryDbPath = ddbPath; }
+
+  const forked = launchWorker('acoustid', ACOUSTID_SCRIPT_PATH, JSON.stringify(jsonLoad));
+  winston.info('AcoustID identification pass started');
+  if (Number.isInteger(forked.pid)) {
+    writeScannerPidfile(config.program.storage.dbDirectory, forked.pid,
+      process.execPath, 'js', workerReaperMarker('acoustid', ACOUSTID_SCRIPT_PATH));
+  }
+
+  const killFn = () => { try { forked.kill(); } catch (_) { /* already gone */ } };
+  addToKillQueue(killFn);
+  const observers = { hitCap: false, matched: 0, completeEvt: null };
+  activeTask = { kind: 'acoustid', taskObj, child: forked, killFn, observers };
+  reportEnrichment('acoustid', { state: 'running' });
+
+  bufferLines(forked.stdout, (line) => {
+    if (!line) { return; }
+    if (line[0] === '{') {
+      try {
+        const evt = JSON.parse(line);
+        if (evt.event === 'acoustidComplete') {
+          observers.hitCap = !!evt.hitCap;
+          observers.matched = evt.matched || 0;
+          observers.completeEvt = evt;
+          if (evt.attempted > 0) {
+            winston.info(`AcoustID pass complete: ${evt.matched} identified, `
+              + `${evt.nomatch} unknown to AcoustID, ${evt.lowconf} low-confidence, `
+              + `${evt.undecodable} undecodable, ${evt.errors} error(s) (${evt.attempted} attempted)`);
+          }
+          return;
+        }
+        if (evt.event === 'acoustidProgress') {
+          reportEnrichment('acoustid', { progress: { attempted: evt.attempted ?? 0, total: evt.total ?? null } });
+          winston.info(`AcoustID: ${evt.attempted}/${evt.total} tracks attempted`);
+          return;
+        }
+        if (evt.event === 'error') {
+          winston.error(`AcoustID pass: ${evt.message}`);
+          return;
+        }
+      } catch (_) { /* not a structured event — log as plain text */ }
+    }
+    winston.info(line);
+  });
+  bufferLines(forked.stderr, (line) => logWorkerStderr('AcoustID pass', line));
+
+  let closed = false;
+  const closeOnce = (code, signal) => {
+    if (closed) { return; }
+    closed = true;
+    if (signal) {
+      winston.info(`AcoustID pass terminated by ${signal}`);
+    } else if (code === 3) {
+      winston.warn('AcoustID pass aborted: library schema changed under it (another instance migrating?)');
+    } else if (code !== 0 && code !== null) {
+      winston.warn(`AcoustID pass exited with code ${code}`);
+    }
+    clearScannerPidfile(config.program.storage.dbDirectory);
+    if (activeTask?.child === forked) {
+      removeFromKillQueue(activeTask.killFn);
+      activeTask = null;
+    }
+    finishEnrichment('acoustid', code, signal, observers.completeEvt);
+    if (code === 0 && !signal && observers.hitCap) {
+      maybeEnqueueAcoustid();
+    }
+    // Identity upgrades bump discovery.db's row_seq — publish them to the
+    // network once the backlog drains (no-ops when p2p is off or nothing
+    // moved; same hook as the embedding pass).
+    if (code === 0 && !signal && observers.matched > 0
+        && !taskQueue.some((t) => t.task === 'acoustid')) {
+      import('../state/discovery-p2p.js')
+        .then((p2p) => p2p.maybeAutoPublishSnapshot())
+        .catch((err) => winston.warn(`discovery auto-publish after AcoustID pass failed: ${err.message}`));
+    }
+    nextTask();
+    checkQueueDrainedSideEffects();
+  };
+  forked.on('error', (err) => {
+    winston.error(`AcoustID pass failed to start: ${err.message}`);
     closeOnce(-1, null);
   });
   forked.on('close', (code, signal) => closeOnce(code, signal));
@@ -971,11 +2293,24 @@ function runScan(scanObj) {
     // for the rationale on the half-cores default.
     scanThreads: config.program.scanOptions.scanThreads || 0,
     forceRescan: scanObj.forceRescan || false,
+    // Generation-scoped convergence epoch (V60): re-parse only rows
+    // stamped below the current hashing generation. Distinct from
+    // forceRescan — see the field's comment in scanner.mjs / main.rs.
+    hashEpoch: scanObj.hashEpoch || false,
     // Per-library followSymlinks flag (V21). Pulled straight from
     // the libraries row — toggling it in the admin panel takes
     // effect on the next scan of this vpath without the scanner
     // needing to know anything about the admin UI.
     followSymlinks: library.follow_symlinks === 1,
+    // Dot-entry ignore flags (scanOptions, default FALSE — opt-in via
+    // the admin toggles) — both scanners skip dot-hidden files/folders
+    // during the walk AND treat matching rows as stale in the sweep, so
+    // a flag flip converges the index on the next scan. The hardcoded
+    // NAS-recycle/system-dir blocklist (src/db/scan-ignore.js) is
+    // always on and needs no field here. Old scanner builds ignore
+    // both fields.
+    ignoreDotFiles: config.program.scanOptions.ignoreDotFiles === true,
+    ignoreDotFolders: config.program.scanOptions.ignoreDotFolders === true,
     // TRANSITION-ONLY fields: current scanners ignore both — waveform
     // generation moved to the post-scan waveform task (runWaveformTask)
     // and BPM analysis left the scanner entirely (it returns as the
@@ -1097,9 +2432,19 @@ const BACKUP_WORKER_PATH = path.join(__dirname, '../backup/worker.mjs');
 //   true  — queued (or running, if the slot was free and it started immediately)
 //   false — dropped because of dedup
 // The caller is responsible for any 'skipped' history-row bookkeeping.
+//
+// KNOWN LIMITATION (accepted, 2026-07-10): the queue is in-memory only
+// and the history row is created when the run STARTS (runBackupTask),
+// not here — so a queued-but-not-started backup vanishes without trace
+// on a process restart. A manual "Run now" stuck behind a multi-hour
+// scan is the visible case; daily and after-scan triggers self-heal on
+// their next cadence. The info log below is the only breadcrumb.
+// Persisting queue state (a 'queued' status + boot recovery) was judged
+// not worth the schema/recovery complexity for that one case.
 export function addBackupTask(destinationId, triggerReason) {
   if (isBackupQueuedOrActive(destinationId)) { return false; }
   taskQueue.push({ task: 'backup', destinationId, triggerReason, id: nanoid(8) });
+  winston.info(`Backup: queued run for destination #${destinationId} (trigger=${triggerReason})`);
   nextTask();
   return true;
 }
@@ -1110,6 +2455,29 @@ export function isBackupQueuedOrActive(destinationId) {
     return true;
   }
   return taskQueue.some((t) => t.task === 'backup' && t.destinationId === destinationId);
+}
+
+// Purge queued backups for a destination and kill its active worker if
+// one is running. Called by the DELETE route BEFORE the destination row
+// is removed — without this, a deleted destination's worker kept
+// mirroring (for hours, to a config the user just removed) while its
+// history row was cascade-deleted out from under it. The kill is
+// asynchronous: the worker's close handler fires shortly after, marks
+// the (already-deleted) row failed as a no-op, and releases the queue
+// slot. Returns true when an active worker was signalled.
+export function cancelBackupsForDestination(destinationId) {
+  for (let i = taskQueue.length - 1; i >= 0; i--) {
+    if (taskQueue[i].task === 'backup' && taskQueue[i].destinationId === destinationId) {
+      taskQueue.splice(i, 1);
+    }
+  }
+  if (activeTask?.kind === 'backup'
+      && activeTask.taskObj.destinationId === destinationId) {
+    winston.info(`Backup: killing active run for deleted destination #${destinationId}`);
+    activeTask.killFn();
+    return true;
+  }
+  return false;
 }
 
 export function getActiveBackupRun() {
@@ -1172,7 +2540,28 @@ function runBackupTask(taskObj) {
     interFileDelayMs: dest.inter_file_delay_ms || 0,
   };
 
-  const forked = launchWorker('backup', BACKUP_WORKER_PATH, JSON.stringify(jsonLoad));
+  // launchWorker can THROW synchronously for some spawn failures
+  // (ENOMEM/EPERM-class errors throw instead of emitting 'error' —
+  // only the EACCES/EAGAIN/EMFILE/ENFILE/ENOENT family defers). The
+  // history row above already exists; letting the throw escape to
+  // nextTask's catch would orphan it as 'running' forever — never
+  // pruned (running rows are exempt), never flipped until the next
+  // boot's crash recovery, and silently consuming the day's scheduled
+  // window. Finalise the row as failed and re-throw for nextTask's
+  // dispatch log. activeTask isn't claimed until attachBackupHandlers,
+  // so there's nothing else to unwind here.
+  let forked;
+  try {
+    forked = launchWorker('backup', BACKUP_WORKER_PATH, JSON.stringify(jsonLoad));
+  } catch (err) {
+    try {
+      db.finishBackupRunRow(historyId, {
+        status: 'failed',
+        errorMessage: `Worker launch failed: ${err.message}`,
+      });
+    } catch (_) { /* row finalisation is best-effort here */ }
+    throw err;
+  }
   winston.info(`Backup: started run #${historyId} for ${dest.dest_path} (trigger=${taskObj.triggerReason})`);
 
   const observers = attachBackupHandlers(forked, taskObj, historyId);
@@ -1281,13 +2670,20 @@ function onBackupClose(forked, taskObj, historyId, code, signal, { lastEvent, fa
     activeTask = null;
   }
 
-  // Decide final status. Three cases:
+  // Decide final status. Four cases:
   //   1. Worker emitted {event:'error'} and exited 1 → 'failed'
   //   2. Worker exited non-zero / killed by signal     → 'failed'
   //      (covers crashes, OOM, killed by signal — including server
   //      shutdown via the kill list).
-  //   3. Worker exited 0                               → 'success',
-  //      annotated with file-error count if any per-file errors hit.
+  //   3. Worker exited 0 with per-file errors          → 'partial'.
+  //      Previously this was 'success' with an error annotation buried
+  //      in a hover tooltip — a run where EVERY file failed still
+  //      showed green. 'partial' renders distinctly (orange). It still
+  //      COUNTS as a scheduler attempt (one try per day either way)
+  //      and as the progress denominator (getLastCountedBackupBefore —
+  //      it processed roughly the whole library); it is only excluded
+  //      from "last successful run" semantics.
+  //   4. Worker exited 0 cleanly                       → 'success'.
   //
   // For signal kills `code` is null and `signal` carries the name —
   // we report the signal explicitly so a user looking at the history
@@ -1306,6 +2702,7 @@ function onBackupClose(forked, taskObj, historyId, code, signal, { lastEvent, fa
     errorMessage = `Worker exited with code ${code}`;
   } else if (lastEvent?.event === 'done' && lastEvent.fileErrors > 0) {
     const sample = lastEvent.sampleErrorMessage ? `; example: ${lastEvent.sampleErrorMessage}` : '';
+    status = 'partial';
     errorMessage = `${lastEvent.fileErrors} file error(s)${sample}`;
   }
 
@@ -1326,10 +2723,39 @@ export function scanVPath(vPath) {
   addScanTask(vPath);
 }
 
-// Targeted subtree scan. Walks {vpath}/{subtree} only and skips the
-// stale-cleanup pass. Used by the torrent completion-watcher so each
-// completed torrent triggers a narrow scan over its own download dir
-// instead of a full library walk.
+// Filesystem-watcher lifecycle, bound to this queue's enqueue functions
+// and scan-activity signal so the watcher module never has to import
+// task-queue (no cycle). Restart-idempotent — boot, reboot() and the
+// admin toggle all call these blindly; directory add/remove restarts
+// them so the watched set tracks the library list.
+export function startLibraryWatchers() {
+  libraryWatcher.startLibraryWatchers({
+    libraries: db.getAllLibraries(),
+    waitSeconds: config.program.scanOptions.watcherWait,
+    isScanActive: () => activeTask?.kind === 'scan',
+    enqueueFull: (vpath) => addScanTask(vpath),
+    enqueueSubtree: (vpath, subtree) => addSubtreeScanTask(vpath, subtree),
+  });
+}
+
+export function stopLibraryWatchers() {
+  libraryWatcher.stopLibraryWatchers();
+}
+
+// Re-sync the watched set with the current library list; a no-op while
+// the feature is disabled.
+export function refreshLibraryWatchers() {
+  if (config.program.scanOptions.watcherEnabled === true) {
+    startLibraryWatchers();
+  }
+}
+
+// Targeted subtree scan. Walks {vpath}/{subtree} only; the stale sweep
+// runs scoped to that prefix (deleted/renamed files under the subtree
+// converge out, with move re-homing — rows outside it are never
+// touched). Used by the torrent completion-watcher so each completed
+// torrent triggers a narrow scan over its own download dir instead of
+// a full library walk.
 export function scanSubtree(vPath, subtree) {
   addSubtreeScanTask(vPath, subtree);
 }
@@ -1372,12 +2798,92 @@ export function getAdminStats() {
   };
 }
 
+// Config/environment gates per enrichment pass, evaluated WITHOUT side
+// effects. Mirrors the checks each maybeEnqueueX/runXTask applies, minus
+// anything mutating: notably NO findRustParser() (its miss path can kick
+// off a five-minute `cargo build`) — the latched rustParserDisabled flag
+// is the strongest side-effect-free signal about the binary, and an
+// unprobed binary reads as available (the pass itself probes when it runs).
+// Reasons are ordered most-actionable-first: a config toggle the operator
+// can flip beats an environment condition they'd have to fix.
+function enrichmentGate(kind) {
+  const opts = config.program.scanOptions;
+  const off = (reason) => ({ enabled: false, reason });
+  const on = { enabled: true, reason: null };
+  switch (kind) {
+    case 'waveform':
+      if (opts.generateWaveforms === false) { return off('config'); }
+      if (waveformPassUnsupported) { return off('binary-unsupported'); }
+      if (rustParserDisabled) { return off('no-binary'); }
+      // The rust half is sidelined but the ffmpeg half still runs, so this
+      // is a degraded-not-disabled state: reported as enabled with a reason
+      // rather than off, otherwise the panel would claim nothing happens
+      // while Opus coverage is in fact still being produced.
+      if (waveformGenerationMismatch) {
+        return { enabled: true, reason: 'binary-generation-mismatch' };
+      }
+      return on;
+    case 'albumart':
+      if (opts.autoAlbumArt === false || opts.skipImg === true) { return off('config'); }
+      if (Array.isArray(opts.albumArtServices) && opts.albumArtServices.length === 0) { return off('config'); }
+      return on;
+    case 'lyrics': {
+      const lyr = config.program.lyrics || {};
+      if (lyr.backfill !== true) { return off('config'); }
+      if (!Array.isArray(lyr.providers) || lyr.providers.length === 0) { return off('config'); }
+      return on;
+    }
+    case 'audioanalysis':
+      if (opts.analyzeBpm !== true) { return off('config'); }
+      if (!ffmpegBin()) { return off('no-ffmpeg'); }
+      return on;
+    case 'discovery':
+      if (opts.collectDiscoveryData !== true) { return off('config'); }
+      if (discoveryRuntimeUnavailable) { return off('runtime-unavailable'); }
+      if (!ffmpegBin()) { return off('no-ffmpeg'); }
+      return on;
+    case 'acoustid':
+      if (opts.analyzeAcoustid !== true) { return off('config'); }
+      if (!opts.acoustidApiKey) { return off('no-api-key'); }
+      if (rustParserDisabled) { return off('no-binary'); }
+      return on;
+    default:
+      return on;
+  }
+}
+
+// Snapshot of every enrichment pass for the status API
+// (GET /api/v1/scan/status). Defensive copies throughout, same contract
+// as getAdminStats. 'disabled' is derived here rather than stored: the
+// registry keeps the truthful runtime state, so a pass that is mid-run
+// when its toggle flips off reports 'running' until it exits, and a
+// re-enabled pass is instantly 'idle' again without an event.
+export function getEnrichmentStatus() {
+  return ENRICHMENT_KINDS.map((kind) => {
+    const s = enrichmentStatus[kind];
+    const gate = enrichmentGate(kind);
+    return {
+      pass: kind,
+      enabled: gate.enabled,
+      disabledReason: gate.reason,
+      state: s.state === 'idle' && !gate.enabled ? 'disabled' : s.state,
+      progress: s.progress ? { ...s.progress } : null,
+      lastRun: s.lastRun
+        ? { ...s.lastRun, counts: s.lastRun.counts ? { ...s.lastRun.counts } : null }
+        : null,
+    };
+  });
+}
+
 // Read the stable scan id for the in-flight migration-rescan epoch from
 // the `.rescan-pending` marker, assigning + persisting one the first time
 // (older markers were written empty — that's expected). Reusing this id
 // across restarts is what lets the boot rescan RESUME: the scanner skips
 // any track already stamped with it instead of re-parsing from file zero.
-// Exported for the unit test in test/task-queue.test.mjs.
+// Two flavors, encoded in the id itself: 'rescan-*' (minted here for
+// empty markers — full force epochs from rescanRequired migrations) and
+// 'hashgen-N' (written by the boot convergence check — generation-scoped
+// hashEpoch scans). Exported for the unit test in test/task-queue.test.mjs.
 export function resolveRescanEpochId(markerPath) {
   let epochId = '';
   try { epochId = fs.readFileSync(markerPath, 'utf8').trim(); } catch (_) { /* unreadable/missing — assign below */ }
@@ -1389,8 +2895,21 @@ export function resolveRescanEpochId(markerPath) {
 }
 
 export function runAfterBoot() {
-  // Clear any stale scan progress rows left from a previous crash
-  try { db.getDB()?.prepare('DELETE FROM scan_progress').run(); } catch (_) {}
+  // Clear any stale scan progress rows left from a previous crash.
+  // reboot() re-runs this WITHOUT exiting the process, so a scan worker
+  // can be genuinely alive right now — spare its row, or the admin
+  // progress UI goes blank for the rest of a possibly hours-long scan
+  // (the scanners INSERT their row once at startup and only UPDATE it
+  // after; a wiped row makes every later write a 0-row no-op). Same
+  // reboot-survivor guard the backup side has in markStaleBackupRunsFailed.
+  try {
+    const liveScanId = activeTask?.kind === 'scan' ? activeTask.taskObj.id : null;
+    if (liveScanId != null) {
+      db.getDB()?.prepare('DELETE FROM scan_progress WHERE scan_id != ?').run(liveScanId);
+    } else {
+      db.getDB()?.prepare('DELETE FROM scan_progress').run();
+    }
+  } catch (_) {}
 
   // Check if a migration flagged a force rescan. We DO NOT unlink the
   // marker here — it stays on disk until the queue drains after a
@@ -1405,14 +2924,36 @@ export function runAfterBoot() {
   // finish in one uptime the marker never cleared and it re-scanned from
   // scratch forever (the bug this fixes).
   const markerPath = path.join(config.program.storage.dbDirectory, '.rescan-pending');
+  // Hash-generation convergence (V60): rows below the current generation
+  // mean a re-key epoch never fully completed (an interrupted epoch, a
+  // file that erred mid-parse, rows written by paths that predate the
+  // stamp). The marker content is the STABLE generation-derived epoch id
+  // — every re-arm resumes the same epoch instead of minting a fresh one
+  // — and the 'hashgen-' prefix makes the boot scan run in hashEpoch
+  // mode: only rows stamped below the current generation re-parse, so a
+  // re-arm costs the stragglers, never a whole-library re-parse. The
+  // probe is O(1) via the self-emptying partial index from SCHEMA_V60
+  // (the literal generation in the query text is what lets SQLite prove
+  // the index applies). A real migration epoch always outranks this:
+  // manager.js truncates the marker, and empty content resolves to a
+  // full-force 'rescan-*' id.
+  try {
+    if (!fs.existsSync(markerPath)
+        && db.getDB()?.prepare(`SELECT 1 FROM tracks WHERE hash_v < ${HASH_GENERATION} LIMIT 1`).get()) {
+      fs.writeFileSync(markerPath, `hashgen-${HASH_GENERATION}\n`);
+      winston.info('Hash-generation convergence: rows below the current generation remain — arming a generation-scoped rescan epoch');
+    }
+  } catch (_) { /* checked again next boot */ }
   let pendingRescan = false;
+  let hashEpoch = false;
   try {
     if (fs.existsSync(markerPath)) {
       pendingRescan = true;
       bootRescanInFlight = true;
       bootRescanMarkerPath = markerPath;
       bootRescanScanId = resolveRescanEpochId(markerPath);
-      winston.info(`Force rescan pending from migration — resumable epoch '${bootRescanScanId}'`);
+      hashEpoch = bootRescanScanId.startsWith('hashgen-');
+      winston.info(`Rescan pending from migration — resumable ${hashEpoch ? 'generation-scoped' : 'full force'} epoch '${bootRescanScanId}'`);
     }
   } catch (_) {}
 
@@ -1420,8 +2961,9 @@ export function runAfterBoot() {
     if (pendingRescan) {
       // Resumable migration rescan: every library shares the stable epoch
       // id so a restart continues from where it left off instead of
-      // re-parsing the whole library from file zero.
-      rescanAll(bootRescanScanId);
+      // re-parsing the whole library from file zero. hashgen epochs run
+      // generation-scoped (hashEpoch) rather than full-force.
+      rescanAll(bootRescanScanId, hashEpoch);
       // If rescanAll enqueued nothing (e.g. zero libraries configured), no
       // scan will ever close to trigger the drain check — so clear the
       // marker now rather than letting it linger across boots. When
@@ -1432,6 +2974,14 @@ export function runAfterBoot() {
     }
     if (config.program.scanOptions.scanInterval > 0 && scanIntervalTimer === null) {
       scanIntervalTimer = setInterval(() => scanAll(), config.program.scanOptions.scanInterval * 60 * 60 * 1000);
+    }
+    // Filesystem watcher (opt-in). Started/stopped here so reboot()
+    // re-evaluates the flag; start is restart-idempotent. Any events it
+    // catches during the boot scan are absorbed by the queue's dedup.
+    if (config.program.scanOptions.watcherEnabled === true) {
+      startLibraryWatchers();
+    } else {
+      stopLibraryWatchers();
     }
   }, config.program.scanOptions.bootScanDelay * 1000);
 }

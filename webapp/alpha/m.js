@@ -119,10 +119,10 @@ function escapeHtml (string) {
 
 function renderAlbum(id, artist, name, albumArtFile, year) {
   const artSrc = albumArtFile
-    ? `${MSTREAMAPI.currentServer.host}album-art/${albumArtFile}?${VUEPLAYERCORE.altLayout.compressArt ? 'compress=l&' : ''}token=${MSTREAMAPI.currentServer.token}`
+    ? `${MSTREAMAPI.currentServer.host}album-art/${escapeHtml(albumArtFile)}?${VUEPLAYERCORE.altLayout.compressArt ? 'compress=l&' : ''}token=${MSTREAMAPI.currentServer.token}`
     : null;
 
-  return `<div class="album-grid-card" ${year ? `data-year="${year}"` : ''} ${artist ? `data-artist="${artist}"` : ''} ${id ? `data-album="${id}"` : ''} onclick="getAlbumsOnClick(this);">
+  return `<div class="album-grid-card" ${year ? `data-year="${escapeHtml(year)}"` : ''} ${artist ? `data-artist="${escapeHtml(artist)}"` : ''} ${id ? `data-album="${escapeHtml(id)}"` : ''} onclick="getAlbumsOnClick(this);">
     <div class="album-grid-art">
       ${artSrc
         ? `<img loading="lazy" src="${artSrc}">`
@@ -132,29 +132,29 @@ function renderAlbum(id, artist, name, albumArtFile, year) {
       </button>
     </div>
     <div class="album-grid-info">
-      <div class="album-grid-name">${name}</div>
-      ${year ? `<div class="album-grid-year">${year}</div>` : ''}
+      <div class="album-grid-name">${escapeHtml(name)}</div>
+      ${year ? `<div class="album-grid-year">${escapeHtml(year)}</div>` : ''}
     </div>
   </div>`;
 }
 
 function renderArtist(artist) {
   return `<li class="collection-item">
-      <div data-artist="${artist}" class="artistz" onclick="getArtistz(this)">${artist}</div>
+      <div data-artist="${escapeHtml(artist)}" class="artistz" onclick="getArtistz(this)">${escapeHtml(artist)}</div>
     </li>`;
 }
 
 function renderFileWithMetadataHtml(filepath, lokiId, metadata) {
   return `<li data-lokiid="${lokiId}" class="collection-item">
-    <div data-file_location="${filepath}" class="filez flex" onclick="onFileClick(this);">
-      <img class="album-art-box" loading="lazy" ${metadata['album-art'] ? `src="${MSTREAMAPI.currentServer.host}album-art/${metadata['album-art']}?compress=s&token=${MSTREAMAPI.currentServer.token}"` : 'src="assets/img/default.png"'}>
+    <div data-file_location="${escapeHtml(filepath)}" class="filez flex" onclick="onFileClick(this);">
+      <img class="album-art-box" loading="lazy" ${metadata['album-art'] ? `src="${MSTREAMAPI.currentServer.host}album-art/${escapeHtml(metadata['album-art'])}?compress=s&token=${MSTREAMAPI.currentServer.token}"` : 'src="assets/img/default.png"'}>
       <div>
-        <b><span>${(!metadata || !metadata.title) ? filepath.split("/").pop() : `${metadata.title}`}</span></b>
-        ${metadata.artist ? `</b><br><span style="font-size:15px;">${metadata.artist}</span>` : ''}
+        <b><span>${escapeHtml((!metadata || !metadata.title) ? filepath.split("/").pop() : metadata.title)}</span></b>
+        ${metadata.artist ? `</b><br><span style="font-size:15px;">${escapeHtml(metadata.artist)}</span>` : ''}
       </div>
     </div>
     <div class="song-button-box">
-      <span title="Play Now" onclick="playNow(this);" data-file_location="${filepath}" class="songDropdown">
+      <span title="Play Now" onclick="playNow(this);" data-file_location="${escapeHtml(filepath)}" class="songDropdown">
         <svg xmlns="http://www.w3.org/2000/svg" height="14" width="14" viewBox="0 0 24 24"><path fill="none" d="M0 0h24v24H0z"/><path d="M15.5 5H11l5 7-5 7h4.5l5-7z"/><path d="M8.5 5H4l5 7-5 7h4.5l5-7z"/></svg>
       </span>
       <span data-lokiid="${lokiId}" class="removePlaylistSong" onclick="removePlaylistSong(this);">remove</span>
@@ -164,19 +164,19 @@ function renderFileWithMetadataHtml(filepath, lokiId, metadata) {
 
 function createMusicFileHtml(fileLocation, title, aa, rating, subtitle) {
   return `<li class="collection-item">
-    <div data-file_location="${fileLocation}" class="filez ${aa ? 'flex2' : ''}" onclick="onFileClick(this);">
+    <div data-file_location="${escapeHtml(fileLocation)}" class="filez ${aa ? 'flex2' : ''}" onclick="onFileClick(this);">
       ${aa ? `<img loading="lazy" class="album-art-box" ${aa}>` : '<svg class="music-image" height="18" width="18" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><path d="M9 37.5c-3.584 0-6.5-2.916-6.5-6.5s2.916-6.5 6.5-6.5a6.43 6.43 0 012.785.634l.715.34V5.429l25-3.846V29c0 3.584-2.916 6.5-6.5 6.5s-6.5-2.916-6.5-6.5 2.916-6.5 6.5-6.5a6.43 6.43 0 012.785.634l.715.34V11.023l-19 2.931V31c0 3.584-2.916 6.5-6.5 6.5z" fill="#8bb7f0"/><path d="M37 2.166V29c0 3.308-2.692 6-6 6s-6-2.692-6-6 2.692-6 6-6a5.93 5.93 0 012.57.586l1.43.68V10.441l-1.152.178-18 2.776-.848.13V31c0 3.308-2.692 6-6 6s-6-2.692-6-6 2.692-6 6-6a5.93 5.93 0 012.57.586l1.43.68V5.858l24-3.692M38 1L12 5v19.683A6.962 6.962 0 009 24a7 7 0 107 7V14.383l18-2.776v11.076A6.962 6.962 0 0031 22a7 7 0 107 7V1z" fill="#4e7ab5"/></svg>'} 
       <span>
         ${subtitle !== undefined ? `<b>` : ''}
-        <span class="${aa ? '' : 'item-text'}">${rating ? `[${rating}] ` : ''}${title}</span>
-        ${subtitle !== undefined ? `</b><br><span>${subtitle}</span>` : ''}
+        <span class="${aa ? '' : 'item-text'}">${rating ? `[${rating}] ` : ''}${escapeHtml(title)}</span>
+        ${subtitle !== undefined ? `</b><br><span style="font-size:15px;">${escapeHtml(subtitle)}</span>` : ''}
       </span>
     </div>
     <div class="song-button-box">
-      <span title="Play Now" onclick="playNow(this);" data-file_location="${fileLocation}" class="songDropdown">
+      <span title="Play Now" onclick="playNow(this);" data-file_location="${escapeHtml(fileLocation)}" class="songDropdown">
         <svg xmlns="http://www.w3.org/2000/svg" height="14" width="14" viewBox="0 0 24 24"><path fill="none" d="M0 0h24v24H0z"/><path d="M15.5 5H11l5 7-5 7h4.5l5-7z"/><path d="M8.5 5H4l5 7-5 7h4.5l5-7z"/></svg>
       </span>
-      <span title="Add To Playlist" onclick="createPopper3(this);" data-file_location="${fileLocation}" class="fileAddToPlaylist">
+      <span title="Add To Playlist" onclick="createPopper3(this);" data-file_location="${escapeHtml(fileLocation)}" class="fileAddToPlaylist">
         <svg class="pop-f" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 292.362 292.362"><path class="pop-f" d="M286.935 69.377c-3.614-3.617-7.898-5.424-12.848-5.424H18.274c-4.952 0-9.233 1.807-12.85 5.424C1.807 72.998 0 77.279 0 82.228c0 4.948 1.807 9.229 5.424 12.847l127.907 127.907c3.621 3.617 7.902 5.428 12.85 5.428s9.233-1.811 12.847-5.428L286.935 95.074c3.613-3.617 5.427-7.898 5.427-12.847 0-4.948-1.814-9.229-5.427-12.85z"/></svg>
       </span>
     </div>
@@ -185,15 +185,15 @@ function createMusicFileHtml(fileLocation, title, aa, rating, subtitle) {
 
 function renderDirHtml(name) {
   return `<li class="collection-item">
-    <div data-directory="${name}" class="dirz" onclick="handleDirClick(this);">
+    <div data-directory="${escapeHtml(name)}" class="dirz" onclick="handleDirClick(this);">
       <svg class="folder-image" viewBox="0 0 48 48" version="1.0" xmlns="http://www.w3.org/2000/svg"><path fill="#FFA000" d="M38 12H22l-4-4H8c-2.2 0-4 1.8-4 4v24c0 2.2 1.8 4 4 4h31c1.7 0 3-1.3 3-3V16c0-2.2-1.8-4-4-4z"/><path fill="#FFCA28" d="M42.2 18H15.3c-1.9 0-3.6 1.4-3.9 3.3L8 40h31.7c1.9 0 3.6-1.4 3.9-3.3l2.5-14c.5-2.4-1.4-4.7-3.9-4.7z"/></svg>
-      <span class="item-text">${name}</span>
+      <span class="item-text">${escapeHtml(name)}</span>
     </div>
     <div class="song-button-box">
-      <span style="padding-top:1px;" title="Add All To Queue" class="songDropdown" onclick="recursiveAddDir(this);" data-directory="${name}">
+      <span style="padding-top:1px;" title="Add All To Queue" class="songDropdown" onclick="recursiveAddDir(this);" data-directory="${escapeHtml(name)}">
         <svg xmlns="http://www.w3.org/2000/svg" height="10" width="10" viewBox="0 0 1280 1276"><path d="M6760 12747 c-80 -5 -440 -10 -800 -11 -701 -2 -734 -4 -943 -57 -330 -84 -569 -281 -681 -563 -103 -256 -131 -705 -92 -1466 12 -241 16 -531 16 -1232 l0 -917 -1587 -4 c-1561 -3 -1590 -3 -1703 -24 -342 -62 -530 -149 -692 -322 -158 -167 -235 -377 -244 -666 -43 -1404 -42 -1813 7 -2355 21 -235 91 -400 233 -548 275 -287 730 -389 1591 -353 1225 51 2103 53 2330 7 l60 -12 6 -1489 c6 -1559 6 -1548 49 -1780 100 -535 405 -835 933 -921 88 -14 252 -17 1162 -24 591 -4 1099 -4 1148 1 159 16 312 56 422 112 118 59 259 181 333 290 118 170 195 415 227 722 18 173 21 593 6 860 -26 444 -32 678 -34 1432 l-2 811 54 7 c30 4 781 6 1670 5 1448 -2 1625 -1 1703 14 151 28 294 87 403 168 214 159 335 367 385 666 15 85 29 393 30 627 0 105 4 242 10 305 43 533 49 1047 15 1338 -44 386 -144 644 -325 835 -131 140 -278 220 -493 270 -92 21 -98 21 -1772 24 l-1680 3 3 1608 c2 1148 0 1635 -8 1706 -49 424 -255 701 -625 841 -243 91 -633 124 -1115 92z" transform="matrix(.1 0 0 -.1 0 1276)"/></svg>
       </span>
-      <span data-directory="${name}" title="Download Directory" class="downloadDir" onclick="recursiveFileDownload(this);">
+      <span data-directory="${escapeHtml(name)}" title="Download Directory" class="downloadDir" onclick="recursiveFileDownload(this);">
         <svg width="13" height="13" viewBox="0 0 2048 2048" xmlns="http://www.w3.org/2000/svg"><path d="M1803 960q0 53-37 90l-651 652q-39 37-91 37-53 0-90-37l-651-652q-38-36-38-90 0-53 38-91l74-75q39-37 91-37 53 0 90 37l294 294v-704q0-52 38-90t90-38h128q52 0 90 38t38 90v704l294-294q37-37 90-37 52 0 91 37l75 75q37 39 37 91z"/></svg>
       </span>
     </div>
@@ -202,15 +202,15 @@ function renderDirHtml(name) {
 
 function createFileplaylistHtml(dataDirectory) {
   return `<li class="collection-item pointer">
-    <div data-directory="${dataDirectory}" class="fileplaylistz" onclick="onFilePlaylistClick(this);">
+    <div data-directory="${escapeHtml(dataDirectory)}" class="fileplaylistz" onclick="onFilePlaylistClick(this);">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="25" height="25"><path d="M14.5 8a2.495 2.495 0 0 0-2.5 2.5v45c0 1.385 1.115 2.5 2.5 2.5h35c1.385 0 2.5-1.115 2.5-2.5V23l-13.75-1.25L37 8Z" opacity=".2"/><path fill="#1e98d1" d="M14.5 7A2.495 2.495 0 0 0 12 9.5v45c0 1.385 1.115 2.5 2.5 2.5h35c1.385 0 2.5-1.115 2.5-2.5V22l-13.75-1.25L37 7z"/><path d="M37 8v12.5a2.5 2.5 0 0 0 2.5 2.5H52Z" opacity=".2"/><path fill="#67bbe9" d="M37 7v12.5a2.5 2.5 0 0 0 2.5 2.5H52L37 7z"/><path d="M14.5 7A2.495 2.495 0 0 0 12 9.5v1C12 9.115 13.115 8 14.5 8H37V7z" opacity=".2" fill="#fff"/><path d="M24.199 28A2.149 2.085 0 0 0 22 30.086v19.831a2.149 2.085 0 0 0 3.223 1.805l17.704-9.916a2.149 2.085 0 0 0 0-3.61L25.223 28.28a2.149 2.085 0 0 0-1.024-.28z" opacity=".2"/><path d="M24.199 27A2.149 2.085 0 0 0 22 29.086v19.831a2.149 2.085 0 0 0 3.223 1.805l17.704-9.916a2.149 2.085 0 0 0 0-3.61L25.223 27.28a2.149 2.085 0 0 0-1.024-.28z" fill="#fff"/></svg>
-      <span class="item-text">${dataDirectory}</span>
+      <span class="item-text">${escapeHtml(dataDirectory)}</span>
     </div>
     <div class="song-button-box">
-      <span title="Add All To Queue" class="addFileplaylist" onclick="addFilePlaylist(this);" data-directory="${dataDirectory}">
+      <span title="Add All To Queue" class="addFileplaylist" onclick="addFilePlaylist(this);" data-directory="${escapeHtml(dataDirectory)}">
         <svg xmlns="http://www.w3.org/2000/svg" height="9" width="9" viewBox="0 0 1280 1276"><path d="M6760 12747 c-80 -5 -440 -10 -800 -11 -701 -2 -734 -4 -943 -57 -330 -84 -569 -281 -681 -563 -103 -256 -131 -705 -92 -1466 12 -241 16 -531 16 -1232 l0 -917 -1587 -4 c-1561 -3 -1590 -3 -1703 -24 -342 -62 -530 -149 -692 -322 -158 -167 -235 -377 -244 -666 -43 -1404 -42 -1813 7 -2355 21 -235 91 -400 233 -548 275 -287 730 -389 1591 -353 1225 51 2103 53 2330 7 l60 -12 6 -1489 c6 -1559 6 -1548 49 -1780 100 -535 405 -835 933 -921 88 -14 252 -17 1162 -24 591 -4 1099 -4 1148 1 159 16 312 56 422 112 118 59 259 181 333 290 118 170 195 415 227 722 18 173 21 593 6 860 -26 444 -32 678 -34 1432 l-2 811 54 7 c30 4 781 6 1670 5 1448 -2 1625 -1 1703 14 151 28 294 87 403 168 214 159 335 367 385 666 15 85 29 393 30 627 0 105 4 242 10 305 43 533 49 1047 15 1338 -44 386 -144 644 -325 835 -131 140 -278 220 -493 270 -92 21 -98 21 -1772 24 l-1680 3 3 1608 c2 1148 0 1635 -8 1706 -49 424 -255 701 -625 841 -243 91 -633 124 -1115 92z" transform="matrix(.1 0 0 -.1 0 1276)"/></svg>
       </span>
-      <span data-directory="${dataDirectory}" title="Download Playlist" class="downloadFileplaylist" onclick="downloadFileplaylist(this);">
+      <span data-directory="${escapeHtml(dataDirectory)}" title="Download Playlist" class="downloadFileplaylist" onclick="downloadFileplaylist(this);">
         <svg width="12" height="12" viewBox="0 0 2048 2048" xmlns="http://www.w3.org/2000/svg"><path d="M1803 960q0 53-37 90l-651 652q-39 37-91 37-53 0-90-37l-651-652q-38-36-38-90 0-53 38-91l74-75q39-37 91-37 53 0 90 37l294 294v-704q0-52 38-90t90-38h128q52 0 90 38t38 90v704l294-294q37-37 90-37 52 0 91 37l75 75q37 39 37 91z"/></svg>
       </span>
     </div>
@@ -263,15 +263,13 @@ function loadFileExplorer() {
 }
 
 async function senddir(root) {
-  if (isElectron() && !MSTREAMAPI.currentServer.host) { return; }
-
   // Construct the directory string
   const directoryString = root === true ? '~' : getFileExplorerPath();
   document.getElementById('filelist').innerHTML = getLoadingSvg();
 
   try {
     const response = await MSTREAMAPI.dirparser(directoryString);
-    // document.getElementById('directoryName').innerHTML = response.path;
+    // document.getElementById('directoryName').innerHTML = escapeHtml(response.path);
 
     // const formattedPath = response.path.replaceAll("/", "/<wbr>");
     // document.getElementById('directoryName').innerHTML = formattedPath;
@@ -388,14 +386,46 @@ function boilerplateFailure(err) {
   }
 
   iziToast.error({
-    title: msg,
+    // iziToast renders title as HTML; msg can be a server error string.
+    title: escapeHtml(msg),
     position: 'topCenter',
     timeout: 3500
   });
 }
 
 function onFileClick(el) {
+  // Sonic Path song-capture: an armed picker takes the next SINGLE row
+  // click; bulk actions never come through here, so they queue normally.
+  if (VUEPLAYERCORE.songCapture) {
+    const capture = VUEPLAYERCORE.songCapture;
+    VUEPLAYERCORE.songCapture = null;
+    capture({ filepath: el.getAttribute("data-file_location") });
+    return;
+  }
   VUEPLAYERCORE.addSongWizard(el.getAttribute("data-file_location"), {}, true);
+}
+
+// Metadata for the current DB-search results, keyed by (raw) filepath. The
+// search API returns the full canonical metadata object inline on track hits,
+// so the search-result handlers below enqueue with it directly and skip the
+// per-click /api/v1/db/metadata round-trip that the shared onFileClick/playNow
+// (used by the file browser, which has no inline metadata) still perform.
+// Rebuilt on every search in submitSearchForm().
+let searchResultMetadata = {};
+
+// Search-result variants of onFileClick / playNow: enqueue with the inline
+// metadata when we have it (so addSongWizard skips the lookup), else fall back
+// to a server lookup (lookupMetadata=true) for safety.
+function searchFileClick(el) {
+  const fp = el.getAttribute("data-file_location");
+  const meta = searchResultMetadata[fp];
+  VUEPLAYERCORE.addSongWizard(fp, meta || {}, !meta);
+}
+
+function searchPlayNow(el) {
+  const fp = el.getAttribute("data-file_location");
+  const meta = searchResultMetadata[fp];
+  VUEPLAYERCORE.addSongWizard(fp, meta || {}, !meta, MSTREAMPLAYER.positionCache.val + 1);
 }
 
 async function recursiveAddDir(el) {
@@ -418,7 +448,7 @@ async function onFilePlaylistClick(el) {
     });
     const directoryString = getFileExplorerPath();
   
-    document.getElementById('directoryName').innerHTML = '/' + directoryString.substring(0, directoryString.length - 1);
+    document.getElementById('directoryName').innerHTML = escapeHtml('/' + directoryString.substring(0, directoryString.length - 1));
     document.getElementById('filelist').innerHTML = getLoadingSvg();  
 
     const response = await MSTREAMAPI.loadFileplaylist(directoryString);
@@ -497,8 +527,8 @@ async function init() {
 
     response.playlists.forEach(p => {
       VUEPLAYERCORE.playlists.push(p);
-      document.getElementById('pop-f').innerHTML += `<div class="pop-list-item" onclick="addToPlaylistUI('${p.name}')">&#8226; ${p.name}</div>`;
-      document.getElementById('live-playlist-select').innerHTML += `<option value="${p.name}">${p.name}</option>`;
+      document.getElementById('pop-f').innerHTML += `<div class="pop-list-item" data-playlist="${escapeHtml(p.name)}" onclick="addToPlaylistUI(this.getAttribute('data-playlist'))">&#8226; ${escapeHtml(p.name)}</div>`;
+      document.getElementById('live-playlist-select').innerHTML += `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`;
     });
 
     if (response.supportedAudioFiles) {
@@ -516,20 +546,24 @@ async function init() {
 
     MSTREAMAPI.currentServer.noMkdir = response.noMkdir === true;
 
+    // Discovery capability — consumed by the Discover panel (below) and
+    // the Auto-DJ panel's sonic-similarity section.
+    MSTREAMAPI.currentServer.discovery = response.discovery === true;
+    VUEPLAYERCORE.setDiscoveryAvailable(response.discovery === true);
+    VUEPLAYERCORE.setDiscoveryP2pAvailable(response.discoveryP2p === true);
+    VUEPLAYERCORE.setFederationDiscoveryAvailable(response.federationDiscovery === true);
+    // Sonic Path is a standalone side-nav panel — reveal its nav entry
+    // only when the server has the route (never probed).
+    MSTREAMAPI.currentServer.discoveryPath = response.discoveryPath === true;
+    document.getElementById('nav-sonic-path').classList.toggle('super-hide', response.discoveryPath !== true);
+
     if (response.transcode) {
       MSTREAMPLAYER.transcodeOptions.serverEnabled = true;
       MSTREAMPLAYER.transcodeOptions.defaultCodec = response.transcode.defaultCodec;
       MSTREAMPLAYER.transcodeOptions.defaultBitrate = response.transcode.defaultBitrate;
     }
   }catch (err) {
-    if (isElectron()) {
-      MSTREAMAPI.currentServer.host = '';
-      MSTREAMAPI.currentServer.token = '';
-      localStorage.removeItem('current-server');
-      document.getElementById('filelist').innerHTML = '';
-      openEditModal();
-      return;
-    }
+    console.error('init failed', err);
   }
 
   // load user settings
@@ -635,6 +669,158 @@ function openNewPlaylistModal() {
 
 function openPlaybackModal() {
   myModal.open('#speedModal');
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard Shortcuts modal (Layout > Keyboard Shortcuts). Bindings live in
+// MSTREAMPLAYER.hotkeys (mstream.player.js) so the shared-playlist page picks
+// them up too; this modal is just the editor. One combo maps to one action —
+// assigning a combo that another action holds steals it (the other action
+// goes unbound). percentSeek is the fixed 0-9 digit row: clear/restore only.
+const HOTKEY_MODAL_ROWS = [
+  ['playPause', 'hotkeys.action.playPause'],
+  ['playPauseAlt', 'hotkeys.action.playPauseAlt'],
+  ['seekBack', 'hotkeys.action.seekBack'],
+  ['seekForward', 'hotkeys.action.seekForward'],
+  ['bigSeekBack', 'hotkeys.action.bigSeekBack'],
+  ['bigSeekForward', 'hotkeys.action.bigSeekForward'],
+  ['prevTrack', 'hotkeys.action.prevTrack'],
+  ['nextTrack', 'hotkeys.action.nextTrack'],
+  ['percentSeek', 'hotkeys.action.percentSeek'],
+  ['volumeUp', 'hotkeys.action.volumeUp'],
+  ['volumeDown', 'hotkeys.action.volumeDown'],
+  ['mute', 'hotkeys.action.mute'],
+  ['shuffle', 'hotkeys.action.shuffle'],
+  ['repeat', 'hotkeys.action.repeat'],
+  ['speedUp', 'hotkeys.action.speedUp'],
+  ['speedDown', 'hotkeys.action.speedDown'],
+];
+
+function formatHotkeyCombo(combo) {
+  if (combo === null || combo === undefined) { return t('hotkeys.none'); }
+  if (combo === '0-9') { return '0 – 9'; }
+  const pretty = { ' ': t('hotkeys.space'), 'ArrowLeft': '←', 'ArrowRight': '→', 'ArrowUp': '↑', 'ArrowDown': '↓' };
+  let ctrl = false;
+  let key = combo;
+  if (key.indexOf('ctrl+') === 0) { ctrl = true; key = key.slice(5); }
+  key = pretty[key] !== undefined ? pretty[key] : (key.length === 1 ? key.toUpperCase() : key);
+  return (ctrl ? 'Ctrl + ' : '') + key;
+}
+
+let hotkeyCaptureAction = null;
+let hotkeyCaptureListener = null;
+
+function renderHotkeysModal() {
+  const cfg = MSTREAMPLAYER.hotkeys.getConfig();
+  let rowsHtml = '';
+  HOTKEY_MODAL_ROWS.forEach(([action, labelKey]) => {
+    const combo = cfg.bindings[action];
+    const keycap = hotkeyCaptureAction === action
+      ? `<span class="hotkey-keycap capturing">${t('hotkeys.pressKey')}</span>`
+      : `<span class="hotkey-keycap${combo === null ? ' unbound' : ''}">${escapeHtml(formatHotkeyCombo(combo))}</span>`;
+    const changeLink = action === 'percentSeek' ? '' :
+      `<a class="hotkey-btn" onclick="beginHotkeyCapture('${action}')">${t('hotkeys.change')}</a>`;
+    const clearLink = combo === null
+      ? `<a class="hotkey-btn" onclick="restoreHotkeyDefaultFor('${action}')">${t('hotkeys.restore')}</a>`
+      : `<a class="hotkey-btn" onclick="clearHotkeyBinding('${action}')">${t('hotkeys.clear')}</a>`;
+    rowsHtml += `
+      <div class="hotkey-row">
+        <div class="hotkey-label">${t(labelKey)}</div>
+        ${keycap}
+        ${changeLink}
+        ${clearLink}
+      </div>`;
+  });
+
+  document.getElementById('hotkeys-modal-content').innerHTML = `
+    <div class="switch" style="margin: 12px 0;">
+      <label>
+        <input onchange="tglHotkeysEnabled(this);" type="checkbox" ${cfg.enabled ? 'checked' : ''}>
+        <span class="lever"></span>
+        ${t('hotkeys.enable')}
+      </label>
+    </div>
+    <div class="${cfg.enabled ? '' : 'hotkeys-disabled'}">${rowsHtml}</div>
+    <br>
+    <a class="btn" onclick="restoreHotkeyDefaults()">${t('hotkeys.restoreDefaults')}</a>`;
+}
+
+function cancelHotkeyCapture() {
+  if (hotkeyCaptureListener) {
+    document.removeEventListener('keydown', hotkeyCaptureListener, true);
+    hotkeyCaptureListener = null;
+  }
+  hotkeyCaptureAction = null;
+}
+
+function beginHotkeyCapture(action) {
+  cancelHotkeyCapture();
+  hotkeyCaptureAction = action;
+  renderHotkeysModal();
+  hotkeyCaptureListener = (event) => {
+    // Modal closed mid-capture — disarm without touching bindings
+    if (!document.getElementById('hotkeysModal').classList.contains('hystmodal--active')) {
+      cancelHotkeyCapture();
+      return;
+    }
+    // A modifier alone isn't a combo — keep waiting for the real key
+    if (['Control', 'Shift', 'Alt', 'Meta'].indexOf(event.key) !== -1) { return; }
+    event.preventDefault();
+    event.stopPropagation();
+    const captured = hotkeyCaptureAction;
+    cancelHotkeyCapture();
+    // Escape cancels; alt/meta combos and shifted named keys can never match
+    // in hotkeys.resolve, so refuse to store them
+    const invalid = event.key === 'Escape' || event.altKey || event.metaKey ||
+      (event.key.length > 1 && event.shiftKey);
+    if (invalid) { renderHotkeysModal(); return; }
+    const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+    assignHotkeyBinding(captured, (event.ctrlKey ? 'ctrl+' : '') + key);
+  };
+  document.addEventListener('keydown', hotkeyCaptureListener, true);
+}
+
+function assignHotkeyBinding(action, combo) {
+  const cfg = MSTREAMPLAYER.hotkeys.getConfig();
+  if (combo !== null) {
+    Object.keys(cfg.bindings).forEach((other) => {
+      if (other !== action && other !== 'percentSeek' && cfg.bindings[other] === combo) {
+        cfg.bindings[other] = null;
+      }
+    });
+  }
+  cfg.bindings[action] = combo;
+  MSTREAMPLAYER.hotkeys.saveConfig(cfg);
+  renderHotkeysModal();
+}
+
+function clearHotkeyBinding(action) {
+  assignHotkeyBinding(action, null);
+}
+
+function restoreHotkeyDefaultFor(action) {
+  assignHotkeyBinding(action, MSTREAMPLAYER.hotkeys.defaults[action]);
+}
+
+function restoreHotkeyDefaults() {
+  cancelHotkeyCapture();
+  const cfg = MSTREAMPLAYER.hotkeys.getConfig();
+  cfg.bindings = Object.assign({}, MSTREAMPLAYER.hotkeys.defaults);
+  MSTREAMPLAYER.hotkeys.saveConfig(cfg);
+  renderHotkeysModal();
+}
+
+function tglHotkeysEnabled(el) {
+  const cfg = MSTREAMPLAYER.hotkeys.getConfig();
+  cfg.enabled = el.checked;
+  MSTREAMPLAYER.hotkeys.saveConfig(cfg);
+  renderHotkeysModal();
+}
+
+function openHotkeysModal() {
+  cancelHotkeyCapture();
+  renderHotkeysModal();
+  myModal.open('#hotkeysModal');
 }
 
 function switchUploadTab(tab) {
@@ -1174,8 +1360,11 @@ async function submitTorrent() {
     const res  = await MSTREAMAPI.addTorrent(fd);
     const body = res.data || res;
     iziToast.success({
-      title:   `${body.isDuplicate ? 'Already added: ' : 'Added: '}${body.name}`,
-      message: body.downloadPath,
+      // iziToast renders title/message as HTML — escape the torrent
+      // name (attacker-controlled info.name / magnet dn=) and the
+      // download path (carries the user-supplied directoryName).
+      title:   `${body.isDuplicate ? 'Already added: ' : 'Added: '}${escapeHtml(body.name)}`,
+      message: escapeHtml(body.downloadPath || ''),
       position: 'topCenter',
       timeout: 4000,
     });
@@ -1186,7 +1375,7 @@ async function submitTorrent() {
     if (body.renameWarning) {
       iziToast.warning({
         title:   'Rename failed',
-        message: body.renameWarning,
+        message: escapeHtml(body.renameWarning || ''),
         position: 'topCenter',
         timeout: 6000,
       });
@@ -1200,7 +1389,7 @@ async function submitTorrent() {
   } catch (err) {
     const body = err.response?.data || {};
     iziToast.error({
-      title:   body.message || body.error || err.message || 'Add failed',
+      title:   escapeHtml(body.message || body.error || err.message || 'Add failed'),
       position: 'topCenter',
       timeout: 5000,
     });
@@ -1579,7 +1768,7 @@ async function onAutoDetectMetadata() {
     if (!res || !res.ok) {
       iziToast.warning({
         title: 'Auto-detect: not enough metadata',
-        message: res?.message || 'No reliable metadata could be extracted. Fill in the fields manually.',
+        message: escapeHtml(res?.message || 'No reliable metadata could be extracted. Fill in the fields manually.'),
         position: 'topCenter',
         timeout: 5000
       });
@@ -1600,7 +1789,7 @@ async function onAutoDetectMetadata() {
     if (res.confidence === 'high') {
       iziToast.success({
         title: 'Metadata detected',
-        message: `Method: ${res.method}`,
+        message: `Method: ${escapeHtml(res.method)}`,
         position: 'topCenter', timeout: 2500
       });
       document.getElementById('at_meta_warning').classList.add('super-hide');
@@ -1616,7 +1805,7 @@ async function onAutoDetectMetadata() {
     const body = err.response?.data || {};
     iziToast.error({
       title: 'Auto-detect failed',
-      message: body.message || body.error || err.message || 'Server error',
+      message: escapeHtml(body.message || body.error || err.message || 'Server error'),
       position: 'topCenter', timeout: 4000
     });
   } finally {
@@ -1802,7 +1991,7 @@ async function submitAddTorrentPanel() {
         case 'seeded':
           _clearSeedStatus('at_seed_status');
           iziToast.success({
-            title:   `Already in your library: ${seedRes.name}`,
+            title:   `Already in your library: ${escapeHtml(seedRes.name)}`,
             message: 'No download needed — the files were already here, and your torrent client is now sharing them.',
             position: 'topCenter',
             timeout: 5000,
@@ -1813,7 +2002,7 @@ async function submitAddTorrentPanel() {
         case 'already_in_daemon':
           _clearSeedStatus('at_seed_status');
           iziToast.info({
-            title:   `Already added: ${seedRes.name || ''}`,
+            title:   `Already added: ${escapeHtml(seedRes.name || '')}`,
             message: 'This torrent is already in your torrent client. Nothing to do.',
             position: 'topCenter',
             timeout: 4500,
@@ -1825,7 +2014,7 @@ async function submitAddTorrentPanel() {
           _clearSeedStatus('at_seed_status');
           iziToast.error({
             title:   'Invalid torrent file',
-            message: seedRes.error || 'The file is malformed.',
+            message: escapeHtml(seedRes.error || 'The file is malformed.'),
             position: 'topCenter',
             timeout: 5000,
           });
@@ -1836,9 +2025,38 @@ async function submitAddTorrentPanel() {
           _clearSeedStatus('at_seed_status');
           iziToast.error({
             title:   'Torrent client error',
-            message: seedRes.error || 'Could not reach the torrent client.',
+            message: escapeHtml(seedRes.error || 'Could not reach the torrent client.'),
             position: 'topCenter',
             timeout: 5000,
+          });
+          submitBtn.disabled = false;
+          return;
+
+        case 'match_unmapped':
+          // Every file is on disk in seedRes.vpath, but that library's
+          // daemon path mapping isn't usable — /add would bounce off
+          // the same gate (412/409), so don't fall through to it.
+          _clearSeedStatus('at_seed_status');
+          iziToast.info({
+            title:   'Found, but not seedable yet',
+            message: `All files are already in your "${escapeHtml(seedRes.vpath)}" library, but the torrent client's path mapping for it isn't set up. Ask your admin to run auto-detect on the Torrent admin page, then retry.`,
+            position: 'topCenter',
+            timeout: 8000,
+          });
+          submitBtn.disabled = false;
+          return;
+
+        case 'pad_files_missing':
+          // All real files present, but this hybrid torrent's padding
+          // files aren't on disk and the active client can't seed
+          // without them. Handing off would stall the daemon, so stop
+          // here rather than fall through to /add.
+          _clearSeedStatus('at_seed_status');
+          iziToast.info({
+            title:   'Found, but needs padding files',
+            message: `All files are in your "${escapeHtml(seedRes.vpath)}" library, but this torrent needs its alignment (padding) files, which ${escapeHtml(seedRes.clientType)} can't recreate. It would re-download the boundary pieces. A qBittorrent/Deluge backend handles these automatically.`,
+            position: 'topCenter',
+            timeout: 9000,
           });
           submitBtn.disabled = false;
           return;
@@ -1880,7 +2098,7 @@ async function submitAddTorrentPanel() {
     // self-XSS scenarios matter — e.g. an admin pastes a hostile magnet).
     statusEl.innerHTML = `✓ Added: <b>${escapeHtml(body.name)}</b><br>Files will land at: <code>${escapeHtml(body.downloadPath)}</code>`;
     iziToast.success({
-      title: `${body.isDuplicate ? 'Already added: ' : 'Added: '}${body.name}`,
+      title: `${body.isDuplicate ? 'Already added: ' : 'Added: '}${escapeHtml(body.name)}`,
       position: 'topCenter', timeout: 3500,
     });
     // Non-fatal rename-root warning — separate toast so the success
@@ -1888,7 +2106,7 @@ async function submitAddTorrentPanel() {
     if (body.renameWarning) {
       iziToast.warning({
         title:   'Rename failed',
-        message: body.renameWarning,
+        message: escapeHtml(body.renameWarning || ''),
         position: 'topCenter',
         timeout: 6000,
       });
@@ -1900,7 +2118,7 @@ async function submitAddTorrentPanel() {
     statusEl.textContent = `Add failed: ${errBody.message || errBody.error || err.message || 'unknown error'}`;
     submitBtn.disabled = false;
     iziToast.error({
-      title: errBody.message || errBody.error || err.message || 'Add failed',
+      title: escapeHtml(errBody.message || errBody.error || err.message || 'Add failed'),
       position: 'topCenter', timeout: 5000,
     });
   }
@@ -1991,24 +2209,81 @@ function openMetadataModal(metadata, fp) {
     });
   }
 
-  document.getElementById('meta--title').innerHTML = metadata.title;
-  document.getElementById('meta--album').innerHTML = metadata.album;
-  document.getElementById('meta--artist').innerHTML = metadata.artist;
-  document.getElementById('meta--year').innerHTML = metadata.year;
-  document.getElementById('meta--disk').innerHTML = metadata.disk;
-  document.getElementById('meta--track').innerHTML = metadata.track;
-  document.getElementById('meta--rating').innerHTML = metadata.rating;
-  document.getElementById('meta--rg').innerHTML = metadata['replaygain-track'];
-  document.getElementById('meta--fp').innerHTML = fp;
+  document.getElementById('meta--title').textContent = metadata.title;
+  document.getElementById('meta--album').textContent = metadata.album;
+  document.getElementById('meta--artist').textContent = metadata.artist;
+  document.getElementById('meta--year').textContent = metadata.year;
+  document.getElementById('meta--disk').textContent = metadata.disk;
+  document.getElementById('meta--track').textContent = metadata.track;
+  document.getElementById('meta--rating').textContent = metadata.rating;
+  document.getElementById('meta--rg').textContent = metadata['replaygain-track'];
+  document.getElementById('meta--fp').textContent = fp;
   document.getElementById('meta--fp').href = 'media' + fp;
-  document.getElementById('meta--aa').innerHTML = 'album-art/' + metadata['album-art'];
+  document.getElementById('meta--aa').textContent = 'album-art/' + metadata['album-art'];
   if (metadata['album-art']) {
     document.getElementById('meta--aa').href = `album-art/${metadata['album-art']}`;
   } else {
     document.getElementById('meta--aa').href = '#';
   }
-  
+
+  // Lyrics tag: shown only when the track has lyrics; clicking it swaps
+  // the metadata modal for the lyrics modal (same flow as Change Album Art).
+  const lyricsRow = document.getElementById('meta--lyrics-row');
+  if (lyricsRow) {
+    const hasLyrics = !!(metadata && metadata['has-lyrics']);
+    lyricsRow.style.display = hasLyrics ? '' : 'none';
+    const tag = document.getElementById('meta--lyrics-tag');
+    if (tag) {
+      tag.onclick = hasLyrics
+        ? () => { myModal.close(); setTimeout(() => openLyricsModal(fp, metadata.title), 300); }
+        : null;
+    }
+  }
+
   myModal.open('#metadataModel');
+}
+
+// Fetch + display the stored lyrics for a track (keyed off its filepath)
+// in a modal. Uses the default-mStream lyrics API (GET /api/v1/lyrics).
+// Synced LRC is shown as text (timestamps stripped); plain lyrics as-is.
+function openLyricsModal(fp, title) {
+  const titleEl = document.getElementById('lyrics-modal-title');
+  if (titleEl) { titleEl.textContent = title || t('lyrics.modalTitle'); }
+  const body = document.getElementById('lyrics-modal-body');
+  body.textContent = t('lyrics.loading');
+  myModal.open('#lyricsModal');
+
+  fetch(MSTREAMAPI.currentServer.host + 'api/v1/lyrics?path=' + encodeURIComponent(String(fp).replace(/^\/+/, '')), {
+    headers: { 'x-access-token': MSTREAMAPI.currentServer.token }
+  }).then(r => {
+    if (r.status === 404) { return null; }
+    if (!r.ok) { throw new Error('lyrics fetch failed: ' + r.status); }
+    return r.json();
+  }).then(data => {
+    body.textContent = lyricsToText(data) || t('lyrics.none');
+  }).catch(() => {
+    body.textContent = t('lyrics.error');
+  });
+}
+
+// Collapse the lyrics API response to display text. Prefers synced (LRC,
+// timestamps stripped) over plain. Returns '' when neither is present.
+function lyricsToText(data) {
+  if (!data) { return ''; }
+  const pick = (c) => (c && Array.isArray(c.lyrics)) ? c.lyrics[c.default || 0] : null;
+  const synced = pick(data.syncedLyrics);
+  if (synced && synced.data) {
+    return synced.data.split(/\r?\n/)
+      // Strip only the LEADING timestamp/ID tags ([mm:ss.xx], [ar:…], [ti:…]),
+      // not every bracketed token — so inline lyric brackets like "[Chorus]"
+      // or "don't [stop]" survive in the displayed text.
+      .map(line => line.replace(/^(?:\s*\[[^\]]*\])+/, '').trim())
+      .filter(Boolean)
+      .join('\n');
+  }
+  const plain = pick(data.lyrics);
+  if (plain && plain.data) { return plain.data; }
+  return '';
 }
 
 function openAlbumArtModal(metadata, fp) {
@@ -2069,10 +2344,10 @@ async function searchAlbumArt() {
 
     let html = '';
     res.results.forEach((r, i) => {
-      html += `<div style="cursor:pointer;text-align:center;width:130px;" onclick="selectAlbumArt('${r.url.replace(/'/g, "\\'")}')">
-        <img src="${r.url}" style="width:120px;height:120px;object-fit:cover;border-radius:4px;border:2px solid transparent;"
+      html += `<div style="cursor:pointer;text-align:center;width:130px;" data-url="${escapeHtml(r.url)}" onclick="selectAlbumArt(this.getAttribute('data-url'))">
+        <img src="${escapeHtml(r.url)}" style="width:120px;height:120px;object-fit:cover;border-radius:4px;border:2px solid transparent;"
              onerror="this.parentElement.style.display='none'" loading="lazy">
-        <div style="font-size:11px;color:#aaa;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${r.label}</div>
+        <div style="font-size:11px;color:#aaa;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(r.label)}</div>
       </div>`;
     });
 
@@ -2131,13 +2406,6 @@ async function uploadCustomAlbumArt() {
     }
   };
   reader.readAsDataURL(file);
-}
-
-function openEditModal() {
-  document.getElementById('server_address').value = MSTREAMAPI.currentServer.host;
-  document.getElementById('server_username').value = MSTREAMAPI.currentServer.username;
-  document.getElementById('server_password').value = '';
-  myModal.open('#editServer');
 }
 
 async function addToPlaylistUI(playlist) {
@@ -2353,8 +2621,8 @@ async function getAllPlaylists() {
       const lol = { name: p.name, type: 'playlist' };
       currentBrowsingList.push(lol);
       VUEPLAYERCORE.playlists.push(lol);
-      document.getElementById('pop-f').innerHTML += `<div class="pop-list-item" onclick="addToPlaylistUI('${p.name}')">&#8226; ${p.name}</div>`;
-      document.getElementById('live-playlist-select').innerHTML += `<option value="${p.name}">${p.name}</option>`;
+      document.getElementById('pop-f').innerHTML += `<div class="pop-list-item" data-playlist="${escapeHtml(p.name)}" onclick="addToPlaylistUI(this.getAttribute('data-playlist'))">&#8226; ${escapeHtml(p.name)}</div>`;
+      document.getElementById('live-playlist-select').innerHTML += `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)}</option>`;
     });
     playlists += '</ul>'
 
@@ -2378,7 +2646,7 @@ function deletePlaylist(el) {
     displayMode: 'once',
     id: 'question',
     zindex: 99999,
-    title: `Delete '${playlistname}'?`,
+    title: `Delete '${escapeHtml(playlistname)}'?`,
     position: 'center',
     buttons: [
         ['<button><b>Delete</b></button>', async (instance, toast) => {
@@ -2408,7 +2676,7 @@ function renamePlaylist(el) {
     displayMode: 'once',
     id: 'rename-playlist-question',
     zindex: 99999,
-    title: `Rename '${oldName}'`,
+    title: `Rename '${escapeHtml(oldName)}'`,
     position: 'center',
     inputs: [
       [`<input type="text" class="rename-playlist-input" value="${escapeHtml(oldName)}" maxlength="120">`, 'keyup', (instance, toast, input, e) => {
@@ -2466,7 +2734,7 @@ function renamePlaylist(el) {
 async function onPlaylistClick(el) {
   try {
     const playlistname = decodeURIComponent(el.getAttribute('data-playlistname'));
-    document.getElementById('directoryName').innerHTML = 'Playlist: ' + playlistname;
+    document.getElementById('directoryName').innerHTML = 'Playlist: ' + escapeHtml(playlistname);
     document.getElementById('filelist').innerHTML = getLoadingSvg();
     currentBrowsingList = [];
     programState.push({
@@ -2531,8 +2799,8 @@ async function newPlaylist() {
 
     document.getElementById("newPlaylistForm").reset(); 
     VUEPLAYERCORE.playlists.push({ name: title, type: 'playlist'});
-    document.getElementById('pop-f').innerHTML += `<div class="pop-list-item" onclick="addToPlaylistUI('${title}')">&#8226; ${title}</div>`;
-    document.getElementById('live-playlist-select').innerHTML += `<option value="${title}">${title}</option>`;
+    document.getElementById('pop-f').innerHTML += `<div class="pop-list-item" data-playlist="${escapeHtml(title)}" onclick="addToPlaylistUI(this.getAttribute('data-playlist'))">&#8226; ${escapeHtml(title)}</div>`;
+    document.getElementById('live-playlist-select').innerHTML += `<option value="${escapeHtml(title)}">${escapeHtml(title)}</option>`;
   
     if (programState[0].state === 'allPlaylists') {
       getAllPlaylists();
@@ -2651,8 +2919,8 @@ async function savePlaylist() {
     }
 
     VUEPLAYERCORE.playlists.push({ name: title, type: 'playlist'});
-    document.getElementById('pop-f').innerHTML += `<div class="pop-list-item" onclick="addToPlaylistUI('${title}')">&#8226; ${title}</div>`;
-    document.getElementById('live-playlist-select').innerHTML += `<option value="${title}">${title}</option>`;
+    document.getElementById('pop-f').innerHTML += `<div class="pop-list-item" data-playlist="${escapeHtml(title)}" onclick="addToPlaylistUI(this.getAttribute('data-playlist'))">&#8226; ${escapeHtml(title)}</div>`;
+    document.getElementById('live-playlist-select').innerHTML += `<option value="${escapeHtml(title)}">${escapeHtml(title)}</option>`;
   }catch(err) {
     boilerplateFailure(err);
   } finally {
@@ -2704,7 +2972,7 @@ function getArtistz(el) {
 
 async function getArtistsAlbums(artist) {
   setBrowserRootPanel(t('panel.albums'));
-  document.getElementById('directoryName').innerHTML = t('label.artist') + ' ' + artist;
+  document.getElementById('directoryName').innerHTML = t('label.artist') + ' ' + escapeHtml(artist);
   document.getElementById('filelist').innerHTML = getLoadingSvg();
 
   try {
@@ -2744,8 +3012,8 @@ async function getAllGenres() {
     let html = '<ul class="collection">';
     response.genres.forEach(value => {
       html += `<li class="collection-item">
-        <div data-genre="${value.name.replace(/"/g, '&quot;')}" class="artistz" onclick="getGenreSongsList(this)">
-          ${value.name} <span style="color:#888;font-size:13px;">(${value.track_count})</span>
+        <div data-genre="${escapeHtml(value.name)}" class="artistz" onclick="getGenreSongsList(this)">
+          ${escapeHtml(value.name)} <span style="color:#888;font-size:13px;">(${value.track_count})</span>
         </div>
       </li>`;
       currentBrowsingList.push({ type: 'genre', name: value.name });
@@ -2771,7 +3039,7 @@ function getGenreSongsList(el) {
 
 async function getGenreSongs(genre) {
   setBrowserRootPanel(t('panel.songs'));
-  document.getElementById('directoryName').innerHTML = t('label.genre') + ' ' + genre;
+  document.getElementById('directoryName').innerHTML = t('label.genre') + ' ' + escapeHtml(genre);
   document.getElementById('filelist').innerHTML = getLoadingSvg();
 
   try {
@@ -2839,7 +3107,7 @@ function getAlbumsOnClick(el) {
 }
 
 async function getAlbumSongs(album, artist, year) {
-  document.getElementById('directoryName').innerHTML = 'Album: ' + album;
+  document.getElementById('directoryName').innerHTML = 'Album: ' + escapeHtml(album);
 
   programState.push({
     state: 'album',
@@ -2908,10 +3176,10 @@ async function getRatedSongs() {
       });
 
       files += createMusicFileHtml(value.filepath,
-        value.metadata.title ? value.metadata.title : value.filepath.split('/').pop(), 
-        value.metadata['album-art'] ? `src="${MSTREAMAPI.currentServer.host}album-art/${value.metadata['album-art']}?compress=s&token=${MSTREAMAPI.currentServer.token}"` : `src="assets/img/default.png"`, 
+        value.metadata.title ? value.metadata.title : value.filepath.split('/').pop(),
+        value.metadata['album-art'] ? `src="${MSTREAMAPI.currentServer.host}album-art/${escapeHtml(value.metadata['album-art'])}?compress=s&token=${MSTREAMAPI.currentServer.token}"` : `src="assets/img/default.png"`,
         rating,
-        value.metadata.artist ? `<span style="font-size:15px;">${value.metadata.artist}</span>` : '');
+        value.metadata.artist ? value.metadata.artist : '');
     });
 
     document.getElementById('filelist').innerHTML = `<ul class="collection">${files}</ul>`;
@@ -2953,13 +3221,13 @@ async function redoRecentlyPlayed() {
 
       filelist += createMusicFileHtml(el.filepath,
         el.metadata.title ? `${el.metadata.title}`: el.filepath.split("/").pop(),
-        el.metadata['album-art'] ? `src="${MSTREAMAPI.currentServer.host}album-art/${el.metadata['album-art']}?compress=s&token=${MSTREAMAPI.currentServer.token}"` : `src="assets/img/default.png"`, 
+        el.metadata['album-art'] ? `src="${MSTREAMAPI.currentServer.host}album-art/${escapeHtml(el.metadata['album-art'])}?compress=s&token=${MSTREAMAPI.currentServer.token}"` : `src="assets/img/default.png"`,
         undefined,
-        el.metadata.artist ? `<span style="font-size:15px;">${el.metadata.artist}</span>` : '');
+        el.metadata.artist ? el.metadata.artist : '');
     });
 
     filelist += '</ul>'
-  
+
     document.getElementById('filelist').innerHTML = filelist;
 
     App.setFocusableElements();
@@ -3005,9 +3273,9 @@ async function redoMostPlayed() {
 
       filelist += createMusicFileHtml(el.filepath,
         el.metadata.title ? `${el.metadata.title}`: el.filepath.split("/").pop(),
-        el.metadata['album-art'] ? `src="${MSTREAMAPI.currentServer.host}album-art/${el.metadata['album-art']}?compress=s&token=${MSTREAMAPI.currentServer.token}"` : `src="assets/img/default.png"`, 
+        el.metadata['album-art'] ? `src="${MSTREAMAPI.currentServer.host}album-art/${escapeHtml(el.metadata['album-art'])}?compress=s&token=${MSTREAMAPI.currentServer.token}"` : `src="assets/img/default.png"`,
         undefined,
-        el.metadata.artist ? `<span style="font-size:15px;">${el.metadata.artist} [${el.metadata['play-count']} plays]</span>` : `<span style="font-size:15px;">[${el.metadata['play-count']} plays]</span>`);
+        el.metadata.artist ? `${el.metadata.artist} [${el.metadata['play-count']} plays]` : `[${el.metadata['play-count']} plays]`);
     });
 
     filelist += '</ul>'
@@ -3057,9 +3325,9 @@ async function redoRecentlyAdded() {
 
       filelist += createMusicFileHtml(el.filepath,
         el.metadata.title ? `${el.metadata.title}`: el.filepath.split("/").pop(),
-        el.metadata['album-art'] ? `src="${MSTREAMAPI.currentServer.host}album-art/${el.metadata['album-art']}?compress=s&token=${MSTREAMAPI.currentServer.token}"` : `src="assets/img/default.png"`, 
+        el.metadata['album-art'] ? `src="${MSTREAMAPI.currentServer.host}album-art/${escapeHtml(el.metadata['album-art'])}?compress=s&token=${MSTREAMAPI.currentServer.token}"` : `src="assets/img/default.png"`,
         undefined,
-        el.metadata.artist ? `<span style="font-size:15px;">${el.metadata.artist}</span>` : '');
+        el.metadata.artist ? el.metadata.artist : '');
     });
 
     filelist += '</ul>'
@@ -3480,6 +3748,328 @@ function _syncVpathsToLegacy() {
 // Start/Stop fires repeated renders that overlap during the async
 // fetches at the top of the function — explicit abort closes that
 // window without leaning on the GC.
+// ── Sonic Path panel ────────────────────────────────────────────────────
+//
+// A standalone view (side-nav, like Auto DJ) over POST
+// /api/v1/discovery/local/path: pick a START and an END song, choose a
+// length, and the server fills the journey between them. Song pickers use
+// a CAPTURE flow — "pick from library" arms VUEPLAYERCORE.songCapture and
+// drops the user into the file explorer with a banner; the next song they
+// click anywhere (explorer, search, albums) lands in the field instead of
+// the queue. "Use playing song" grabs the current track directly.
+//
+// UX mirrors the mobile app's path screen: preview first — seed rows
+// accented, every row wearing the match meter vs its own waypoint — then
+// Play (replaces the queue) or + Queue all.
+
+const SONICPATH = {
+  view: 'setup',    // 'setup' (pick songs + length) | 'results' (journey)
+  start: null,      // { rawFilePath, title, artist, art }
+  end: null,
+  length: 14,       // server clamps 4..32
+  rows: [],         // last built journey (seeds included)
+  loading: false,
+  notAnalyzedStart: false,
+  notAnalyzedEnd: false,
+  fetched: false,   // a build has completed (drives the empty-state hint)
+};
+
+// The body of a Start/End card. Empty → "Not set" + the two choose
+// buttons; chosen → album art (or a placeholder tile), title/artist, and a
+// clear ✕ that reverts the card — the choose buttons disappear so a filled
+// card reads as a settled decision.
+function sonicPathSongCard(side) {
+  const s = SONICPATH[side];
+  if (!s) {
+    return `
+      <div class="spath-song"><span class="spath-notset">${t('sonicPath.notSet')}</span></div>
+      <div class="spath-field-buttons">
+        <button type="button" class="spath-btn" data-spath-playing="${side}">${t('sonicPath.usePlaying')}</button>
+        <button type="button" class="spath-btn" data-spath-pick="${side}">${t('sonicPath.pickSong')}</button>
+      </div>`;
+  }
+  const art = s.art
+    ? `<img class="spath-art" loading="lazy" src="${MSTREAMAPI.currentServer.host}album-art/${encodeURIComponent(s.art)}?compress=s&token=${MSTREAMAPI.currentServer.token}">`
+    : `<div class="spath-art spath-art-placeholder"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="#777"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg></div>`;
+  return `
+    <div class="spath-chosen">
+      ${art}
+      <div class="spath-chosen-info">
+        <span class="spath-song-title">${escapeHtml(s.title)}</span>
+        ${s.artist ? `<span class="spath-song-artist">${escapeHtml(s.artist)}</span>` : ''}
+      </div>
+      <span class="spath-clear pointer" data-spath-clear="${side}" title="${t('sonicPath.clear')}">&#10005;</span>
+    </div>`;
+}
+
+function sonicPathBanner(side) {
+  let el = document.getElementById('spath-banner');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'spath-banner';
+    document.body.appendChild(el);
+  }
+  el.innerHTML = `
+    <span>${t(side === 'start' ? 'sonicPath.pickBannerStart' : 'sonicPath.pickBannerEnd')}</span>
+    <span class="spath-banner-cancel pointer">${t('sonicPath.cancelPick')}</span>`;
+  el.querySelector('.spath-banner-cancel').addEventListener('click', () => {
+    VUEPLAYERCORE.songCapture = null;
+    sonicPathHideBanner();
+    changeView(sonicPathPanel, document.getElementById('nav-sonic-path'));
+  });
+}
+
+function sonicPathHideBanner() {
+  document.getElementById('spath-banner')?.remove();
+}
+
+function sonicPathPick(side) {
+  VUEPLAYERCORE.songCapture = async (song) => {
+    sonicPathHideBanner();
+    // Row clicks carry no inline metadata (the file browser passes none) —
+    // resolve the real title/artist so the field doesn't read as a
+    // filename. Lookup failure falls back to the filename.
+    let meta = song.metadata || {};
+    if (!meta.title) {
+      try {
+        const response = await MSTREAMAPI.lookupMetadata(song.filepath);
+        if (response && response.metadata) { meta = response.metadata; }
+      } catch (_err) { /* filename fallback below */ }
+    }
+    SONICPATH[side] = {
+      rawFilePath: song.filepath,
+      title: meta.title || song.filepath.split('/').pop(),
+      artist: meta.artist || '',
+      art: meta['album-art'] || null,
+    };
+    changeView(sonicPathPanel, document.getElementById('nav-sonic-path'));
+  };
+  sonicPathBanner(side);
+  // Drop the user somewhere clickable; the capture works from ANY view
+  // (search, albums…) — the explorer is just a sane starting point.
+  changeView(loadFileExplorer, document.querySelector('.side-nav-item'));
+}
+
+async function sonicPathUsePlaying(side) {
+  const song = MSTREAMPLAYER.getCurrentSong();
+  if (!song || !song.rawFilePath) {
+    iziToast.warning({ title: t('sonicPath.nothingPlaying'), position: 'topCenter', timeout: 2500 });
+    return;
+  }
+  if (song.federation) {
+    // Peer-namespace paths can't seed the local index.
+    iziToast.warning({ title: t('sonicPath.federatedTrack'), position: 'topCenter', timeout: 3000 });
+    return;
+  }
+  // A just-queued track's async metadata lookup may not have landed yet
+  // (addSongWizard fills it in the background) — resolve it here the same
+  // way the picker does, so the card never shows a bare filename.
+  let meta = song.metadata || {};
+  if (!meta.title) {
+    try {
+      const response = await MSTREAMAPI.lookupMetadata(song.rawFilePath);
+      if (response && response.metadata) { meta = response.metadata; }
+    } catch (_err) { /* filename fallback below */ }
+  }
+  SONICPATH[side] = {
+    rawFilePath: song.rawFilePath,
+    title: meta.title || song.rawFilePath.split('/').pop(),
+    artist: meta.artist || '',
+    art: meta['album-art'] || null,
+  };
+  sonicPathPanel();
+}
+
+async function sonicPathBuild() {
+  if (!SONICPATH.start || !SONICPATH.end || SONICPATH.loading) { return; }
+  SONICPATH.view = 'results';
+  SONICPATH.loading = true;
+  SONICPATH.rows = [];
+  SONICPATH.notAnalyzedStart = false;
+  SONICPATH.notAnalyzedEnd = false;
+  sonicPathPanel();
+
+  const strip = (v) => (v.charAt(0) === '/' ? v.substr(1) : v);
+  const res = await MSTREAMAPI.discoveryPath(
+    strip(SONICPATH.start.rawFilePath), strip(SONICPATH.end.rawFilePath), SONICPATH.length);
+
+  SONICPATH.loading = false;
+  SONICPATH.fetched = true;
+  if (res && res.disabled) {
+    // 403 — the flag was stale; retract the whole panel for the session.
+    document.getElementById('nav-sonic-path').classList.add('super-hide');
+    iziToast.error({ title: t('sonicPath.disabled'), position: 'topCenter', timeout: 3500 });
+    return;
+  }
+  if (!res) {
+    iziToast.error({ title: t('sonicPath.failed'), position: 'topCenter', timeout: 3000 });
+    sonicPathPanel();
+    return;
+  }
+  SONICPATH.notAnalyzedStart = !!(res.notAnalyzed && res.notAnalyzed.start);
+  SONICPATH.notAnalyzedEnd = !!(res.notAnalyzed && res.notAnalyzed.end);
+  SONICPATH.rows = res.results || [];
+  sonicPathPanel();
+}
+
+function sonicPathPlay(replaceQueue) {
+  if (!SONICPATH.rows.length) { return; }
+  if (replaceQueue) { MSTREAMPLAYER.clearPlaylist(); }
+  for (const row of SONICPATH.rows) {
+    VUEPLAYERCORE.addSongWizard(row.filepath, row.metadata || {}, false, undefined, false, true);
+  }
+}
+
+async function sonicPathSavePlaylist() {
+  const title = document.getElementById('spath_playlist_name').value;
+  if (!title || !SONICPATH.rows.length) { return; }
+  try {
+    await MSTREAMAPI.savePlaylist(title, SONICPATH.rows.map((row) => row.filepath));
+    myModal.close();
+    iziToast.success({ title: t('sonicPath.playlistSaved'), message: title, position: 'topCenter', timeout: 2500 });
+  } catch (_err) {
+    iziToast.error({ title: t('sonicPath.playlistSaveFailed'), position: 'topCenter', timeout: 3000 });
+  }
+}
+
+// "Start over" — the panel's escape hatch back to a pristine setup view:
+// fields cleared, length back to default, results dropped.
+function sonicPathStartOver() {
+  SONICPATH.view = 'setup';
+  SONICPATH.start = null;
+  SONICPATH.end = null;
+  SONICPATH.length = 14;
+  SONICPATH.rows = [];
+  SONICPATH.loading = false;
+  SONICPATH.notAnalyzedStart = false;
+  SONICPATH.notAnalyzedEnd = false;
+  SONICPATH.fetched = false;
+  sonicPathPanel();
+}
+
+function sonicPathPanel() {
+  setBrowserRootPanel(t('sonicPath.title'), false);
+  sonicPathHideBanner();
+
+  const tags = (row) => {
+    if (!row.genreTags || !row.genreTags.length) { return ''; }
+    const label = row.genreTags.slice(0, 2).map((x) => x.split('---').pop()).join(' · ');
+    return ` &middot; ${escapeHtml(label)}`;
+  };
+
+  const lengthRow = (withRegen) => `
+    <div class="spath-length-row">
+      <span class="autodj-opt-label">${t('sonicPath.length')}</span>
+      <input type="range" id="spath-length" min="4" max="32" step="1" value="${SONICPATH.length}">
+      <span class="spath-length-value" id="spath-length-value">${SONICPATH.length}</span>
+      ${withRegen ? `<button type="button" class="spath-btn" id="spath-regen" ${SONICPATH.loading ? 'disabled' : ''}>${t('sonicPath.regenerate')}</button>` : ''}
+    </div>`;
+
+  let html;
+  if (SONICPATH.view === 'setup') {
+    // ── Stage 1: pick the songs and a length ──
+    const field = (side, labelKey) => `
+      <div class="spath-field">
+        <div class="autodj-opt-label">${t(labelKey)}</div>
+        ${sonicPathSongCard(side)}
+      </div>`;
+    html = `
+      <div class="spath-panel">
+        <div class="spath-hint">${t('sonicPath.hint')}</div>
+        <div class="spath-fields">
+          ${field('start', 'sonicPath.startSong')}
+          <div class="spath-arrow">&#8595;</div>
+          ${field('end', 'sonicPath.endSong')}
+        </div>
+        ${lengthRow(false)}
+        <button type="button" class="spath-btn spath-btn-primary spath-build" id="spath-build"
+                ${SONICPATH.start && SONICPATH.end ? '' : 'disabled'}>${t('sonicPath.build')}</button>
+      </div>`;
+  } else {
+    // ── Stage 2: the journey — setup cleared away, list + actions in its
+    // place. The length slider stays so tweak → Regenerate is a tight
+    // loop; Start over is the way back to stage 1.
+    let results = '';
+    if (SONICPATH.loading) {
+      results = `<div class="discover-hint">${t('sonicPath.loading')}</div>`;
+    } else if (SONICPATH.notAnalyzedStart) {
+      results = `<div class="discover-hint">${t('sonicPath.startNotAnalyzed')}</div>`;
+    } else if (SONICPATH.notAnalyzedEnd) {
+      results = `<div class="discover-hint">${t('sonicPath.endNotAnalyzed')}</div>`;
+    } else if (SONICPATH.rows.length) {
+      const last = SONICPATH.rows.length - 1;
+      results = `
+        <div class="discover-rows spath-rows">
+          ${SONICPATH.rows.map((row, i) => `
+            <div class="discover-row pointer${i === 0 || i === last ? ' discover-path-seed' : ''}"
+                 data-spath-row="${i}" title="${Math.round(row.similarity * 100)}% on-path — add to queue">
+              ${row.metadata && row.metadata['album-art']
+                ? `<img class="spath-row-art" loading="lazy" src="${MSTREAMAPI.currentServer.host}album-art/${encodeURIComponent(row.metadata['album-art'])}?compress=s&token=${MSTREAMAPI.currentServer.token}">`
+                : `<div class="spath-row-art spath-art-placeholder"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="#777"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg></div>`}
+              <div class="discover-row-info">
+                <div class="discover-row-title">${escapeHtml((row.metadata && row.metadata.title) || row.filepath.split('/').pop())}</div>
+                <div class="discover-row-sub">${escapeHtml((row.metadata && row.metadata.artist) || '')}${tags(row)}</div>
+              </div>
+              <div class="discover-add"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"><path fill="currentColor" d="M13 11h8v2h-8v8h-2v-8H3v-2h8V3h2v8z"/></svg></div>
+            </div>`).join('')}
+        </div>`;
+    } else if (SONICPATH.fetched) {
+      results = `<div class="discover-hint">${t('sonicPath.none')}</div>`;
+    }
+
+    const hasRows = !SONICPATH.loading && SONICPATH.rows.length > 0;
+    html = `
+      <div class="spath-panel">
+        <div class="spath-context">${escapeHtml(SONICPATH.start?.title || '')} <span class="spath-arrow-inline">&#8594;</span> ${escapeHtml(SONICPATH.end?.title || '')}</div>
+        <div class="spath-actions">
+          ${hasRows ? `
+            <button type="button" class="spath-btn spath-btn-primary" id="spath-play">${t('sonicPath.play')}</button>
+            <button type="button" class="spath-btn" id="spath-queue">${t('discover.queueAll')}</button>
+            <button type="button" class="spath-btn" id="spath-save">${t('sonicPath.saveAsPlaylist')}</button>` : ''}
+          <button type="button" class="spath-btn spath-startover" id="spath-startover">${t('sonicPath.startOver')}</button>
+        </div>
+        ${lengthRow(true)}
+        ${results}
+      </div>`;
+  }
+
+  const root = document.getElementById('filelist');
+  root.innerHTML = html;
+
+  root.querySelectorAll('[data-spath-pick]').forEach((el) => {
+    el.addEventListener('click', () => sonicPathPick(el.getAttribute('data-spath-pick')));
+  });
+  root.querySelectorAll('[data-spath-playing]').forEach((el) => {
+    el.addEventListener('click', () => sonicPathUsePlaying(el.getAttribute('data-spath-playing')));
+  });
+  root.querySelectorAll('[data-spath-clear]').forEach((el) => {
+    el.addEventListener('click', () => {
+      SONICPATH[el.getAttribute('data-spath-clear')] = null;
+      sonicPathPanel();
+    });
+  });
+  const lengthEl = document.getElementById('spath-length');
+  lengthEl.addEventListener('input', () => {
+    SONICPATH.length = Number(lengthEl.value);
+    document.getElementById('spath-length-value').textContent = lengthEl.value;
+  });
+  document.getElementById('spath-build')?.addEventListener('click', sonicPathBuild);
+  document.getElementById('spath-regen')?.addEventListener('click', sonicPathBuild);
+  document.getElementById('spath-startover')?.addEventListener('click', sonicPathStartOver);
+  document.getElementById('spath-play')?.addEventListener('click', () => sonicPathPlay(true));
+  document.getElementById('spath-queue')?.addEventListener('click', () => sonicPathPlay(false));
+  document.getElementById('spath-save')?.addEventListener('click', () => {
+    document.getElementById('spath_playlist_name').value = '';
+    myModal.open('#spathSaveModal');
+  });
+  root.querySelectorAll('[data-spath-row]').forEach((el) => {
+    el.addEventListener('click', () => {
+      const row = SONICPATH.rows[Number(el.getAttribute('data-spath-row'))];
+      if (row) { VUEPLAYERCORE.addSongWizard(row.filepath, row.metadata || {}, false, undefined, false, true); }
+    });
+  });
+}
+
 let _autoDjPanelAbortController = null;
 
 async function autoDjPanel() {
@@ -3696,6 +4286,83 @@ async function autoDjPanel() {
       </div>
     </div>`;
 
+  // ── Sonic similarity (discovery embeddings) ─────────────────────
+  //
+  // Server capability comes from the ping response (same flag that
+  // gates the Discover panel). When absent the section renders
+  // disabled with an explanatory hint — same treatment as the
+  // similar-artists row without a Last.fm key.
+  //
+  // The slider stores the RAW cosine threshold (0.30–0.90); the hint
+  // translates it to a perceptual word + percentage so users don't
+  // need to know what cosine similarity is.
+  const discoveryAvailable = MSTREAMAPI.currentServer.discovery === true;
+  const sonicOn = AUTODJ.state.sonicEnabled && discoveryAvailable;
+  const sonicSeed = AUTODJ.getSonicSeed();
+  const anchorMode = AUTODJ.state.sonicAnchorMode;
+  function _sonicSimHint(cos) {
+    const pct = Math.round(cos * 100);
+    let word = t('autoDJ.sonicSimLockedIn');
+    if (cos < 0.45)      { word = t('autoDJ.sonicSimAdventurous'); }
+    else if (cos < 0.6)  { word = t('autoDJ.sonicSimBalanced'); }
+    else if (cos < 0.75) { word = t('autoDJ.sonicSimFocused'); }
+    return t('autoDJ.sonicSimValue', { word, pct });
+  }
+  const sonicSeedChip = sonicSeed ? `
+    <span class="dj-filter-tag" role="listitem">
+      ${escapeHtml(sonicSeed.title)}<button type="button" class="dj-filter-tag-rm" id="dj-sonic-seed-rm" aria-label="${escapeHtml(t('autoDJ.sonicSeedRemove'))}">×</button>
+    </span>` : `<span class="autodj-opt-hint">${t('autoDJ.sonicSeedNone')}</span>`;
+  const sonicBlock = `
+    <h4 class="autodj-section-heading">${t('autoDJ.sectionSonic')}</h4>
+    <div class="autodj-opt-row${discoveryAvailable ? '' : ' autodj-opt-disabled'}">
+      <div>
+        <div class="autodj-opt-label" id="dj-sonic-label">${t('autoDJ.sonicLabel')}</div>
+        <div class="autodj-opt-hint">${discoveryAvailable ? t('autoDJ.sonicHint') : '<em>' + t('autoDJ.sonicHintNoDiscovery') + '</em>'}</div>
+      </div>
+      <label class="toggle-sw">
+        <input type="checkbox" id="dj-sonic-on" aria-labelledby="dj-sonic-label" ${sonicOn ? 'checked' : ''} ${discoveryAvailable ? '' : 'disabled'}>
+        <span class="toggle-sw-track"><span class="toggle-sw-thumb"></span></span>
+      </label>
+    </div>
+    <div id="dj-sonic-opts" style="${sonicOn ? '' : 'display:none'}">
+      <div class="autodj-opt-row">
+        <div>
+          <div class="autodj-opt-label" id="dj-sonic-sim-label">${t('autoDJ.sonicSimilarityLabel')}</div>
+          <div class="autodj-opt-hint" id="dj-sonic-sim-val">${_sonicSimHint(AUTODJ.state.sonicMinSimilarity)}</div>
+        </div>
+        <input type="range" id="dj-sonic-sim" class="autodj-slider" min="30" max="90" step="1" value="${Math.round(AUTODJ.state.sonicMinSimilarity * 100)}" aria-labelledby="dj-sonic-sim-label" aria-valuemin="30" aria-valuemax="90" aria-valuenow="${Math.round(AUTODJ.state.sonicMinSimilarity * 100)}">
+      </div>
+      <div class="autodj-opt-row">
+        <div>
+          <div class="autodj-opt-label">${t('autoDJ.sonicAnchorLabel')}</div>
+          <div class="autodj-opt-hint" id="dj-sonic-anchor-hint">${t(anchorMode === 'locked' ? 'autoDJ.sonicAnchorLockedHint' : 'autoDJ.sonicAnchorRollingHint')}</div>
+        </div>
+        <div class="dj-genre-mode" role="radiogroup" aria-label="${escapeHtml(t('autoDJ.sonicAnchorLabel'))}">
+          <button type="button" class="dj-genre-mode-btn dj-sonic-anchor-btn" data-anchor="rolling" aria-pressed="${anchorMode === 'rolling'}">${t('autoDJ.sonicAnchorRolling')}</button>
+          <button type="button" class="dj-genre-mode-btn dj-sonic-anchor-btn" data-anchor="locked" aria-pressed="${anchorMode === 'locked'}">${t('autoDJ.sonicAnchorLocked')}</button>
+        </div>
+      </div>
+      <div class="autodj-opt-row autodj-opt-col">
+        <div>
+          <div class="autodj-opt-label">${t('autoDJ.sonicSeedLabel')}</div>
+          <div class="autodj-opt-hint">${t('autoDJ.sonicSeedHint')}</div>
+        </div>
+        <div class="dj-filter-tags" id="dj-sonic-seed-tag" role="list" aria-label="${escapeHtml(t('autoDJ.sonicSeedLabel'))}">${sonicSeedChip}</div>
+        <div class="dj-genre-combo">
+          <input
+            type="text"
+            class="dj-filter-input"
+            id="dj-sonic-seed-input"
+            placeholder="${escapeHtml(t('autoDJ.sonicSeedPlaceholder'))}"
+            autocomplete="off"
+            aria-autocomplete="list"
+            aria-controls="dj-sonic-seed-suggest"
+            aria-label="${escapeHtml(t('autoDJ.sonicSeedLabel'))}">
+          <div class="dj-genre-suggest" id="dj-sonic-seed-suggest" role="listbox" hidden></div>
+        </div>
+      </div>
+    </div>`;
+
   const html = `
     <div class="pad-6 autodj-root">
       <div class="autodj-hero">
@@ -3725,6 +4392,8 @@ async function autoDjPanel() {
         ${bpmContinuityRow}
         ${bpmToleranceRow}
         ${harmonicRow}
+
+        ${sonicBlock}
 
         <h4 class="autodj-section-heading">${t('autoDJ.sectionFilters')}</h4>
         ${keywordFilterRow}
@@ -3825,6 +4494,116 @@ async function autoDjPanel() {
     AUTODJ.setState({ harmonicMixing: on });
     if (!on) { AUTODJ.clearCamelotAnchor(); }
   };
+
+  // ── Sonic similarity ───────────────────────────────────────────
+  //
+  // Toggle shows/hides the sub-options and clears the per-session
+  // anchors on OFF (same semantics as BPM/harmonic: re-enabling
+  // should re-anchor on whatever's playing then). The explicit seed
+  // survives the toggle.
+  const sonicOnEl = document.getElementById('dj-sonic-on');
+  if (sonicOnEl && !sonicOnEl.disabled) {
+    sonicOnEl.onchange = (e) => {
+      const on = !!e.target.checked;
+      AUTODJ.setState({ sonicEnabled: on });
+      if (!on) { AUTODJ.clearSonicAnchors(); }
+      document.getElementById('dj-sonic-opts').style.display = on ? '' : 'none';
+    };
+  }
+
+  // Similarity slider — stores the raw cosine; hint shows the
+  // perceptual word + percentage.
+  const sonicSimEl = document.getElementById('dj-sonic-sim');
+  if (sonicSimEl) {
+    sonicSimEl.oninput = (e) => {
+      const val = Math.max(30, Math.min(90, parseInt(e.target.value, 10))) / 100;
+      AUTODJ.setState({ sonicMinSimilarity: val });
+      document.getElementById('dj-sonic-sim-val').textContent = _sonicSimHint(val);
+      e.target.setAttribute('aria-valuenow', String(Math.round(val * 100)));
+    };
+  }
+
+  // Anchor mode segmented control. Switching modes drops the pinned
+  // locked-anchor so 'locked' re-pins fresh on the next pick.
+  document.querySelectorAll('.dj-sonic-anchor-btn').forEach((btn) => {
+    btn.onclick = () => {
+      const mode = btn.dataset.anchor;
+      AUTODJ.setState({ sonicAnchorMode: mode, sonicLockedAnchor: null });
+      document.querySelectorAll('.dj-sonic-anchor-btn').forEach((b) => {
+        b.setAttribute('aria-pressed', b.dataset.anchor === mode ? 'true' : 'false');
+      });
+      document.getElementById('dj-sonic-anchor-hint').textContent =
+        t(mode === 'locked' ? 'autoDJ.sonicAnchorLockedHint' : 'autoDJ.sonicAnchorRollingHint');
+    };
+  });
+
+  // Seed picker — title search against /api/v1/db/search (titles
+  // only), debounced; picking a result stores the seed and, if
+  // Auto-DJ is already running against an empty queue (the "enabled
+  // sonic on an empty queue" flow), kicks the stalled session into
+  // its first pick.
+  const sonicSeedTagEl = document.getElementById('dj-sonic-seed-tag');
+  const sonicSeedInpEl = document.getElementById('dj-sonic-seed-input');
+  const sonicSeedSugEl = document.getElementById('dj-sonic-seed-suggest');
+  function _renderSonicSeedChip() {
+    const seed = AUTODJ.getSonicSeed();
+    sonicSeedTagEl.innerHTML = seed ? `
+      <span class="dj-filter-tag" role="listitem">
+        ${escapeHtml(seed.title)}<button type="button" class="dj-filter-tag-rm" id="dj-sonic-seed-rm" aria-label="${escapeHtml(t('autoDJ.sonicSeedRemove'))}">×</button>
+      </span>` : `<span class="autodj-opt-hint">${t('autoDJ.sonicSeedNone')}</span>`;
+  }
+  // Chip remove — delegated so the re-rendered chip stays wired.
+  if (sonicSeedTagEl) {
+    sonicSeedTagEl.addEventListener('click', (e) => {
+      if (e.target.closest('#dj-sonic-seed-rm')) {
+        AUTODJ.clearSonicSeed();
+        _renderSonicSeedChip();
+      }
+    }, { signal: _autoDjPanelSignal });
+  }
+  let _sonicSeedDebounce = null;
+  if (sonicSeedInpEl) {
+    sonicSeedInpEl.addEventListener('input', () => {
+      clearTimeout(_sonicSeedDebounce);
+      const q = sonicSeedInpEl.value.trim();
+      if (q.length < 2) { sonicSeedSugEl.hidden = true; return; }
+      _sonicSeedDebounce = setTimeout(async () => {
+        let hits = [];
+        try {
+          const res = await MSTREAMAPI.search({
+            search: q, noArtists: true, noAlbums: true, noFiles: true, noLyrics: true,
+          });
+          hits = (res.title || []).slice(0, 8);
+        } catch (err) {
+          console.error('sonic seed search failed', err);
+        }
+        if (hits.length === 0) { sonicSeedSugEl.hidden = true; return; }
+        sonicSeedSugEl.innerHTML = hits.map(h => `
+          <div class="dj-genre-suggest-row" role="option"
+               data-filepath="${escapeHtml(h.filepath)}"
+               data-title="${escapeHtml(h.name)}${h.metadata && h.metadata.artist ? escapeHtml(' — ' + h.metadata.artist) : ''}">
+            ${escapeHtml(h.name)}${h.metadata && h.metadata.artist ? ` <small>${escapeHtml(h.metadata.artist)}</small>` : ''}
+          </div>`).join('');
+        sonicSeedSugEl.hidden = false;
+      }, 300);
+    }, { signal: _autoDjPanelSignal });
+    sonicSeedInpEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { sonicSeedSugEl.hidden = true; }
+    }, { signal: _autoDjPanelSignal });
+  }
+  if (sonicSeedSugEl) {
+    sonicSeedSugEl.addEventListener('click', (e) => {
+      const item = e.target.closest('.dj-genre-suggest-row');
+      if (!item) { return; }
+      AUTODJ.setSonicSeed(item.dataset.filepath, item.dataset.title);
+      _renderSonicSeedChip();
+      sonicSeedInpEl.value = '';
+      sonicSeedSugEl.hidden = true;
+      // The "enabled Auto-DJ on an empty queue" flow ends here: the
+      // seed just arrived, so nudge the stalled session into picking.
+      MSTREAMPLAYER.autoDjKick();
+    }, { signal: _autoDjPanelSignal });
+  }
 
   // ── Keyword filter ─────────────────────────────────────────────
   //
@@ -4149,11 +4928,15 @@ function runLocalSearch(el) {
 
 //////////////////////// Search
 const searchToggles = (() => {
+  const defaults = { albums: true, artists: true, files: false, titles: true, lyrics: true };
   try {
     const saved = JSON.parse(localStorage.getItem('mstream-search-toggles'));
-    if (saved && typeof saved === 'object') { return saved; }
+    // Merge OVER defaults so a toggle added in a later release (e.g. `lyrics`)
+    // inherits its default for existing users instead of being absent →
+    // rendered unchecked, while their own saved choices still win.
+    if (saved && typeof saved === 'object') { return { ...defaults, ...saved }; }
   } catch (_e) {}
-  return { albums: true, artists: true, files: false, titles: true };
+  return defaults;
 })();
 
 const searchMap = {
@@ -4173,13 +4956,19 @@ const searchMap = {
     name: 'File',
     class: 'filez',
     data: 'file_location',
-    func: 'onFileClick'
+    func: 'searchFileClick'
   },
   title: {
     name: 'Song',
     class: 'filez',
     data: 'file_location',
-    func: 'onFileClick'
+    func: 'searchFileClick'
+  },
+  lyrics: {
+    name: 'Lyrics',
+    class: 'filez',
+    data: 'file_location',
+    func: 'searchFileClick'
   }
 };
 
@@ -4189,7 +4978,10 @@ function setupSearchPanel(searchTerm) {
   programState = [{ state: 'searchPanel' }];
 
   let valString = '';
-  if (searchTerm) { valString = `value="${searchTerm}"`; }
+  // escapeHtml matters: searchTerm is the user's PREVIOUS query replayed
+  // on back-navigation — a quote in it would otherwise break out of the
+  // value attribute (broken input at best, self-XSS at worst).
+  if (searchTerm) { valString = `value="${escapeHtml(searchTerm)}"`; }
 
   document.getElementById('filelist').innerHTML = 
     `<div>
@@ -4216,6 +5008,10 @@ function setupSearchPanel(searchTerm) {
       <label class="grow" for="search-in-filepaths">
         <input ${(searchToggles.files === true ? 'checked' : '')} id="search-in-filepaths" class="filled-in" type="checkbox">
         <span>File Paths</span>
+      </label>
+      <label class="grow" for="search-in-lyrics">
+        <input ${(searchToggles.lyrics === true ? 'checked' : '')} id="search-in-lyrics" class="filled-in" type="checkbox">
+        <span>Lyrics</span>
       </label>
     </div>
     <div id="search-results"></div>`;
@@ -4247,6 +5043,8 @@ async function submitSearchForm() {
     searchToggles.files = document.getElementById("search-in-filepaths").checked;
     if (document.getElementById("search-in-titles") && document.getElementById("search-in-titles").checked === false) { postObject.noTitles = true; }
     searchToggles.titles = document.getElementById("search-in-titles").checked;
+    if (document.getElementById("search-in-lyrics") && document.getElementById("search-in-lyrics").checked === false) { postObject.noLyrics = true; }
+    searchToggles.lyrics = document.getElementById("search-in-lyrics").checked;
 
     try { localStorage.setItem('mstream-search-toggles', JSON.stringify(searchToggles)); } catch (_e) {}
 
@@ -4258,23 +5056,33 @@ async function submitSearchForm() {
 
     let noResultsFlag = true;
 
+    // Reset the per-search metadata lookup the search-result handlers read.
+    searchResultMetadata = {};
+
     // Populate list
     let searchList = '<ul class="collection">';
     Object.keys(res).forEach((key) => {
       res[key].forEach((value, i) => {
         noResultsFlag = false;
 
+        // Track-level hits (title/files/lyrics) now carry the full metadata
+        // object inline — stash it so searchFileClick/searchPlayNow can
+        // enqueue without a second /api/v1/db/metadata round-trip.
+        if (value.filepath && value.metadata) {
+          searchResultMetadata[value.filepath] = value.metadata;
+        }
+
         // perform some operation on a value;
         searchList += `<li class="collection-item">
-          <div onclick="${searchMap[key].func}(this);" data-${searchMap[key].data}="${value.filepath ? value.filepath : value.name}" class="${searchMap[key].class}">
-            <b>${searchMap[key].name}:&nbsp&nbsp</b><span>${value.name}</span>
+          <div onclick="${searchMap[key].func}(this);" data-${searchMap[key].data}="${escapeHtml(value.filepath ? value.filepath : value.name)}" class="${searchMap[key].class}">
+            <b>${searchMap[key].name}:</b> ${escapeHtml(value.name)}${key === 'lyrics' && value.snippet ? `<br><small class="grey-text">${escapeHtml(value.snippet)}</small>` : ''}
           </div>
           ${
-            key === 'files' || key === 'title' ? `<div class="song-button-box">
-            <span title="Play Now" onclick="playNow(this);" data-file_location="${value.filepath}" class="songDropdown">
+            key === 'files' || key === 'title' || key === 'lyrics' ? `<div class="song-button-box">
+            <span title="Play Now" onclick="searchPlayNow(this);" data-file_location="${escapeHtml(value.filepath)}" class="songDropdown">
               <svg xmlns="http://www.w3.org/2000/svg" height="12" width="12" viewBox="0 0 24 24"><path fill="none" d="M0 0h24v24H0z"/><path d="M15.5 5H11l5 7-5 7h4.5l5-7z"/><path d="M8.5 5H4l5 7-5 7h4.5l5-7z"/></svg>
             </span>
-            <span title="Add To Playlist" onclick="createPopper3(this);" data-file_location="${value.filepath}" class="fileAddToPlaylist">
+            <span title="Add To Playlist" onclick="createPopper3(this);" data-file_location="${escapeHtml(value.filepath)}" class="fileAddToPlaylist">
               <svg class="pop-f" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 292.362 292.362"><path class="pop-f" d="M286.935 69.377c-3.614-3.617-7.898-5.424-12.848-5.424H18.274c-4.952 0-9.233 1.807-12.85 5.424C1.807 72.998 0 77.279 0 82.228c0 4.948 1.807 9.229 5.424 12.847l127.907 127.907c3.621 3.617 7.902 5.428 12.85 5.428s9.233-1.811 12.847-5.428L286.935 95.074c3.613-3.617 5.427-7.898 5.427-12.847 0-4.948-1.814-9.229-5.427-12.85z"/></svg>
             </span>
           </div>` : ''
@@ -4392,7 +5200,8 @@ function setupLayoutPanel() {
           Light Mode
         </label>
       </div> -->
-      <br>
+      <a class="btn" onclick="openHotkeysModal();">${t('hotkeys.configure')}</a>
+      <br><br>
       <label>${t('settings.language')}</label>
       <select class="browser-default" id="lang-select" onchange="changeLanguage(this.value)">
       </select>
@@ -4475,87 +5284,5 @@ I18N.onChange(() => {
 });
 
 
-async function updateServer() {
-  try {
-    document.getElementById('save_server').disabled = true;
-
-    let host = document.getElementById('server_address').value;
-    if (host.slice(-1) !== '/') {
-      host += '/';
-    }
-
-    const res = await MSTREAMAPI.login(document.getElementById('server_username').value,
-      document.getElementById('server_password').value,
-      host);
-
-    MSTREAMAPI.currentServer.host = host;
-    MSTREAMAPI.currentServer.username = document.getElementById('server_username').value;
-    MSTREAMAPI.currentServer.token = res.token;
-
-    myModal.close();
-
-    init();
-    loadFileExplorer();
-    localStorage.setItem('current-server', JSON.stringify(MSTREAMAPI.currentServer)); 
-    document.getElementById('server_password').value = '';
-  }catch(err) {
-    console.log(err)
-    boilerplateFailure(err);
-  }finally {
-    document.getElementById('save_server').disabled = false;
-  }
-}
-
-function isElectron() {
-  return typeof navigator === 'object'
-    && typeof navigator.userAgent === 'string'
-    && navigator.userAgent.indexOf('Electron') >= 0;
-}
-
-function initElectron() {
-  const navEl = document.getElementById('sidenav');
-
-  // remove links
-  navEl.removeChild( document.querySelector('#admin-side-link'));
-  navEl.removeChild( document.querySelector('#logout-side-link'));
-
-  // add link to edit server
-  navEl.innerHTML += `<div class="side-nav-item my-waves" onclick="changeView(openEditModal, this);">
-  <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 0 24 24" width="24px" fill="#FFFFFF"><path d="M0 0h24v24H0z" fill="none"/><path d="M20.2 5.9l.8-.8C19.6 3.7 17.8 3 16 3s-3.6.7-5 2.1l.8.8C13 4.8 14.5 4.2 16 4.2s3 .6 4.2 1.7zm-.9.8c-.9-.9-2.1-1.4-3.3-1.4s-2.4.5-3.3 1.4l.8.8c.7-.7 1.6-1 2.5-1 .9 0 1.8.3 2.5 1l.8-.8zM19 13h-2V9h-2v4H5c-1.1 0-2 .9-2 2v4c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2v-4c0-1.1-.9-2-2-2zM8 18H6v-2h2v2zm3.5 0h-2v-2h2v2zm3.5 0h-2v-2h2v2z"/></svg>
-  <span>Edit Server</span>
-  </div>`;
-
-  try {
-    const curServer = JSON.parse(localStorage.getItem("current-server"));
-    console.log(curServer);
-    if (curServer.host && curServer.token) {
-      MSTREAMAPI.currentServer.host = curServer.host;
-      MSTREAMAPI.currentServer.token = curServer.token;
-      MSTREAMAPI.currentServer.username = curServer.username;
-    }
-  }catch(err) {}
-
-  // check if server
-  if (!MSTREAMAPI.currentServer.host) {
-    openEditModal();
-  }else {
-    loadFileExplorer();
-    init();
-  }
-    // if not edit server panel
-}
-
-if (isElectron()) {
-  initElectron();
-} else {
-  init();
-  loadFileExplorer();
-}
-
-// The sidenav dropdown must be populated AFTER initElectron()'s `innerHTML +=`
-// runs (which re-serializes and re-parses the entire sidenav and would otherwise
-// wipe dynamically-created child nodes). In non-Electron contexts this is a
-// no-op because the sidenav is never mutated — we just populate normally.
-if (typeof window.initSidenavLangDropdown === 'function') {
-  window.initSidenavLangDropdown();
-}
+init();
+loadFileExplorer();

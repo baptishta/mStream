@@ -98,7 +98,52 @@ const VUEPLAYERCORE = (() => {
   var cpsi;
   var cps;
 
-  new Vue({
+  // Discover panel state (model-powered similar tracks/artists for the
+  // current song — /api/v1/discovery/*). `available` comes from the ping
+  // response (see setDiscoveryAvailable below), so servers without the
+  // discovery feature never render the panel and the webapp never probes
+  // /api/v1/discovery/*. Collapsed by default; while collapsed NO discovery
+  // requests are sent — song changes just mark the panel dirty and the
+  // fetch happens on expand.
+  const discoverState = {
+    available: false,
+    disabled: false,          // server said 403 — stop asking
+    loading: false,
+    notAnalyzed: false,
+    collapsed: (() => { try { return localStorage.getItem('discoverCollapsed') !== 'false'; } catch (_) { return true; } })(),
+    seedTitle: '',
+    tracks: [],
+    artists: [],
+    // "From the network" (discovery P2P): similar tracks on OTHER servers'
+    // fetched snapshots. Metadata-only — these rows aren't playable; they're
+    // leads. Same reveal contract as `available`: the ping response's
+    // discoveryP2p flag, never a probe.
+    p2p: {
+      available: false,
+      disabled: false,        // server said 403 — stop asking
+      tracks: [],
+      searchedPeers: null,    // null = never fetched; 0 = network still warming up
+      newArtistsOnly: (() => { try { return localStorage.getItem('discoverNewArtistsOnly') === 'true'; } catch (_) { return false; } })(),
+    },
+    // "From your peers" (discovery over federation): live similarity answers
+    // from the servers this one is PAIRED with. Same reveal contract — the
+    // ping response's federationDiscovery flag, never a probe. Leads for now
+    // (playable once the federation stream proxy lands). Shares the p2p
+    // section's newArtistsOnly toggle: one semantic, one knob.
+    fed: {
+      available: false,
+      disabled: false,        // server said 403 — stop asking
+      tracks: [],
+      searchedPeers: null,    // null = never fetched; 0 = nobody answered
+      unreachable: 0,         // peers that timed out/failed on the last ask
+      mismatched: 0,          // peers on a different embedding model
+    },
+  };
+  let discoverDebounce = null;
+  let discoverReqId = 0;
+  let discoverDirty = false;   // song changed while collapsed → refetch on expand
+
+  const playlistVue = new Vue({
     el: '#playlist',
     data: {
       playlist: MSTREAMPLAYER.playlist,
@@ -106,7 +151,26 @@ const VUEPLAYERCORE = (() => {
       showClear: showClearLink,
       altLayout: mstreamModule.altLayout,
       meta: MSTREAMPLAYER.playerStats.metadata,
-      livePlaylist: mstreamModule.livePlaylist
+      livePlaylist: mstreamModule.livePlaylist,
+      discover: discoverState,
+      // Owned here rather than in each playlist-item so that one shared
+      // value has one subscriber instead of one per queue row — see the
+      // note on the playlist-item component.
+      positionCache: MSTREAMPLAYER.positionCache
+    },
+    watch: {
+      // Refresh the Discover panel when the playing song changes.
+      // resetCurrentMetadata rebuilds metadata field-by-field on the same
+      // object, so watching the filepath field is reliable. Debounced so
+      // skipping through the queue doesn't burst requests; immediate so a
+      // restored session populates on load.
+      'meta.filepath': {
+        immediate: true,
+        handler: function () {
+          if (discoverDebounce) { clearTimeout(discoverDebounce); }
+          discoverDebounce = setTimeout(() => { this.refreshDiscover(); }, 500);
+        },
+      },
     },
     computed: {
       albumArtPath: function () {
@@ -135,6 +199,15 @@ const VUEPLAYERCORE = (() => {
     methods: {
       getSongInfo: function() {
         openMetadataModal(MSTREAMPLAYER.getCurrentSong().metadata, MSTREAMPLAYER.getCurrentSong().rawFilePath);
+      },
+      // The moveMeta "small" now-playing card lives in this (#playlist)
+      // instance's template, so its lyrics chip binds to openLyrics here.
+      // Without this method Vue's render for #playlist throws on the
+      // chip's v-on:click, aborting the whole card render (stale metadata,
+      // no chip). Mirror of the #mstream-player instance's openLyrics.
+      openLyrics: function() {
+        const song = MSTREAMPLAYER.getCurrentSong();
+        if (song) { openLyricsModal(song.rawFilePath, this.meta && this.meta.title); }
       },
       gsi2: function() {
         openMetadataModal(cps.metadata, cps.rawFilePath);
@@ -182,13 +255,166 @@ const VUEPLAYERCORE = (() => {
           });
         }
       },
+      // ── Discover panel ─────────────────────────────────────────────
+      refreshDiscover: async function () {
+        if (!this.discover.available || this.discover.disabled) { return; }
+        const song = MSTREAMPLAYER.getCurrentSong();
+        if (!song || !song.rawFilePath) {
+          this.discover.tracks = [];
+          this.discover.artists = [];
+          this.discover.seedTitle = '';
+          return;
+        }
+        // A federated track is playing: its path lives in the PEER's vpath
+        // namespace, so local seed resolution can't work. Clear rather than
+        // show the previous song's results as if they belonged here.
+        if (song.federation) {
+          this.discover.tracks = [];
+          this.discover.artists = [];
+          this.discover.p2p.tracks = [];
+          this.discover.fed.tracks = [];
+          this.discover.notAnalyzed = false;
+          this.discover.seedTitle = (song.metadata && song.metadata.title) || '';
+          return;
+        }
+        // Keep it lean: no discovery traffic while the panel is collapsed.
+        // Remember there's something new to fetch for when it opens.
+        if (this.discover.collapsed) {
+          discoverDirty = true;
+          return;
+        }
+        discoverDirty = false;
+        const seedPath = song.rawFilePath.charAt(0) === '/' ? song.rawFilePath.substr(1) : song.rawFilePath;
+        const reqId = ++discoverReqId;
+        this.discover.loading = true;
+
+        const wantP2p = this.discover.p2p.available && !this.discover.p2p.disabled;
+        const wantFed = this.discover.fed.available && !this.discover.fed.disabled;
+        const [similar, artists, p2p, fed] = await Promise.all([
+          MSTREAMAPI.discoverySimilar(seedPath, 5),
+          this.meta.artist ? MSTREAMAPI.discoverySimilarArtists(this.meta.artist, 3) : Promise.resolve(null),
+          wantP2p ? MSTREAMAPI.discoveryP2pSimilar(seedPath, 5, this.discover.p2p.newArtistsOnly) : Promise.resolve(null),
+          wantFed ? MSTREAMAPI.discoveryFederationSimilar(seedPath, 5, this.discover.p2p.newArtistsOnly) : Promise.resolve(null),
+        ]);
+        if (reqId !== discoverReqId) { return; }   // a newer song superseded this refresh
+        this.discover.loading = false;
+
+        if (similar && similar.disabled) {
+          // Server has the feature off — hide for the rest of the session.
+          this.discover.disabled = true;
+          this.discover.available = false;
+          return;
+        }
+        if (similar) {
+          this.discover.notAnalyzed = similar.notAnalyzed === true;
+          this.discover.seedTitle = (similar.seed && similar.seed.metadata && similar.seed.metadata.title)
+            || (this.meta.title || '');
+          this.discover.tracks = similar.results || [];
+          this.discover.artists = (artists && !artists.disabled && !artists.notAnalyzed && artists.results) || [];
+        }
+        // else: transient local failure — keep whatever is shown.
+
+        if (wantP2p) {
+          if (p2p && p2p.disabled) {
+            // 403 — the operator turned the network off; stop asking.
+            this.discover.p2p.disabled = true;
+          } else if (p2p) {
+            this.discover.p2p.tracks = p2p.results || [];
+            this.discover.p2p.searchedPeers = (p2p.searched && p2p.searched.peers) || 0;
+          } else {
+            // null = transient failure OR this track has no embedding yet
+            // (a 404 — the local section's notAnalyzed hint covers that
+            // state for the same seed track). Show nothing rather than
+            // stale rows from the previous song.
+            this.discover.p2p.tracks = [];
+          }
+        }
+
+        if (wantFed) {
+          if (fed && fed.disabled) {
+            // 403 — federation turned off; stop asking for the session.
+            this.discover.fed.disabled = true;
+          } else if (fed) {
+            this.discover.fed.tracks = fed.results || [];
+            this.discover.fed.searchedPeers = (fed.searched && fed.searched.peers) || 0;
+            this.discover.fed.unreachable = (fed.searched && fed.searched.unreachable) || 0;
+            this.discover.fed.mismatched = (fed.searched && fed.searched.mismatched) || 0;
+          } else {
+            // Same null semantics as the p2p leg above.
+            this.discover.fed.tracks = [];
+          }
+        }
+      },
+      // ── "From your peers" rows ─────────────────────────────────────
+      // Playable since phase 4: the row queues through the federation
+      // stream proxy. Lite metadata comes straight off the fed result so
+      // the queue + now-playing card render without any local lookup.
+      queueDiscoverFed: function (ft) {
+        mstreamModule.addFederationSongWizard(ft.peer, ft.filepath, {
+          title: ft.title || '',
+          artist: ft.artist || '',
+          duration: ft.duration || null,
+        }, true);
+      },
+      // ── "From the network" rows ────────────────────────────────────
+      // Not playable (the track lives on someone else's server) — clicking
+      // copies "Artist - Title" so the user can go find it.
+      copyDiscoverP2p: async function (track) {
+        const text = `${track.artist || ''} - ${track.title || ''}`.trim();
+        try {
+          await navigator.clipboard.writeText(text);
+          iziToast.success({ title: t('discover.network.copied'), message: text, position: 'topCenter', timeout: 2500 });
+        } catch (_) {
+          iziToast.info({ title: text, position: 'topCenter', timeout: 3500 });
+        }
+      },
+      discoverP2pMbUrl: function (track) {
+        return track.recordingMbid ? `https://musicbrainz.org/recording/${track.recordingMbid}` : null;
+      },
+      toggleDiscoverNewArtists: function () {
+        this.discover.p2p.newArtistsOnly = !this.discover.p2p.newArtistsOnly;
+        try { localStorage.setItem('discoverNewArtistsOnly', String(this.discover.p2p.newArtistsOnly)); } catch (_) { /* private mode */ }
+        this.refreshDiscover();
+      },
+      toggleDiscover: function () {
+        this.discover.collapsed = !this.discover.collapsed;
+        try { localStorage.setItem('discoverCollapsed', String(this.discover.collapsed)); } catch (_) { /* private mode */ }
+        // Opening with stale (or no) content → fetch for the current song.
+        if (!this.discover.collapsed && discoverDirty) { this.refreshDiscover(); }
+      },
+      queueDiscoverTrack: function (t) {
+        mstreamModule.addSongWizard(t.filepath, t.metadata || {}, false, undefined, false, true);
+      },
+      queueAllDiscover: function () {
+        for (const t of this.discover.tracks) { this.queueDiscoverTrack(t); }
+      },
+      queueArtistEntryPoints: function (a) {
+        for (const e of (a.entryPoints || [])) {
+          mstreamModule.addSongWizard(e.filepath, e.metadata || {}, false, undefined, false, true);
+        }
+      },
+      goToDiscoverArtist: function (a) {
+        const el = document.createElement('DIV');
+        el.setAttribute('data-artist', a.artist);
+        getArtistz(el);
+      },
+      // "Electronic---Synthwave" → "Synthwave"; join the first two with a
+      // dot so the row reads: Vosto · Synthwave · Chillwave
+      discoverTags: function (tags) {
+        if (!tags || !tags.length) { return ''; }
+        return tags.slice(0, 2).map((t) => t.split('---').pop()).join(' · ');
+      },
+      discoverArtistTag: function (a) {
+        if (!a.genreTags || !a.genreTags.length) { return ''; }
+        return a.genreTags[0].split('---').pop();
+      },
     },
   });
 
   // Template for playlist items
   Vue.component('playlist-item', {
     template: `
-      <li v-on:click="goToSong($event)" class="noselect np-queue-item" v-bind:class="{ 'np-queue-active': (this.index === positionCache.val), playError: (this.songError && this.songError === true) }">
+      <li v-on:click="goToSong($event)" class="noselect np-queue-item" v-bind:class="{ playError: (this.songError && this.songError === true) }">
         <span onclick="event.stopPropagation()" class="drag-handle">
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="16" height="16"><path fill="#666" d="M4 7v2h24V7Zm0 8v2h24v-2Zm0 8v2h24v-2Z"/></svg>
         </span>
@@ -216,11 +442,15 @@ const VUEPLAYERCORE = (() => {
 
     props: ['index', 'song'],
 
-    // We need the positionCache to track the currently playing song
+    // positionCache deliberately does NOT live here. It is a single shared
+    // object, so putting it in per-row data made every row in the queue a
+    // reactive subscriber to a value that changes once per track change —
+    // advancing a track re-rendered the whole list. The active-row class is
+    // now bound by the parent (#playlist) on the v-for in index.html, which
+    // re-renders one row instead of N. Measured with the bundled Vue 2.7.16:
+    // 500 rows 69.3ms -> 5.1ms per track change, 2000 rows 353ms -> 34.5ms.
     data: function () {
-      return {
-        positionCache: MSTREAMPLAYER.positionCache
-      }
+      return {};
     },
 
     // Methods used by playlist item events
@@ -245,6 +475,13 @@ const VUEPLAYERCORE = (() => {
         link.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
       },
       createPopper: function (event) {
+        // Peer tracks can't be rated: ratings live in user_metadata keyed by
+        // LOCAL track hashes, so the server would just 404 the remote path.
+        // Say so up front instead of opening a rater that fails on submit.
+        if (this.song.federation) {
+          iziToast.info({ title: t('discover.peers.noRating'), position: 'topCenter', timeout: 2500 });
+          return;
+        }
         if (currentPopperSongIndex === this.index) {
           currentPopperSongIndex = false;
           document.getElementById("pop").style.visibility = "hidden";
@@ -418,6 +655,18 @@ const VUEPLAYERCORE = (() => {
         } else {
           if (_waveformData) _stopWaveformRaf();
         }
+      },
+      // Seeking while PAUSED moves the playhead with no rAF loop running,
+      // and nothing else repaints the canvas, so the orange played/unplayed
+      // split used to freeze in place while the time label moved — the bar
+      // disagreed with the clock until playback resumed. Guarded on the
+      // loop being idle, so during playback this watcher costs a comparison
+      // and nothing else (the loop already owns repainting then).
+      'playerStats.currentTime': function () {
+        if (_waveformRaf) { return; }
+        if (!this.altLayout.waveformBar || !_waveformData) { return; }
+        _wfInvalidate();
+        _drawWaveform();
       }
     },
     created: function () {
@@ -484,6 +733,10 @@ const VUEPLAYERCORE = (() => {
     methods: {
       getSongInfo: function() {
         openMetadataModal(MSTREAMPLAYER.getCurrentSong().metadata, MSTREAMPLAYER.getCurrentSong().rawFilePath);
+      },
+      openLyrics: function() {
+        const song = MSTREAMPLAYER.getCurrentSong();
+        if (song) { openLyricsModal(song.rawFilePath, this.meta && this.meta.title); }
       },
       changeVol: function(event) {
         const rect = this.$refs.volumeWrapper.getBoundingClientRect();
@@ -582,7 +835,26 @@ const VUEPLAYERCORE = (() => {
     }
   });
 
-  // Change spacebar behavior to Play/Pause
+  // Player hotkeys — bindings come from MSTREAMPLAYER.hotkeys, configurable
+  // under Layout > Keyboard Shortcuts (persisted in localStorage).
+  function hotkeyAdjustVolume(delta) {
+    let newVol = Math.round(MSTREAMPLAYER.playerStats.volume) + delta;
+    if (newVol > 100) { newVol = 100; }
+    if (newVol < 0) { newVol = 0; }
+    MSTREAMPLAYER.changeVolume(newVol);
+    if (typeof(Storage) !== "undefined") {
+      localStorage.setItem("volume", newVol);
+    }
+  }
+
+  function hotkeyStepPlaybackRate(delta) {
+    // Same range as the speed modal (0.25x - 4x)
+    let newRate = Math.round((MSTREAMPLAYER.playerStats.playbackRate + delta) * 100) / 100;
+    if (newRate > 4) { newRate = 4; }
+    if (newRate < 0.25) { newRate = 0.25; }
+    MSTREAMPLAYER.changePlaybackRate(newRate);
+  }
+
   window.addEventListener("keydown", (event) => {
     // Use default behavior if user is in a form or editable element
     const elementTag = event.target.tagName.toLowerCase();
@@ -602,12 +874,29 @@ const VUEPLAYERCORE = (() => {
       return;
     }
 
-    // Check the key
-    switch (event.key) {
-      case " ": //SpaceBar
-        event.preventDefault();
+    const action = MSTREAMPLAYER.hotkeys.resolve(event);
+    if (!action) { return; }
+    event.preventDefault();
+
+    switch (action) {
+      case 'playPause':
+      case 'playPauseAlt':
         MSTREAMPLAYER.playPause();
         break;
+      case 'seekBack': MSTREAMPLAYER.goBackSeek(5); break;
+      case 'seekForward': MSTREAMPLAYER.goForwardSeek(5); break;
+      case 'bigSeekBack': MSTREAMPLAYER.goBackSeek(30); break;
+      case 'bigSeekForward': MSTREAMPLAYER.goForwardSeek(30); break;
+      case 'prevTrack': MSTREAMPLAYER.previousSong(); break;
+      case 'nextTrack': MSTREAMPLAYER.nextSong(); break;
+      case 'volumeUp': hotkeyAdjustVolume(5); break;
+      case 'volumeDown': hotkeyAdjustVolume(-5); break;
+      case 'mute': playerVue.toggleMute(); break;
+      case 'shuffle': MSTREAMPLAYER.toggleShuffle(); break;
+      case 'repeat': MSTREAMPLAYER.toggleRepeat(); break;
+      case 'speedUp': hotkeyStepPlaybackRate(0.25); break;
+      case 'speedDown': hotkeyStepPlaybackRate(-0.25); break;
+      case 'percentSeek': MSTREAMPLAYER.seekByPercentage(parseInt(event.key, 10) * 10); break;
       case "ArrowUp":
         event.preventDefault();
         App.focusOnBrowserEl("prev");
@@ -649,6 +938,13 @@ const VUEPLAYERCORE = (() => {
       done();
     }
   });
+
+  // Song-capture slot (the Sonic Path panel's pickers). Consumed by
+  // onFileClick (m.js) — the SINGLE-row click dispatch — so any browsing
+  // view can feed a picker while bulk actions (Add All To Queue, recursive
+  // adds) go straight to addSongWizard and never trip an armed picker.
+  // One-shot: the consumer clears it on first capture / cancel.
+  mstreamModule.songCapture = null;
 
   mstreamModule.addSongWizard = async (filepath, metadata, lookupMetadata, position, livePlaylist, autoPlayOff) => {
     // Escape filepath
@@ -704,15 +1000,56 @@ const VUEPLAYERCORE = (() => {
       mstreamModule.prefetchWaveform(rawFilepath);
     }
 
-    // perform lookup
-    if (lookupMetadata === true) {
+    // Perform a metadata lookup ONLY when we weren't handed usable metadata
+    // already. Callers that pass a real metadata object — search results
+    // (the search API returns full metadata inline), album queue, playlist
+    // load — skip this redundant /api/v1/db/metadata round-trip. The file
+    // browser passes {} (it has no inline metadata) and still gets a lookup.
+    const hasMetadata = metadata && typeof metadata === 'object' && Object.keys(metadata).length > 0;
+    if (lookupMetadata === true && !hasMetadata) {
       const response = await MSTREAMAPI.lookupMetadata(rawFilepath);
 
       if (response.metadata) {
         newSong.metadata = response.metadata;
-        MSTREAMPLAYER.resetCurrentMetadata();
+        // Only refresh the now-playing card when the track we just
+        // enriched IS the one playing. resetCurrentMetadata() reads
+        // getCurrentPlayer().songObject, so calling it for some other
+        // queued track re-rendered the same values it already had — but
+        // it also runs _updateAutoDjAnchorsOnSongChange(), and the
+        // playing song is not flagged _djPicked, so that took the
+        // "manual pick" branch and called AUTODJ.resetAnchors(): six
+        // localStorage writes wiping bpmHistory, the Camelot anchor and
+        // the sonic seed. Queueing one track from the file browser threw
+        // away the Auto-DJ session. Identity compare is safe — the
+        // engine's add/insert/setMedia paths all preserve the object.
+        if (MSTREAMPLAYER.getCurrentSong() === newSong) {
+          MSTREAMPLAYER.resetCurrentMetadata();
+        }
       }
     }
+  };
+
+  // Queue a track that lives on a FEDERATED PEER. It plays through this
+  // server's stream proxy (/api/v1/federation/peers/:id/stream/…), so the
+  // browser needs nothing but its normal token. Deliberately NOT routed
+  // through addSongWizard: no transcode rerouting, no waveform prefetch,
+  // no live-playlist save, no metadata lookup — every one of those
+  // resolves paths against the LOCAL library, and this path lives in the
+  // peer's vpath namespace. The `federation` marker on the song object is
+  // what the degrade guards key on (waveform skip, Discover clear).
+  mstreamModule.addFederationSongWizard = (peer, remotePath, metadata, autoPlayOff) => {
+    let escaped = remotePath.replace(/\%/g, '%25').replace(/\#/g, '%23').replace(/\?/g, '%3F');
+    if (escaped.charAt(0) === '/') { escaped = escaped.substr(1); }
+    let url = `${MSTREAMAPI.currentServer.host}api/v1/federation/peers/${peer.id}/stream/${escaped}?`;
+    if (MSTREAMAPI.currentServer.token) { url += 'token=' + MSTREAMAPI.currentServer.token; }
+    MSTREAMPLAYER.addSong({
+      url: url,
+      rawFilePath: remotePath,
+      filepath: remotePath,
+      metadata: metadata || {},
+      authToken: MSTREAMAPI.currentServer.token,
+      federation: { peerId: peer.id, peerName: peer.name || 'peer' },
+    }, autoPlayOff);
   };
 
   mstreamModule.clearQueue = async() => {
@@ -733,26 +1070,91 @@ const VUEPLAYERCORE = (() => {
   let _waveformData = null;   // Array of 0-255 bar heights (800 entries)
   let _waveformFp   = null;   // filepath of the currently loaded waveform
   let _waveformRaf  = null;   // requestAnimationFrame handle
-  const _WF_LS_PREFIX = 'wf:';
+  // Bumped alongside the server's cache generation (CACHE_EXT in
+  // src/db/waveform-lib.js). Waveforms are stored per filepath with no
+  // version in the value, so without a new prefix a browser would keep
+  // rendering bars from the old decoder forever — the server-side fix
+  // would simply never reach anyone who had already played the track.
+  // Entries under the previous prefix are purged on first load.
+  const _WF_LS_PREFIX = 'wf2:';
+  const _WF_LS_OLD_PREFIXES = ['wf:'];
+
+  (function _wfLsPurgeOldGenerations() {
+    try {
+      const doomed = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && _WF_LS_OLD_PREFIXES.some(p => k.startsWith(p))) doomed.push(k);
+      }
+      for (const k of doomed) localStorage.removeItem(k);
+    } catch (_e) { /* private mode / quota — the new prefix still wins */ }
+  }());
+
+  // Bars are stored base64, not as a JSON number array. Each bar is one
+  // byte, so JSON spends ~3.4 characters ("128,") on what base64 says in
+  // 1.34 — and localStorage holds UTF-16, which doubles whatever we write.
+  // Measured on an 800-bar waveform: 5474 bytes as JSON, 2166 as base64.
+  // At the 500-entry cap that is ~2.7 MB against ~1.1 MB, i.e. the
+  // difference between sitting comfortably inside a ~5 MB origin budget
+  // and living permanently in the eviction path, re-fetching what was
+  // just dropped. Decoding is ~16x cheaper too (31.5 us -> 1.9 us), and
+  // hands the renderer a Uint8Array instead of 800 boxed numbers.
+  //
+  // NOT compressed on the wire and NOT changed server-side: this is purely
+  // how the browser holds its own copy. The endpoint still returns JSON,
+  // which the compression middleware already handles well.
+  function _wfB64Encode(data) {
+    // Chunked rather than String.fromCharCode(...data): spreading is fine
+    // at 800 entries but throws RangeError once arrays get large, and this
+    // is the one place the array length is not ours to assume.
+    let s = '';
+    for (let i = 0; i < data.length; i += 4096) {
+      s += String.fromCharCode.apply(null,
+        Array.prototype.slice.call(data, i, i + 4096));
+    }
+    return btoa(s);
+  }
+
+  function _wfB64Decode(str) {
+    const bin = atob(str);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) { out[i] = bin.charCodeAt(i); }
+    return out;
+  }
 
   function _wfLsGet(filepath) {
     try {
       const raw = localStorage.getItem(_WF_LS_PREFIX + filepath);
       if (!raw) return null;
-      const arr = JSON.parse(raw);
-      return Array.isArray(arr) && arr.length > 0 ? arr : null;
+      // Entries written before this encoding are still perfectly valid
+      // bars, so they are read rather than discarded — a '[' can't start
+      // base64, which makes the two formats trivially distinguishable.
+      // Re-write on hit so a warm cache migrates as tracks get played
+      // instead of staying oversized forever.
+      if (raw[0] === '[') {
+        const arr = JSON.parse(raw);
+        if (!Array.isArray(arr) || arr.length === 0) { return null; }
+        const bytes = Uint8Array.from(arr, (v) => v & 255);
+        _wfLsSet(filepath, bytes);
+        return bytes;
+      }
+      const bytes = _wfB64Decode(raw);
+      return bytes.length > 0 ? bytes : null;
     } catch (_e) { return null; }
   }
 
   const _WF_LS_MAX = 500; // max cached waveforms in localStorage
 
   function _wfLsSet(filepath, data) {
+    let encoded;
+    try { encoded = _wfB64Encode(data); }
+    catch (_e) { return; }   // unencodable input is not worth a quota retry
     try {
-      localStorage.setItem(_WF_LS_PREFIX + filepath, JSON.stringify(data));
+      localStorage.setItem(_WF_LS_PREFIX + filepath, encoded);
     } catch (_e) {
       // Quota exceeded — evict oldest wf:* entries and retry once
       _wfLsEvict();
-      try { localStorage.setItem(_WF_LS_PREFIX + filepath, JSON.stringify(data)); }
+      try { localStorage.setItem(_WF_LS_PREFIX + filepath, encoded); }
       catch (_e2) { /* still full — give up */ }
     }
   }
@@ -770,13 +1172,38 @@ const VUEPLAYERCORE = (() => {
     for (const k of toRemove) localStorage.removeItem(k);
   }
 
+  // Cleared whenever anything the canvas depends on changes, so the rAF
+  // loop's skip check below can never hold a stale "already drawn" belief.
+  let _wfLastSplitPx = -1;
+  function _wfInvalidate() { _wfLastSplitPx = -1; }
+
   function _setWaveformReady(val) {
+    // Every path that swaps or clears the bar data calls through here, which
+    // makes this the one place that has to invalidate the frame cache.
+    _wfInvalidate();
     if (playerVue) playerVue.waveformReady = val;
   }
 
+  // Draw once Vue has flushed. The four "waveform is ready" call sites used
+  // to draw synchronously, but `wf-active` — the class that un-hides the
+  // canvas — is applied by Vue on the next tick. So the canvas was still
+  // display:none, offsetWidth was 0, and _drawWaveform bailed at its size
+  // guard without painting. Since spa.css hides the plain .determinate bar
+  // as soon as wf-active lands, the common "queue a track with autoplay
+  // off" path showed an entirely blank progress bar until the user pressed
+  // play. Only the ready=true sites need this; the ready=false ones draw to
+  // clear a canvas that is still visible, and must stay synchronous.
+  function _drawWaveformSoon() {
+    if (typeof Vue !== 'undefined' && Vue.nextTick) { Vue.nextTick(_drawWaveform); }
+    else { _drawWaveform(); }
+  }
+
   async function _fetchWaveform(filepath) {
-    // Skip radio/external streams and empty paths
-    if (!filepath || /^https?:\/\//i.test(filepath)) {
+    // Skip radio/external streams, federated tracks, and empty paths — a
+    // peer's filepath means nothing to the local waveform API (it resolves
+    // against OUR libraries), so treat it like an external stream.
+    const cur = MSTREAMPLAYER.getCurrentSong();
+    if (!filepath || /^https?:\/\//i.test(filepath) || (cur && cur.federation)) {
       _waveformData = null;
       _waveformFp = null;
       _setWaveformReady(false);
@@ -788,7 +1215,7 @@ const VUEPLAYERCORE = (() => {
     // In-memory cache hit
     if (_waveformFp === filepath && _waveformData) {
       _setWaveformReady(true);
-      _drawWaveform();
+      _drawWaveformSoon();
       if (MSTREAMPLAYER.playerStats.playing) _startWaveformRaf();
       return;
     }
@@ -799,7 +1226,7 @@ const VUEPLAYERCORE = (() => {
       _waveformData = cached;
       _waveformFp   = filepath;
       _setWaveformReady(true);
-      _drawWaveform();
+      _drawWaveformSoon();
       if (MSTREAMPLAYER.playerStats.playing) _startWaveformRaf();
       return;
     }
@@ -825,7 +1252,7 @@ const VUEPLAYERCORE = (() => {
         _waveformFp   = filepath;
         _wfLsSet(filepath, d.waveform);
         _setWaveformReady(true);
-        _drawWaveform();
+        _drawWaveformSoon();
         if (MSTREAMPLAYER.playerStats.playing) _startWaveformRaf();
       }
     } catch (_e) { /* waveform unavailable — plain bar stays */ }
@@ -843,7 +1270,14 @@ const VUEPLAYERCORE = (() => {
   //   - radio/http(s) streams (no waveform on the server side)
   //   - anything already in-memory or already in localStorage
   //   - duplicate enqueues (dedup'd by filepath)
-  const _WF_PREFETCH_MAX = 2;
+  // Deliberately 1, not 2. The server allows MAX_CONCURRENT_FFMPEG = 2
+  // concurrent decodes (src/api/waveform.js), so a prefetch cap of 2 let
+  // background warm-up hold BOTH slots — on a cold cache the waveform for
+  // the track actually playing then queued behind album prefetches
+  // (measured: 0.6-1.2s for mp3, 7.4s for flac, versus 0-1ms at a cap of
+  // 1). Warm-up throughput barely moves (8 tracks: 6.2s -> 7.7s), and
+  // nobody is watching the prefetch.
+  const _WF_PREFETCH_MAX = 1;
   const _wfPrefetchQueue = [];
   const _wfPrefetchSeen = new Set(); // filepaths already queued/done this session
   let _wfPrefetchActive = 0;
@@ -884,7 +1318,7 @@ const VUEPLAYERCORE = (() => {
             _waveformData = d.waveform;
             _waveformFp   = filepath;
             _setWaveformReady(true);
-            _drawWaveform();
+            _drawWaveformSoon();
             if (MSTREAMPLAYER.playerStats.playing) { _startWaveformRaf(); }
           }
         } catch (_e) { /* swallow — best-effort */ }
@@ -950,23 +1384,71 @@ const VUEPLAYERCORE = (() => {
     ctx.restore();
   }
 
+  // The only thing that moves between frames is the playhead, and
+  // playerStats.currentTime is written from the audio element's timeupdate
+  // event, which fires ~4 times a second. At 60 fps that means the vast
+  // majority of frames redraw a bitmap identical to the one already on
+  // screen — pixel-diffed at 97.4%. Each of those redraws is 1600
+  // fillRects across two clipped passes, so the loop was burning a few
+  // percent of a core continuously, for the whole of playback, to produce
+  // no visible change.
+  //
+  // Skipping is keyed on the split position rounded to a whole pixel,
+  // which is the only per-frame input to the drawing. The guard lives HERE
+  // rather than inside _drawWaveform deliberately: several callers rely on
+  // that function to CLEAR the canvas on track change, and short-circuiting
+  // it would leave the previous song's waveform on screen.
   function _startWaveformRaf() {
     if (_waveformRaf) return;
     (function loop() {
-      _drawWaveform();
+      const canvas = document.getElementById('waveform-canvas');
+      const w = canvas ? canvas.offsetWidth : 0;
+      const dur = MSTREAMPLAYER.playerStats.duration;
+      const pct = dur > 0 ? MSTREAMPLAYER.playerStats.currentTime / dur : 0;
+      const splitPx = Math.round(pct * w);
+      if (splitPx !== _wfLastSplitPx) {
+        _wfLastSplitPx = splitPx;
+        _drawWaveform();
+      }
       _waveformRaf = requestAnimationFrame(loop);
     }());
   }
 
   function _stopWaveformRaf() {
     if (_waveformRaf) { cancelAnimationFrame(_waveformRaf); _waveformRaf = null; }
+    _wfInvalidate();
     _drawWaveform(); // final redraw at resting position
   }
 
   // Redraw on window resize so the canvas doesn't appear stretched while paused
-  window.addEventListener('resize', () => { if (_waveformData) _drawWaveform(); });
+  window.addEventListener('resize', () => {
+    _wfInvalidate();   // width changed, so the cached split pixel means nothing
+    if (_waveformData) _drawWaveform();
+  });
 
   mstreamModule.triggerWaveformFetch = _fetchWaveform;
+
+  // Called by m.js init() with the ping response's `discovery` flag. This is
+  // the ONLY thing that reveals the Discover panel — the webapp never probes
+  // /api/v1/discovery/* to find out whether the feature exists.
+  mstreamModule.setDiscoveryAvailable = (available) => {
+    discoverState.available = available === true;
+    if (discoverState.available) { playlistVue.refreshDiscover(); }
+  };
+
+  // Ping's discoveryP2p flag — reveals the "From the network" section inside
+  // the Discover panel. Independent of `available`: a server can run the
+  // network without local analysis (rare) or vice versa (common).
+  mstreamModule.setDiscoveryP2pAvailable = (available) => {
+    discoverState.p2p.available = available === true;
+  };
+
+  // Ping's federationDiscovery flag — reveals the "From your peers" section.
+  // True only when federation is on, local embeddings exist, and at least
+  // one paired peer is opted into discovery queries.
+  mstreamModule.setFederationDiscoveryAvailable = (available) => {
+    discoverState.fed.available = available === true;
+  };
 
   return mstreamModule;
 })()

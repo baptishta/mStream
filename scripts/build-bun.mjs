@@ -9,10 +9,12 @@
 // Windows icon + metadata flags are only applied for a win-x64 build running ON
 // Windows — Bun can't set them when cross-compiling. Name/version/etc. come from
 // package.json so they never drift.
-import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, cpSync, chmodSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, cpSync, chmodSync, readdirSync, openSync, readSync, closeSync, symlinkSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { canonicalFields, stampWindowsVersionInfo } from './win-versioninfo.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
@@ -62,20 +64,35 @@ if (!t) {
 }
 
 const outPath = join('dist', t.out);
-// --windows-version wants 4 numeric parts; strip any prerelease/build suffix.
-const verParts = String(pkg.version).split('-')[0].split('.').map((n) => String(parseInt(n, 10) || 0));
-while (verParts.length < 4) { verParts.push('0'); }
-const winVersion = verParts.slice(0, 4).join('.');
+// One VersionInfo contract for every Windows PE the bundle ships (server via
+// these Bun flags, launcher via rust-launcher/build.rs, sidecars stamped
+// below) — asserted by scripts/check-win-versioninfo.ps1 on the win-x64 CI
+// leg. --windows-version wants 4 numeric parts (prerelease suffix dropped).
+const winMeta = canonicalFields(pkg);
+const winVersion = winMeta.version;
 
 const buildArgs = ['build', '--compile', `--target=${t.bun}`];
+// The discovery feature's ML runtime CANNOT be bundled: onnxruntime-node's
+// loader requires a per-(platform,arch) native binary that upstream doesn't
+// ship for every target (darwin-x64 has none at all), and Bun folds
+// process.platform/arch to the COMPILE TARGET's constants, so any target
+// missing its binary fails the build at resolve time. External = left as a
+// runtime import instead; in a standalone binary that import fails cleanly
+// and the discovery worker reports the model runtime as unavailable (the
+// dependencyMissing path in src/db/discovery-features-lib.js). Discovery in
+// Bun bundles awaits a sidecar-staging strategy like iroh's below.
+buildArgs.push('--external', 'onnxruntime-node');
 if (t.win && process.platform === 'win32') {
   buildArgs.push(
     '--windows-icon=build/mstream-logo-cut.ico',
-    '--windows-title=mStream Server',
-    `--windows-publisher=${pkg.author?.name ?? ''}`,
+    // --windows-title is the ProductName (shared, "mStream" like every other
+    // shipped PE); --windows-description is the FileDescription — the name
+    // Task Manager and the Details tab show for THIS file.
+    `--windows-title=${winMeta.productName}`,
+    `--windows-publisher=${winMeta.companyName}`,
     `--windows-version=${winVersion}`,
-    `--windows-description=${pkg.description ?? ''}`,
-    `--windows-copyright=${pkg.author?.name ?? ''} (${pkg.license ?? ''})`,
+    '--windows-description=mStream Server',
+    `--windows-copyright=${winMeta.legalCopyright}`,
   );
 } else if (t.win) {
   console.warn('NOTE: building for Windows from a non-Windows host - icon/metadata skipped (Bun limitation).');
@@ -115,17 +132,75 @@ function stageExe(src, dest) {
   if (isUnix) { try { chmodSync(dest, 0o755); } catch (_) { /* best-effort; no-op on Windows hosts */ } }
 }
 
-// macOS gets a .app bundle so Finder/Dock show the icon; its assets (webapp/,
-// bin/) live next to the binary inside Contents/MacOS so appRoot
-// (= dirname(process.execPath)) still resolves them. It's a portable .app —
-// run it in place (it writes its db/config next to the binary, like the bare
-// builds). Other platforms stage flat in the bundle dir.
+// macOS gets a .app bundle so Finder/Dock show the icon. The bin/ sidecars
+// live next to the binary inside Contents/MacOS so appRoot
+// (= dirname(process.execPath)) still resolves them; webapp/ lives in
+// Contents/Resources with a symlink from MacOS (see below — codesign's
+// sealing rules force the split, the symlink keeps appRoot resolution
+// working). Other platforms stage flat in the bundle dir.
 const isMac = t.plat === 'darwin';
 const contentRoot = isMac ? join(stageDir, 'mStream.app', 'Contents', 'MacOS') : stageDir;
 mkdirSync(contentRoot, { recursive: true });
 
-stageExe(join(root, outPath), join(contentRoot, isMac ? 'mStream' : t.out));     // the server binary
-cpSync(join(root, 'webapp'), join(contentRoot, 'webapp'), { recursive: true });  // the UI
+// The server ships as `mstream-server` in EVERY bundle (1c rename): it is the
+// sibling name the desktop launcher resolves, the terminal/headless entry, and
+// one consistent name across platforms (the bundle dir already carries the
+// arch). The launcher below — where this platform has one — takes over the
+// user-facing name (mStream.exe / the .app executable / mstream-desktop).
+const serverName = `mstream-server${t.ext}`;
+stageExe(join(root, outPath), join(contentRoot, serverName));
+// The UI. On macOS it lives in Contents/Resources with a RELATIVE SYMLINK
+// from Contents/MacOS/webapp: codesign's bundle-sealing scan treats every
+// item under MacOS as a nested-code candidate, and a tree of html/js there
+// fails the bundle sign outright ("code object is not signed at all — In
+// subcomponent: …webapp/velvet/admin/index.html", observed on the first
+// signed CI runs). A symlink is sealed as a symlink, the server's
+// appRoot-relative lookup resolves through it unchanged, and zip -y /
+// ditto / Finder extraction all preserve it. bin/ stays under MacOS: its
+// contents are signed Mach-Os, which the nested-code scan accepts.
+if (isMac) {
+  const resRoot = join(stageDir, 'mStream.app', 'Contents', 'Resources');
+  mkdirSync(resRoot, { recursive: true });
+  cpSync(join(root, 'webapp'), join(resRoot, 'webapp'), { recursive: true });
+  symlinkSync(join('..', 'Resources', 'webapp'), join(contentRoot, 'webapp'));
+} else {
+  cpSync(join(root, 'webapp'), join(contentRoot, 'webapp'), { recursive: true });  // the UI
+}
+
+// Desktop tray launcher (rust-launcher/), CI-committed per platform like the
+// rust-parser sidecars. Deliberately absent on linux-arm64 and the musl
+// targets: those are headless-leaning (Pi servers, Alpine/NAS containers) and
+// the gtk/appindicator cross-build isn't worth carrying until someone asks —
+// their bundles stay server-only and the .desktop/plist writers below adapt.
+const launcherSrc = {
+  'win-x64':      'mstream-launcher-win32-x64.exe',
+  'darwin-x64':   'mstream-launcher-darwin-x64',
+  'darwin-arm64': 'mstream-launcher-darwin-arm64',
+  'linux-x64':    'mstream-launcher-linux-x64',
+}[key];
+let launcherStaged = false;
+if (launcherSrc) {
+  const src = join(root, 'bin', 'rust-launcher', launcherSrc);
+  if (existsSync(src)) {
+    const face = t.plat === 'win32' ? 'mStream.exe' : (isMac ? 'mStream' : 'mstream-desktop');
+    stageExe(src, join(contentRoot, face));
+    launcherStaged = true;
+  } else if (process.env.CI && !process.env.MSTREAM_ALLOW_MISSING_LAUNCHER) {
+    // In CI a launcher-shipping target without its launcher is a broken
+    // release, not a variant: the server-only self-heal below would ship a
+    // bundle whose double-click face is the raw server — no tray, no
+    // supervised lifecycle — and every job stays green (darwin-x64 has no
+    // smoke step to catch it). The workflow's fallback-build step is
+    // responsible for the binary existing; if it didn't, fail HERE, on
+    // every leg, before a green build can say otherwise.
+    console.error(`  FATAL: launcher-shipping target ${key} has no bin/rust-launcher/${launcherSrc} (set MSTREAM_ALLOW_MISSING_LAUNCHER=1 to build server-only on purpose)`);
+    process.exit(1);
+  } else {
+    // Local/dev builds: server-only is a legitimate shape (launcher
+    // binaries only exist on master or after a local cargo build).
+    console.warn(`  launcher not found, bundle ships server-only: bin/rust-launcher/${launcherSrc}`);
+  }
+}
 
 // External binaries the server spawns, arch- and libc-specific. A musl bundle
 // stages the -musl sidecar variants (the primary parser on Alpine). A glibc
@@ -135,25 +210,277 @@ cpSync(join(root, 'webapp'), join(contentRoot, 'webapp'), { recursive: true }); 
 // host glibc (needs GLIBC_2.34; see tryMuslRetry() in src/db/task-queue.js),
 // keeping native-speed scanning on older-glibc distros (RHEL/Rocky 8, Ubuntu
 // 20.04, Amazon Linux 2, Debian 11) instead of the ~16x-slower JS fallback.
-// rust-server-audio has no musl build, so musl bundles ship without it
-// (server-audio is opt-in). Each entry is skipped gracefully if not committed.
+// Each entry is skipped gracefully if not committed. (mstream-player — the
+// server-audio engine — is not in this list: like the p2p sidecar it left
+// git and is fetched from its pinned release below.)
+//
+// SIGN-LOAD-BEARING LAYOUT (darwin): build-bun.yml's sign step walks
+// Contents/MacOS for Mach-Os (these sidecars + the iroh .node), signs
+// mstream-server by name with its entitlements, and asserts the bundle face
+// is the launcher. If you move where binaries land — or stage a second
+// JIT-needing (Bun-compiled) binary, which would need its own entitlements
+// wiring — update that step in the same PR.
 const libc = t.musl ? '-musl' : '';
 const sidecars = [
-  ['rust-parser',       `rust-parser-${t.plat}-${t.arch}${libc}${t.ext}`],
-  ['rust-server-audio', `rust-server-audio-${t.plat}-${t.arch}${libc}${t.ext}`],
+  ['rust-parser', `rust-parser-${t.plat}-${t.arch}${libc}${t.ext}`],
 ];
 if (t.plat === 'linux' && !t.musl) {
   sidecars.push(['rust-parser', `rust-parser-${t.plat}-${t.arch}-musl`]);
 }
+// Windows sidecars leave their CI build with no VersionInfo (they're
+// version-agnostic tools). Stamp the bundle's canonical block onto the STAGED
+// copy (bin/ itself stays CI-managed) so every PE in the zip carries the same
+// product name/version — see scripts/win-versioninfo.mjs for why this happens
+// here and not in each crate's build. FileDescription is what Task Manager
+// shows as the process name.
+//
+// THREE LISTS MOVE TOGETHER: the `sidecars` array above, this description
+// map, and $known in scripts/check-win-versioninfo.ps1 (which fails the
+// win-x64 leg on any PE it doesn't know). Staging a new Windows sidecar
+// means updating all three in the same change, or the leg goes red with
+// "unknown PE". (The p2p-sidecar is staged separately below — it comes from
+// the pinned release assets, not from bin/ — but its Windows copy joins the
+// same stamped set and the same $known list.)
+const sidecarDescription = {
+  'rust-parser': 'mStream Library Scanner',
+};
 for (const [dir, file] of sidecars) {
   const src = join(root, 'bin', dir, file);
   if (existsSync(src)) {
     mkdirSync(join(contentRoot, 'bin', dir), { recursive: true });
-    stageExe(src, join(contentRoot, 'bin', dir, file));
+    const dest = join(contentRoot, 'bin', dir, file);
+    stageExe(src, dest);
+    if (t.plat === 'win32') {
+      try {
+        await stampWindowsVersionInfo(dest, { ...winMeta, fileDescription: sidecarDescription[dir] ?? 'mStream' });
+        console.log(`  stamped VersionInfo: bin/${dir}/${file} (${winMeta.productName} ${winMeta.version})`);
+      } catch (err) {
+        // A Windows bundle whose sidecars carry no VersionInfo is a metadata
+        // regression the CI assert would catch anyway — fail here, at the
+        // cause, in CI. Locally it's a warning: a dev box without the
+        // devDependency still gets a working bundle.
+        const msg = `VersionInfo stamp failed for bin/${dir}/${file}: ${err.message}`;
+        if (process.env.CI) { console.error(`  FATAL: ${msg}`); process.exit(1); }
+        console.warn(`  WARN: ${msg}`);
+      }
+    }
   } else {
     console.warn(`  sidecar not found, skipping: bin/${dir}/${file}`);
   }
 }
+
+// p2p-sidecar (discovery network): the crate lives in its own repo
+// (IrosTheBeggar/mstream-p2p-sidecar) and the binaries left git — bundles
+// BAKE the target's binary in at build time, fetched from the release
+// assets the committed manifests pin (fetch → sha256+size verify → stage;
+// one download in CI instead of one per user machine). The runtime
+// resolver (src/state/discovery-p2p.js resolveSidecarBinary) finds it at
+// appRoot/bin/p2p-sidecar/<name> — its "prebuilt" rung — so bundle
+// installs never fetch; npm/source/Docker installs keep fetch-on-first-use.
+// The Windows copy is VersionInfo-stamped like the other sidecars (the
+// staged bytes then legitimately differ from the manifest sha — verify
+// happens BEFORE the stamp) and gets Authenticode-signed with the PE set.
+// CI without the asset = a broken release, fail loud (launcher precedent);
+// local/offline builds warn and ship without — the runtime fetch is the
+// fallback. MSTREAM_SIDECAR_BASE mirrors apply here too (pins still hold).
+{
+  const scName = `p2p-sidecar-${t.plat}-${t.arch}${libc}${t.ext}`;
+  const manifestFile = join(root, 'bin', 'p2p-sidecar', t.musl ? 'manifest-musl.json' : 'manifest.json');
+  const skip = (why) => {
+    if (process.env.CI && !process.env.MSTREAM_ALLOW_MISSING_SIDECAR) {
+      console.error(`  FATAL: p2p-sidecar staging failed for ${key}: ${why} (set MSTREAM_ALLOW_MISSING_SIDECAR=1 to bundle without it on purpose)`);
+      process.exit(1);
+    }
+    console.warn(`  p2p-sidecar not staged (${why}) — bundle falls back to runtime fetch`);
+  };
+  let entry = null;
+  try {
+    const m = JSON.parse(readFileSync(manifestFile, 'utf8'));
+    entry = m.assets?.[scName] ? { ...m.assets[scName], repo: m.repo, tag: m.tag } : null;
+  } catch (_err) {
+    // unreadable/absent manifest = the same no-entry skip below
+  }
+  if (!entry) {
+    skip(`no manifest entry for ${scName}`);
+  } else {
+    // Same URL shape the runtime fetch uses — one derivation, no drift.
+    const { deriveAssetUrl } = await import('../src/util/p2p-sidecar-bootstrap.js');
+    const base = (process.env.MSTREAM_SIDECAR_BASE || '').replace(/\/+$/, '');
+    const url = base ? `${base}/${entry.file}` : deriveAssetUrl(entry);
+    const cacheDir = join(root, 'dist', 'sidecar-cache');
+    mkdirSync(cacheDir, { recursive: true });
+    const cached = join(cacheDir, `${entry.sha256.slice(0, 12)}-${scName}`);
+    let bytes = null;
+    if (existsSync(cached)) {
+      bytes = readFileSync(cached);
+      if (createHash('sha256').update(bytes).digest('hex') !== entry.sha256) { bytes = null; }
+    }
+    if (!bytes) {
+      console.log(`  fetching p2p-sidecar: ${url}`);
+      try {
+        const res = await fetch(url, { redirect: 'follow' });
+        if (!res.ok) { throw new Error(`HTTP ${res.status}`); }
+        bytes = Buffer.from(await res.arrayBuffer());
+      } catch (err) {
+        bytes = null;
+        skip(`download failed: ${err.message}`);
+      }
+    }
+    if (bytes) {
+      const gotSha = createHash('sha256').update(bytes).digest('hex');
+      if (gotSha !== entry.sha256 || bytes.length !== entry.size) {
+        // A hash mismatch is NEVER skippable — wrong bytes must not ship,
+        // and must not poison the cache.
+        console.error(`  FATAL: p2p-sidecar ${scName} failed verification (sha ${gotSha.slice(0, 12)}… vs pinned ${entry.sha256.slice(0, 12)}…, ${bytes.length} vs ${entry.size} bytes)`);
+        process.exit(1);
+      }
+      writeFileSync(cached, bytes);
+      mkdirSync(join(contentRoot, 'bin', 'p2p-sidecar'), { recursive: true });
+      const dest = join(contentRoot, 'bin', 'p2p-sidecar', scName);
+      writeFileSync(dest, bytes);
+      if (t.plat !== 'win32') { chmodSync(dest, 0o755); }
+      console.log(`  staged p2p-sidecar ${entry.tag}: bin/p2p-sidecar/${scName} (${(entry.size / 1048576).toFixed(1)} MB, sha verified)`);
+      if (t.plat === 'win32') {
+        try {
+          await stampWindowsVersionInfo(dest, { ...winMeta, fileDescription: 'mStream P2P Sidecar' });
+          console.log(`  stamped VersionInfo: bin/p2p-sidecar/${scName} (${winMeta.productName} ${winMeta.version})`);
+        } catch (err) {
+          const msg = `VersionInfo stamp failed for bin/p2p-sidecar/${scName}: ${err.message}`;
+          if (process.env.CI) { console.error(`  FATAL: ${msg}`); process.exit(1); }
+          console.warn(`  WARN: ${msg}`);
+        }
+      }
+    }
+  }
+}
+
+// Runtime-fetch pin manifests travel WITH the bundle. The ffmpeg bootstrap
+// (src/util/ffmpeg-bootstrap.js) deliberately downloads on first use — the
+// binaries are ~60-130 MB of GPL code we don't redistribute — and reads its
+// pin set from appRoot/bin/ffmpeg/manifest.json at runtime, so a bundle
+// without the file boots with ffmpeg permanently unavailable ("No pinned
+// ffmpeg build for <platform>", observed on the first post-pin bundle).
+// The p2p-sidecar manifest backs that family's runtime-fetch rung for
+// bundles built without the baked binary (MSTREAM_ALLOW_MISSING_SIDECAR /
+// offline local builds) — the "falls back to runtime fetch" promise above
+// holds only if the pins ship. macOS: real file in Contents/Resources,
+// relative symlink from MacOS/bin/<family>/ — codesign's nested-code scan
+// rejects loose non-Mach-O files under MacOS (the same rule that put
+// webapp/ and install.sh in Resources), a symlink is sealed as a symlink,
+// and the runtime's appRoot-relative read resolves through it unchanged.
+for (const m of [
+  { family: 'ffmpeg', file: 'manifest.json' },
+  { family: 'p2p-sidecar', file: t.musl ? 'manifest-musl.json' : 'manifest.json' },
+  ...(t.musl ? [] : [{ family: 'mstream-player', file: 'manifest.json' }]),
+]) {
+  const src = join(root, 'bin', m.family, m.file);
+  const destDir = join(contentRoot, 'bin', m.family);
+  mkdirSync(destDir, { recursive: true });
+  if (isMac) {
+    const resRoot = join(stageDir, 'mStream.app', 'Contents', 'Resources');
+    const resName = `${m.family}-${m.file}`;
+    mkdirSync(resRoot, { recursive: true });
+    cpSync(src, join(resRoot, resName));
+    symlinkSync(join('..', '..', '..', 'Resources', resName), join(destDir, m.file));
+  } else {
+    cpSync(src, join(destDir, m.file));
+  }
+}
+
+// mstream-player (server audio): the crate left git for its own repo
+// (IrosTheBeggar/mstream-terminal-player — the in-tree rust-server-audio
+// was a stale fork of it) and bundles BAKE the target's binary in at build
+// time, fetched from the release assets the committed manifest pins (fetch
+// -> sha256+size verify -> stage; one download in CI instead of one per
+// user machine). The runtime resolver (src/api/server-playback.js) finds
+// it at appRoot/bin/mstream-player/<name>; npm/source installs keep
+// fetch-on-first-use. No musl build exists — server audio is opt-in and
+// needs a sound device — so musl bundles ship without it, exactly as they
+// always have. The Windows copy is VersionInfo-stamped (verify happens
+// BEFORE the stamp) and joins the same $known set. CI without the asset =
+// a broken release, fail loud; local/offline builds warn and ship without
+// — the runtime fetch is the fallback. MSTREAM_PLAYER_BASE mirrors apply
+// (pins still hold); MSTREAM_ALLOW_MISSING_PLAYER is the deliberate
+// escape hatch.
+if (!t.musl) {
+  const plName = `mstream-player-${t.plat}-${t.arch}${t.ext}`;
+  const plManifest = join(root, 'bin', 'mstream-player', 'manifest.json');
+  const skip = (why) => {
+    if (process.env.CI && !process.env.MSTREAM_ALLOW_MISSING_PLAYER) {
+      console.error(`  FATAL: mstream-player staging failed for ${key}: ${why} (set MSTREAM_ALLOW_MISSING_PLAYER=1 to bundle without it on purpose)`);
+      process.exit(1);
+    }
+    console.warn(`  mstream-player not staged (${why}) — bundle falls back to runtime fetch`);
+  };
+  let entry = null;
+  try {
+    const m = JSON.parse(readFileSync(plManifest, 'utf8'));
+    entry = m.assets?.[plName] ? { ...m.assets[plName], repo: m.repo, tag: m.tag } : null;
+  } catch (_err) {
+    // unreadable/absent manifest = the same no-entry skip below
+  }
+  if (!entry) {
+    skip(`no manifest entry for ${plName}`);
+  } else {
+    // Same URL shape the runtime fetch uses — one derivation, no drift.
+    const { deriveAssetUrl } = await import('../src/util/mstream-player-bootstrap.js');
+    const base = (process.env.MSTREAM_PLAYER_BASE || '').replace(/\/+$/, '');
+    const url = base ? `${base}/${entry.file}` : deriveAssetUrl(entry);
+    const cacheDir = join(root, 'dist', 'player-cache');
+    mkdirSync(cacheDir, { recursive: true });
+    const cached = join(cacheDir, `${entry.sha256.slice(0, 12)}-${plName}`);
+    let bytes = null;
+    if (existsSync(cached)) {
+      bytes = readFileSync(cached);
+      if (createHash('sha256').update(bytes).digest('hex') !== entry.sha256) { bytes = null; }
+    }
+    if (!bytes) {
+      console.log(`  fetching mstream-player: ${url}`);
+      try {
+        const res = await fetch(url, { redirect: 'follow' });
+        if (!res.ok) { throw new Error(`HTTP ${res.status}`); }
+        bytes = Buffer.from(await res.arrayBuffer());
+      } catch (err) {
+        bytes = null;
+        skip(`download failed: ${err.message}`);
+      }
+    }
+    if (bytes) {
+      const gotSha = createHash('sha256').update(bytes).digest('hex');
+      if (gotSha !== entry.sha256 || bytes.length !== entry.size) {
+        // A hash mismatch is NEVER skippable — wrong bytes must not ship,
+        // and must not poison the cache.
+        console.error(`  FATAL: mstream-player ${plName} failed verification (sha ${gotSha.slice(0, 12)}… vs pinned ${entry.sha256.slice(0, 12)}…, ${bytes.length} vs ${entry.size} bytes)`);
+        process.exit(1);
+      }
+      writeFileSync(cached, bytes);
+      mkdirSync(join(contentRoot, 'bin', 'mstream-player'), { recursive: true });
+      const dest = join(contentRoot, 'bin', 'mstream-player', plName);
+      writeFileSync(dest, bytes);
+      if (t.plat !== 'win32') { chmodSync(dest, 0o755); }
+      console.log(`  staged mstream-player ${entry.tag}: bin/mstream-player/${plName} (${(entry.size / 1048576).toFixed(1)} MB, sha verified)`);
+      if (t.plat === 'win32') {
+        try {
+          await stampWindowsVersionInfo(dest, { ...winMeta, fileDescription: 'mStream Server Audio' });
+          console.log(`  stamped VersionInfo: bin/mstream-player/${plName} (${winMeta.productName} ${winMeta.version})`);
+        } catch (err) {
+          const msg = `VersionInfo stamp failed for bin/mstream-player/${plName}: ${err.message}`;
+          if (process.env.CI) { console.error(`  FATAL: ${msg}`); process.exit(1); }
+          console.warn(`  WARN: ${msg}`);
+        }
+      }
+    }
+  }
+}
+
+// Iroh remote-access tunnel: @number0/iroh ships as a NAPI-RS *native addon*
+// (prebuilt .node), not a spawned exe like the rust sidecars. A Bun standalone
+// binary can't resolve it from node_modules, so we stage the target's .node next
+// to the binary and point the loader at it at runtime via
+// NAPI_RS_NATIVE_LIBRARY_PATH (see src/state/iroh.js). Best-effort: a build that
+// can't obtain the .node still ships — remote access just stays unavailable,
+// exactly as on an unsupported platform.
+stageIroh(t, contentRoot);
 
 // App icon. Windows embeds it in the .exe at compile time (--windows-icon
 // above). macOS and Linux can't embed an icon in a bare binary, so we package
@@ -162,10 +489,35 @@ if (isMac) {
   const resDir = join(stageDir, 'mStream.app', 'Contents', 'Resources');
   mkdirSync(resDir, { recursive: true });
   cpSync(join(root, 'build', 'mstream-logo-cut.icns'), join(resDir, 'mStream.icns'));
-  writeFileSync(join(stageDir, 'mStream.app', 'Contents', 'Info.plist'), macInfoPlist(pkg.version));
+  // CFBundleExecutable = the launcher when staged (the menu-bar face), else
+  // the server itself (cross-built legs before the launcher binaries land,
+  // and any future launcher-less darwin variant).
+  writeFileSync(join(stageDir, 'mStream.app', 'Contents', 'Info.plist'),
+    macInfoPlist(pkg.version, launcherStaged ? 'mStream' : serverName));
 } else if (t.plat === 'linux') {
   cpSync(join(root, 'build', 'icon.png'), join(stageDir, 'mStream.png'));
-  writeFileSync(join(stageDir, 'mStream.desktop'), linuxDesktopEntry(t.out));
+  writeFileSync(join(stageDir, 'mStream.desktop'),
+    linuxDesktopEntry(launcherStaged ? 'mstream-desktop' : serverName, launcherStaged));
+}
+
+// Signpost at the bundle root: which binary is the desktop face, which is the
+// headless entry. The launcher is a GTK3 tray app and can't even LOAD on a
+// bare server box, so the box can't explain itself — this file has to.
+writeFileSync(join(stageDir, 'README.txt'), bundleReadme(pkg.version, t, launcherStaged, serverName));
+
+// The installer script travels WITH the bundle: the in-app updater
+// (src/util/update-check.js) stages a new version by running exactly the
+// code that installed this one, pinned at build time and covered by the
+// bundle's own sha256 — never a fetch of a mutable script URL at update
+// time. macOS: Contents/Resources — it is a data file, and codesign's
+// nested-code scan rejects loose scripts under Contents/MacOS (same rule
+// that put webapp/ in Resources above).
+if (t.plat === 'win32') {
+  cpSync(join(root, 'install.ps1'), join(contentRoot, 'install.ps1'));
+} else if (isMac) {
+  cpSync(join(root, 'install.sh'), join(stageDir, 'mStream.app', 'Contents', 'Resources', 'install.sh'));
+} else {
+  cpSync(join(root, 'install.sh'), join(contentRoot, 'install.sh'));
 }
 
 const archivePath = join(root, 'dist', `${bundleName}.zip`);
@@ -182,17 +534,57 @@ console.log(`Bundling -> dist/${bundleName}.zip`);
 //     .zip from the extension; a Windows .exe carries no mode bit to lose.
 let zip;
 if (process.platform === 'win32') {
-  zip = spawnSync('tar', ['-a', '-c', '-f', archivePath, '-C', stageRoot, bundleName], { stdio: 'inherit' });
+  // Two tar traps on Windows dev machines, both dodged here:
+  //   - GNU tar (first on PATH under git-bash) reads an absolute C:\...
+  //     path's drive colon as a remote hostname, so paths stay relative
+  //     under an explicit cwd.
+  //   - GNU tar cannot CREATE zips at all: `-a` with a suffix it doesn't
+  //     know (.zip isn't in its table) silently writes an UNCOMPRESSED TAR
+  //     named .zip and exits 0. So prefer System32's bsdtar by absolute
+  //     path — it's what the CI runners resolve anyway — and only fall back
+  //     to PATH lookup on exotic setups. The magic-byte check below catches
+  //     whatever slips through either way.
+  const sysTar = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
+  const tarBin = existsSync(sysTar) ? sysTar : 'tar';
+  zip = spawnSync(tarBin, ['-a', '-c', '-f', join('dist', `${bundleName}.zip`), '-C', join('dist', 'stage'), bundleName], { cwd: root, stdio: 'inherit' });
 } else {
   zip = spawnSync('zip', ['-r', '-y', '-q', archivePath, bundleName], { cwd: stageRoot, stdio: 'inherit' });
 }
 if (zip.error) { console.error(zip.error.message); }
 if (zip.status !== 0) { console.error('archive (zip) failed'); process.exit(zip.status ?? 1); }
+
+// A release archive that isn't a real zip must fail the build, not ship:
+// every zip starts with the PK\x03\x04 local-file-header magic (a tar in
+// zip's clothing starts with the first filename instead).
+{
+  const fd = openSync(archivePath, 'r');
+  const magic = Buffer.alloc(4);
+  const n = readSync(fd, magic, 0, 4, 0);
+  closeSync(fd);
+  if (n !== 4 || !magic.equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))) {
+    console.error(`dist/${bundleName}.zip is not a zip archive (magic: ${magic.subarray(0, Math.max(n, 0)).toString('hex') || 'empty'}) — wrong tar on PATH?`);
+    process.exit(1);
+  }
+}
 console.log(`Done: dist/${bundleName}.zip`);
 
 // macOS .app Info.plist — points CFBundleIconFile at the staged mStream.icns
-// and CFBundleExecutable at the inner binary.
-function macInfoPlist(version) {
+// and CFBundleExecutable at the bundle's face.
+//
+// LSUIElement is load-bearing twice over. Historically (#802): a faceless CLI
+// server never checks in with the WindowServer, and without this key a Finder
+// launch bounced into a permanent "Application Not Responding". Now: the
+// bundle's executable is the tray LAUNCHER (rust-launcher/), a menu-bar app —
+// which is exactly what LSUIElement declares (menu-bar presence, no Dock
+// tile). The user-facing Quit that #802's fix had to defer lives in the
+// launcher's tray menu. When execName is the server itself (launcher-less
+// staging), the key still prevents the ANR class.
+//
+// The NSLocalNetwork/NSBonjour keys caption macOS 15+'s Local Network consent
+// prompt, which fires on first launch because mDNS advertising
+// (_mstream._tcp, src/discovery/mdns.js) is on by default — without them the
+// prompt shows no explanation of why a music server wants LAN access.
+function macInfoPlist(version, execName) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -202,10 +594,17 @@ function macInfoPlist(version) {
   <key>CFBundleIdentifier</key><string>io.mstream.server</string>
   <key>CFBundleVersion</key><string>${version}</string>
   <key>CFBundleShortVersionString</key><string>${version}</string>
-  <key>CFBundleExecutable</key><string>mStream</string>
+  <key>CFBundleExecutable</key><string>${execName}</string>
   <key>CFBundleIconFile</key><string>mStream.icns</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSLocalNetworkUsageDescription</key><string>mStream advertises itself on your local network so players and speakers can find your music library, using Bonjour and — if you enable DLNA — SSDP.</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_mstream._tcp</string>
+    <string>_services._dns-sd._udp</string>
+  </array>
 </dict>
 </plist>
 `;
@@ -214,14 +613,158 @@ function macInfoPlist(version) {
 // Linux .desktop launcher: a bare ELF can't carry an icon, so this is how the
 // PNG shows up in an app menu. Exec/Icon need absolute paths once installed —
 // replace %INSTALL_DIR% with the extract location (or use desktop-file-install).
-function linuxDesktopEntry(binName) {
+function linuxDesktopEntry(binName, isLauncher) {
+  // Launcher bundles are a real desktop app (background server + tray) — no
+  // terminal. Server-only bundles (no launcher for this target) keep the old
+  // run-in-a-terminal behavior so the .desktop entry still does something
+  // sensible.
   return `[Desktop Entry]
 Type=Application
 Name=mStream
 Comment=Self-hosted music streaming server
 Exec=%INSTALL_DIR%/${binName}
 Icon=%INSTALL_DIR%/mStream.png
-Terminal=true
+Terminal=${isLauncher ? 'false' : 'true'}
 Categories=AudioVideo;Audio;Network;
 `;
+}
+
+// The bundle-root README.txt. Kept to one screen: it exists to answer exactly
+// one question — "which of these two binaries do I run?" — for the person who
+// just extracted the zip, especially on a headless box where the launcher
+// fails at the dynamic loader before it can say anything.
+function bundleReadme(version, t, launcherStaged, serverName) {
+  const osName = { win32: 'Windows', darwin: 'macOS', linux: 'Linux' }[t.plat];
+  const dataDir = { win32: '%LOCALAPPDATA%\\mStream', darwin: '~/Library/Application Support/mStream', linux: '~/.local/share/mstream' }[t.plat];
+  const server = t.plat === 'darwin' ? `mStream.app/Contents/MacOS/${serverName}` : serverName;
+  const run = t.plat === 'win32' ? '' : './';
+  const lines = [`mStream ${version}  (${osName} ${t.arch}${t.musl ? ', static musl build' : ''})`, ''];
+  if (launcherStaged) {
+    const face = { win32: 'mStream.exe', darwin: 'open mStream.app', linux: './mstream-desktop' }[t.plat];
+    lines.push(
+      `Desktop:   ${face}`,
+      '           Runs the server in the background with a tray icon and opens',
+      '           the web app. Also works from a terminal (output stays attached).',
+      t.plat === 'linux'
+        ? '           Needs a graphical session with GTK3 (any stock desktop has it).'
+        : null,
+      '',
+      `Headless:  ${run}${server}`,
+      '           The server alone - no tray, no GUI libraries needed. Use this',
+      `           over SSH, in containers, and as a service (${t.plat === 'win32' ? 'NSSM, sc.exe' : t.plat === 'darwin' ? 'launchd' : 'systemd'}).`,
+    );
+  } else {
+    lines.push(
+      `This bundle is server-only (no desktop launcher for this target):`,
+      `           ${run}${server}`,
+      t.musl
+        ? '           Fully static - runs on any Linux, including Alpine and NAS systems.'
+        : null,
+    );
+  }
+  lines.push(
+    '',
+    `The web app serves on http://localhost:3000 - set up your library there.`,
+    // macOS gets no --portable suggestion: "next to the binaries" is INSIDE
+    // mStream.app/Contents/MacOS there, and the first write into a signed
+    // bundle invalidates its seal — codesign --verify fails, Gatekeeper
+    // calls a copied .app "damaged", and signature-keyed consents (Local
+    // Network) can re-prompt. The one sentence users would follow must not
+    // undo the notarization the bundle ships with.
+    t.plat === 'darwin'
+      ? `Data lives in ${dataDir}. (Do not use --portable with the .app: writing inside a signed app breaks its seal.)`
+      : `Data lives in ${dataDir}; pass --portable to keep it next to the binaries.`,
+    '',
+    'Upgrading? The install script does it in place and verifies the download:',
+    t.plat === 'win32'
+      ? '  irm https://raw.githubusercontent.com/IrosTheBeggar/mStream/master/install.ps1 | iex'
+      : '  curl -fsSL https://raw.githubusercontent.com/IrosTheBeggar/mStream/master/install.sh | sh',
+    '',
+    `Docs: https://mstream.io        More flags: ${run}${server} --help`,
+  );
+  return lines.filter((l) => l !== null).join('\n') + '\n';
+}
+
+// NAPI-RS target triple for @number0/iroh's platform package / .node filename
+// (e.g. win32-x64-msvc, linux-arm64-musl, darwin-arm64).
+function napiTriple(target) {
+  if (target.plat === 'win32') { return `win32-${target.arch}-msvc`; }
+  if (target.plat === 'darwin') { return `darwin-${target.arch}`; }
+  return `linux-${target.arch}-${target.musl ? 'musl' : 'gnu'}`; // linux
+}
+
+// Stage @number0/iroh's prebuilt .node for `target` into <contentRoot>/bin/iroh/.
+// Native targets reuse the host-installed platform package (npm install picks
+// the host triple); cross targets fetch the matching package from npm via
+// `npm pack` (which ignores os/cpu, unlike `npm install`). Best-effort — warns
+// and returns on any miss so the bundle still ships without remote access.
+function stageIroh(target, dest) {
+  const triple = napiTriple(target);
+  const file = `iroh.${triple}.node`;
+  const destDir = join(dest, 'bin', 'iroh');
+
+  // 1) Host-matching prebuilt already installed by `npm ci` (native targets).
+  const installed = join(root, 'node_modules', `@number0/iroh-${triple}`, file);
+  if (existsSync(installed)) {
+    mkdirSync(destDir, { recursive: true });
+    cpSync(installed, join(destDir, file));
+    console.log(`  iroh: staged ${file} (node_modules)`);
+    return;
+  }
+
+  // 2) Cross target: fetch the platform package tarball and extract its .node.
+  // Version AND integrity come from package-lock.json — the same pin `npm ci`
+  // enforces for the host triple. `npm pack` only checks the tarball against
+  // the registry's own packument (the same party serving the bytes), so
+  // without this a registry-/mirror-side substitution shipped attacker code
+  // that every remote-access session on the linux-arm64/musl bundles would
+  // dlopen in-process; the lockfile pin closes that the way it already does
+  // for the natively-installed packages.
+  const lockKey = `node_modules/@number0/iroh-${triple}`;
+  let pinned;
+  try {
+    pinned = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8')).packages[lockKey];
+  } catch {
+    pinned = null;
+  }
+  if (!pinned || !pinned.version || !pinned.integrity) {
+    console.warn(`  iroh: package-lock.json has no pinned ${lockKey} — remote access unavailable in this bundle`);
+    return;
+  }
+  const version = pinned.version;
+  const tmp = join(root, 'dist', '.iroh-fetch');
+  rmSync(tmp, { recursive: true, force: true });
+  mkdirSync(tmp, { recursive: true });
+  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const spec = `@number0/iroh-${triple}@${version}`;
+  const pack = spawnSync(npm, ['pack', spec, '--pack-destination', tmp], { cwd: root, stdio: 'inherit' });
+  if (pack.status !== 0) {
+    console.warn(`  iroh: 'npm pack ${spec}' failed — remote access unavailable in this bundle`);
+    return;
+  }
+  const tgz = readdirSync(tmp).find((f) => f.endsWith('.tgz'));
+  if (!tgz) { console.warn('  iroh: npm pack produced no tarball — remote access unavailable'); return; }
+  // Bind the fetched bytes to the lockfile before extracting anything.
+  const [algo, want] = pinned.integrity.split('-', 2);
+  const got = createHash(algo).update(readFileSync(join(tmp, tgz))).digest('base64');
+  if (got !== want) {
+    const msg = `iroh: ${tgz} does not match package-lock.json's ${algo} integrity for ${lockKey} (got ${got.slice(0, 16)}..., want ${want.slice(0, 16)}...) — refusing to stage it`;
+    if (process.env.CI) { console.error(`  FATAL: ${msg}`); process.exit(1); }
+    console.warn(`  WARN: ${msg} — remote access unavailable in this bundle`);
+    return;
+  }
+  console.log(`  iroh: ${tgz} matches package-lock.json integrity (${algo})`);
+  // Relative path under cwd, not join(tmp, tgz): GNU tar (first on PATH in
+  // git-bash dev shells) reads an absolute C:\...'s drive colon as a remote
+  // host — this silently dropped iroh from every locally cross-built bundle.
+  const untar = spawnSync('tar', ['-xzf', tgz], { cwd: tmp, stdio: 'inherit' });
+  // npm tarballs put files under package/.
+  const extracted = join(tmp, 'package', file);
+  if (untar.status !== 0 || !existsSync(extracted)) {
+    console.warn(`  iroh: could not extract ${file} from ${tgz} — remote access unavailable`);
+    return;
+  }
+  mkdirSync(destDir, { recursive: true });
+  cpSync(extracted, join(destDir, file));
+  console.log(`  iroh: staged ${file} (fetched ${tgz})`);
 }

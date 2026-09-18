@@ -1,6 +1,11 @@
 # JSON config
 
-By default, mStream will generate a config at `save/conf/default.conf`. You can set the config file for mstream the the `-j` flag.
+By default, mStream generates a config at `save/conf/default.json` when run
+from source or npm. The standalone binary bundles instead keep it in your user
+data directory (`%LOCALAPPDATA%\mStream`, `~/Library/Application Support/mStream`,
+or `~/.local/share/mstream` — see [install.md](install.md)), and generate it
+with Quick Connect enabled unless launched with `--quick-connect-off-by-default`.
+You can set the config file explicitly with the `-j` flag.
 
 ```
 mstream -j /path/to/config.json
@@ -58,6 +63,10 @@ A heavily edited config would look like:
     "defaultCodec": "opus",
     "defaultBitrate": "128k",
     "autoUpdate": true
+  },
+  "updates": {
+    "check": true,
+    "mode": "stage"
   },
   "ssl": {
     "key": "/path/to/key.pem",
@@ -170,6 +179,32 @@ uses them as-is and never auto-updates them.
 
 Note: older configs may contain `"enabled": true` here — that key is ignored;
 transcoding no longer has an on/off switch.
+
+## Updates
+
+Controls the daily release-update check and what happens when one is found
+(see the "Automatic updates" section of `install.md` for the full story):
+
+```json
+  "updates": {
+    "check": true,
+    "mode": "stage",
+    "skipVersion": ""
+  },
+```
+
+* `check`: (boolean, default `true`) poll the release feed once a day. Set
+  `false` to never phone home — the admin panel's "check now" still works.
+* `mode`: `"notify"` (report only), `"stage"` (default — download in the
+  background; applying takes a restart or a click), or `"auto"` (also
+  restart into the update when the server is idle; headless installs need a
+  process supervisor that restarts mStream after it exits).
+* `skipVersion`: hold one version back — never download or restart into it.
+  Set it (from the admin panel's skip link, or by hand) after rolling back a
+  bad release, or the next daily check would silently re-stage it. Clear
+  with `""`; a newer release supersedes it naturally.
+
+All of these are editable live from the admin panel's About page — no reboot needed.
 
 ## Secret
 

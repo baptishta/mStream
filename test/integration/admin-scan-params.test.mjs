@@ -16,6 +16,7 @@
 import { describe, before, after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { startServer } from '../helpers/server.mjs';
+import { getDefaults } from '../../src/state/config.js';
 
 const ADMIN = { username: 'admin', password: 'pw-admin' };
 const USER  = { username: 'bob',   password: 'pw-bob'   };
@@ -58,28 +59,30 @@ function adminPost(path, body, jwt = adminJwt) {
 
 // ── GET /db/params ────────────────────────────────────────────────────────
 
+test('analyzeBpm defaults to true (BPM/key analysis on out of the box)', () => {
+  assert.equal(getDefaults().scanOptions.analyzeBpm, true);
+});
+
 describe('GET /api/v1/admin/db/params', () => {
   test('returns the full scanOptions object including analyzeBpm', async () => {
     const r = await adminGet('/api/v1/admin/db/params');
     assert.equal(r.status, 200);
     const body = await r.json();
-    // Defaults from src/state/config.js scanOptions:
-    //   analyzeBpm: false  (opt-in — expensive on large libraries / weak hardware)
-    //   generateWaveforms: true
-    //   skipImg: false
-    // These are the surrounding fields the new toggle slots into;
-    // assert them too so a regression in the schema shape (e.g. a
-    // typoed key) shows up here instead of as a silent UI bug.
+    // These are the surrounding fields the toggle slots into; assert them
+    // too so a regression in the schema shape (e.g. a typoed key) shows up
+    // here instead of as a silent UI bug. analyzeBpm defaults ON in
+    // config.js, but the test harness forces it OFF (see server.mjs) so the
+    // suite doesn't run the essentia pass on every scan — hence false here.
     assert.equal(typeof body.analyzeBpm, 'boolean',
       `analyzeBpm should be a boolean, got ${typeof body.analyzeBpm}`);
-    assert.equal(body.analyzeBpm, false, 'analyzeBpm default is false (opt-in)');
+    assert.equal(body.analyzeBpm, false, 'analyzeBpm forced off by the test harness');
     assert.equal(typeof body.generateWaveforms, 'boolean');
     assert.equal(typeof body.skipImg, 'boolean');
   });
 
-  test('rejects non-admin users with 405 (outer admin guard)', async () => {
+  test('rejects non-admin users with 403 (outer admin guard)', async () => {
     const r = await adminGet('/api/v1/admin/db/params', userJwt);
-    assert.equal(r.status, 405);
+    assert.equal(r.status, 403);
   });
 });
 
@@ -130,17 +133,165 @@ describe('POST /api/v1/admin/db/params/analyze-bpm', () => {
     assert.equal(r.status, 400);
   });
 
-  test('rejects non-admin users with 405', async () => {
+  test('rejects non-admin users with 403', async () => {
     const r = await adminPost('/api/v1/admin/db/params/analyze-bpm',
       { analyzeBpm: true }, userJwt);
-    assert.equal(r.status, 405);
+    assert.equal(r.status, 403);
+  });
+});
+
+// ── POST /db/params/analyze-bpm-per-run ───────────────────────────────────
+
+describe('POST /api/v1/admin/db/params/analyze-bpm-per-run', () => {
+  test('sets analyzeBpmPerRun + reflects; rejects out-of-range; 403 non-admin', async () => {
+    const r1 = await adminPost('/api/v1/admin/db/params/analyze-bpm-per-run',
+      { analyzeBpmPerRun: 75 });
+    assert.equal(r1.status, 200);
+    assert.deepEqual(await r1.json(), {}, 'happy-path response is the empty object {}');
+    assert.equal((await (await adminGet('/api/v1/admin/db/params')).json()).analyzeBpmPerRun, 75);
+
+    // Restore the default so later tests start in a known state.
+    await adminPost('/api/v1/admin/db/params/analyze-bpm-per-run', { analyzeBpmPerRun: 200 });
+
+    for (const bad of [{ analyzeBpmPerRun: 0 }, { analyzeBpmPerRun: 10001 },
+      { analyzeBpmPerRun: 'abc' }, { analyzeBpmPerRun: 2.5 }, {}]) {
+      const r = await adminPost('/api/v1/admin/db/params/analyze-bpm-per-run', bad);
+      assert.equal(r.status, 400, `expected rejection for ${JSON.stringify(bad)}`);
+    }
+    assert.equal((await adminPost('/api/v1/admin/db/params/analyze-bpm-per-run',
+      { analyzeBpmPerRun: 50 }, userJwt)).status, 403);
+  });
+});
+
+// ── POST /db/params/analyze-bpm-method ────────────────────────────────────
+
+describe('POST /api/v1/admin/db/params/analyze-bpm-method', () => {
+  test('sets method + reflects; rejects junk; 403 non-admin', async () => {
+    const r1 = await adminPost('/api/v1/admin/db/params/analyze-bpm-method',
+      { analyzeBpmMethod: 'degara' });
+    assert.equal(r1.status, 200);
+    assert.deepEqual(await r1.json(), {}, 'happy-path response is the empty object {}');
+    assert.equal((await (await adminGet('/api/v1/admin/db/params')).json()).analyzeBpmMethod, 'degara');
+
+    // Restore the default so later tests start in a known state.
+    await adminPost('/api/v1/admin/db/params/analyze-bpm-method',
+      { analyzeBpmMethod: 'multifeature' });
+    assert.equal((await (await adminGet('/api/v1/admin/db/params')).json()).analyzeBpmMethod, 'multifeature');
+
+    for (const bad of [{ analyzeBpmMethod: 'percival' }, { analyzeBpmMethod: 1 },
+      { analyzeBpmMethod: true }, {}]) {
+      const r = await adminPost('/api/v1/admin/db/params/analyze-bpm-method', bad);
+      assert.equal(r.status, 400, `expected rejection for ${JSON.stringify(bad)}`);
+    }
+    assert.equal((await adminPost('/api/v1/admin/db/params/analyze-bpm-method',
+      { analyzeBpmMethod: 'degara' }, userJwt)).status, 403);
+  });
+});
+
+// ── POST /db/params/analyze-bpm-window-sec ────────────────────────────────
+
+describe('POST /api/v1/admin/db/params/analyze-bpm-window-sec', () => {
+  test('sets window (incl. 0) + reflects; rejects 1–29 / out-of-range; 403 non-admin', async () => {
+    const r1 = await adminPost('/api/v1/admin/db/params/analyze-bpm-window-sec',
+      { analyzeBpmWindowSec: 120 });
+    assert.equal(r1.status, 200);
+    assert.deepEqual(await r1.json(), {}, 'happy-path response is the empty object {}');
+    assert.equal((await (await adminGet('/api/v1/admin/db/params')).json()).analyzeBpmWindowSec, 120);
+
+    // 0 = whole-file mode is explicitly allowed (the alternatives() branch).
+    assert.equal((await adminPost('/api/v1/admin/db/params/analyze-bpm-window-sec',
+      { analyzeBpmWindowSec: 0 })).status, 200);
+    assert.equal((await (await adminGet('/api/v1/admin/db/params')).json()).analyzeBpmWindowSec, 0);
+
+    // Restore the default so later tests start in a known state.
+    await adminPost('/api/v1/admin/db/params/analyze-bpm-window-sec', { analyzeBpmWindowSec: 60 });
+
+    for (const bad of [{ analyzeBpmWindowSec: 15 }, { analyzeBpmWindowSec: 601 },
+      { analyzeBpmWindowSec: -1 }, { analyzeBpmWindowSec: 45.5 },
+      { analyzeBpmWindowSec: 'abc' }, {}]) {
+      const r = await adminPost('/api/v1/admin/db/params/analyze-bpm-window-sec', bad);
+      assert.equal(r.status, 400, `expected rejection for ${JSON.stringify(bad)}`);
+    }
+    assert.equal((await adminPost('/api/v1/admin/db/params/analyze-bpm-window-sec',
+      { analyzeBpmWindowSec: 60 }, userJwt)).status, 403);
+  });
+});
+
+// ── POST /db/params/ignore-dot-* (dot-entry ignore toggles) ───────────────
+//
+// Same four-part pattern as analyze-bpm: GET defaults, happy-path flip +
+// reflect, Joi boundary rejections (400), non-admin 403. No side effects:
+// the toggles only change what FUTURE scans index (no enqueue on flip).
+
+describe('dot-entry ignore params', () => {
+  test('GET includes both defaults (false — opt-in)', async () => {
+    const body = await (await adminGet('/api/v1/admin/db/params')).json();
+    assert.equal(body.ignoreDotFiles, false, 'ignoreDotFiles default is false');
+    assert.equal(body.ignoreDotFolders, false, 'ignoreDotFolders default is false');
+  });
+
+  for (const [route, field] of [
+    ['ignore-dot-files', 'ignoreDotFiles'],
+    ['ignore-dot-folders', 'ignoreDotFolders'],
+  ]) {
+    test(`${route}: flips + reflects; rejects junk; 403 non-admin`, async () => {
+      const r1 = await adminPost(`/api/v1/admin/db/params/${route}`, { [field]: true });
+      assert.equal(r1.status, 200);
+      assert.deepEqual(await r1.json(), {}, 'happy-path response is the empty object {}');
+      assert.equal((await (await adminGet('/api/v1/admin/db/params')).json())[field], true);
+
+      // Restore the default so later tests start in a known state.
+      await adminPost(`/api/v1/admin/db/params/${route}`, { [field]: false });
+      assert.equal((await (await adminGet('/api/v1/admin/db/params')).json())[field], false);
+
+      for (const bad of [{ [field]: 'yes' }, { [field]: 1 }, { [field]: null }, {}]) {
+        const r = await adminPost(`/api/v1/admin/db/params/${route}`, bad);
+        assert.equal(r.status, 400, `expected rejection for ${JSON.stringify(bad)}`);
+      }
+      assert.equal((await adminPost(`/api/v1/admin/db/params/${route}`,
+        { [field]: true }, userJwt)).status, 403);
+    });
+  }
+});
+
+// ── POST /db/params/watcher-enabled (filesystem watcher toggle) ───────────
+//
+// Same four-part pattern. The happy-path flip exercises the LIVE side
+// effect too: enabling starts real chokidar watchers on the fixture
+// library inside the test server, disabling stops them — both harmless
+// (watchers only enqueue scans, and the fixture stays quiet).
+
+describe('filesystem watcher params', () => {
+  test('GET includes the defaults (disabled, 10s wait)', async () => {
+    const body = await (await adminGet('/api/v1/admin/db/params')).json();
+    assert.equal(body.watcherEnabled, false, 'watcherEnabled default is false (opt-in)');
+    assert.equal(body.watcherWait, 10);
+  });
+
+  test('watcher-enabled: flips + reflects; rejects junk; 403 non-admin', async () => {
+    const r1 = await adminPost('/api/v1/admin/db/params/watcher-enabled',
+      { watcherEnabled: true });
+    assert.equal(r1.status, 200);
+    assert.deepEqual(await r1.json(), {}, 'happy-path response is the empty object {}');
+    assert.equal((await (await adminGet('/api/v1/admin/db/params')).json()).watcherEnabled, true);
+
+    // Restore the default (also stops the watchers the flip started).
+    await adminPost('/api/v1/admin/db/params/watcher-enabled', { watcherEnabled: false });
+    assert.equal((await (await adminGet('/api/v1/admin/db/params')).json()).watcherEnabled, false);
+
+    for (const bad of [{ watcherEnabled: 'yes' }, { watcherEnabled: 1 }, { watcherEnabled: null }, {}]) {
+      const r = await adminPost('/api/v1/admin/db/params/watcher-enabled', bad);
+      assert.equal(r.status, 400, `expected rejection for ${JSON.stringify(bad)}`);
+    }
+    assert.equal((await adminPost('/api/v1/admin/db/params/watcher-enabled',
+      { watcherEnabled: true }, userJwt)).status, 403);
   });
 });
 
 // ── POST /db/params/auto-album-art-* (the downloader's config family) ──────
 //
 // Same four-part pattern as analyze-bpm above: GET defaults, happy-path
-// flip + reflect, Joi boundary rejections (400), non-admin 405. All
+// flip + reflect, Joi boundary rejections (400), non-admin 403. All
 // side-effect-free against the fixtures: the helper boots with
 // autoAlbumArt:false, so no flip here can enqueue a download pass.
 
@@ -152,7 +303,7 @@ describe('downloader config params', () => {
     assert.equal(body.autoAlbumArtPerRun, 100);
   });
 
-  test('auto-album-art-mode: flips + reflects; rejects junk; 405 non-admin', async () => {
+  test('auto-album-art-mode: flips + reflects; rejects junk; 403 non-admin', async () => {
     const r1 = await adminPost('/api/v1/admin/db/params/auto-album-art-mode',
       { autoAlbumArtMode: 'all' });
     assert.equal(r1.status, 200);
@@ -164,10 +315,10 @@ describe('downloader config params', () => {
       assert.equal(r.status, 400, `expected rejection for ${JSON.stringify(bad)}`);
     }
     assert.equal((await adminPost('/api/v1/admin/db/params/auto-album-art-mode',
-      { autoAlbumArtMode: 'all' }, userJwt)).status, 405);
+      { autoAlbumArtMode: 'all' }, userJwt)).status, 403);
   });
 
-  test('auto-album-art-write-to-folder: flips + reflects; rejects junk; 405 non-admin', async () => {
+  test('auto-album-art-write-to-folder: flips + reflects; rejects junk; 403 non-admin', async () => {
     const r1 = await adminPost('/api/v1/admin/db/params/auto-album-art-write-to-folder',
       { autoAlbumArtWriteToFolder: true });
     assert.equal(r1.status, 200);
@@ -180,10 +331,10 @@ describe('downloader config params', () => {
       assert.equal(r.status, 400, `expected rejection for ${JSON.stringify(bad)}`);
     }
     assert.equal((await adminPost('/api/v1/admin/db/params/auto-album-art-write-to-folder',
-      { autoAlbumArtWriteToFolder: true }, userJwt)).status, 405);
+      { autoAlbumArtWriteToFolder: true }, userJwt)).status, 403);
   });
 
-  test('auto-album-art-per-run: sets + reflects; rejects out-of-range; 405 non-admin', async () => {
+  test('auto-album-art-per-run: sets + reflects; rejects out-of-range; 403 non-admin', async () => {
     const r1 = await adminPost('/api/v1/admin/db/params/auto-album-art-per-run',
       { autoAlbumArtPerRun: 250 });
     assert.equal(r1.status, 200);
@@ -196,7 +347,7 @@ describe('downloader config params', () => {
       assert.equal(r.status, 400, `expected rejection for ${JSON.stringify(bad)}`);
     }
     assert.equal((await adminPost('/api/v1/admin/db/params/auto-album-art-per-run',
-      { autoAlbumArtPerRun: 50 }, userJwt)).status, 405);
+      { autoAlbumArtPerRun: 50 }, userJwt)).status, 403);
   });
 
   test('auto-album-art toggle ON routes through the guarded enqueue (no crash, empty 200)', async () => {
@@ -283,8 +434,8 @@ describe('POST /api/v1/admin/config/trust-proxy', () => {
     }
   });
 
-  test('rejects non-admin users with 405', async () => {
+  test('rejects non-admin users with 403', async () => {
     const r = await adminPost('/api/v1/admin/config/trust-proxy', { trustProxy: true }, userJwt);
-    assert.equal(r.status, 405);
+    assert.equal(r.status, 403);
   });
 });

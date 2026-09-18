@@ -1,113 +1,51 @@
-import jwt from 'jsonwebtoken';
-import Joi from 'joi';
-import { URL } from 'url';
-import crypto from 'crypto';
-import httpProxy from 'http-proxy';
-import * as sync from '../state/syncthing.js';
+// Peer-facing federation API (mounted behind the auth wall).
+//
+// The health/identity probe a federated peer hits to test the pairing and
+// learn what it was granted. The peer authenticates with its
+// x-federation-key header (see api/federation-auth.js), so req.user.vpaths
+// IS the key's live grant list — a grant change on this server shows up on
+// the peer's next health check without re-pairing. It also advertises the
+// discovery capability block, so a peer knows whether (and in which model
+// space) it can send vector queries (api/federation-discovery.js).
+//
+// Regular logged-in users can also hit this route; they just see their own
+// vpaths, which they already know. Harmless.
+
+import os from 'os';
+import winston from 'winston';
+import packageJson from '../../package.json' with { type: 'json' };
 import * as config from '../state/config.js';
-import * as db from '../db/manager.js';
-import { joiValidate } from '../util/validation.js';
+import * as sim from '../db/discovery-similarity.js';
+
+// What a peer needs before sending vector queries: can this server answer
+// at all, and in which model space. null = don't bother querying. The index
+// is rowversion-cached, so this is only expensive on the first call after a
+// dataset change — the same build the first similarity query would pay.
+function discoveryCapability() {
+  if (config.program.scanOptions.collectDiscoveryData !== true) { return null; }
+  let index;
+  try {
+    index = sim.getIndex();
+  } catch (err) {
+    winston.warn(`[federation] discovery capability unavailable: ${err.message}`);
+    return null;
+  }
+  if (!index || index.dim === null) { return null; }   // no store, or zero vectors
+  return {
+    modelId: index.modelId,
+    modelVersion: index.modelVersion,
+    dim: index.dim,
+    analyzedCount: index.entries.length,
+  };
+}
 
 export function setup(mstream) {
-  mstream.all('/api/v1/federation/{*path}', (req, res, next) => {
-    if (config.program.federation.enabled === false) { return res.status(405).json({ error: 'Admin API Disabled' }); }
-    if (config.program.lockAdmin === true) { return res.status(405).json({ error: 'Admin API Disabled' }); }
-    if (req.user.admin !== true) { return res.status(405).json({ error: 'Admin API Disabled' }); }
-    next();
-  });
-
-  mstream.post('/api/v1/federation/invite/accept', (req, res) => {
-    const schema = Joi.object({
-      url: Joi.string().uri().required(),
-      vpaths: Joi.array().items(Joi.string()).required(),
-      invite: Joi.string().required(),
-      accessAll: Joi.boolean().required()
-    });
-    joiValidate(schema, req.body);
-
-    const newURL = new URL(req.body.url);
-    newURL.pathname = '/federation/invite/exchange';
-
-    // const result = await axios({
-    //   method: 'post',
-    //   url: newURL.toString(),
-    //   headers: { 'accept': 'application/json' },
-    //   responseType: 'json',
-    //   data: { token: req.body.invite, federationId: sync.getId() }
-    // });
-
-    res.json({});
-  });
-
-  mstream.post('/api/v1/federation/invite/generate', (req, res) => {
-    const schema = Joi.object({
-      vpaths: Joi.array().items(Joi.string()),
-      url: Joi.string().optional()
-    });
-    joiValidate(schema, req.body);
-
-    const vPaths = {};
-    req.body.vpaths.forEach(p => {
-      if (!db.getLibraryByName(p)) { return; }
-      if(typeof sync.getPathId(p) === 'string') {
-        vPaths[p] = crypto.createHash('sha256').update(sync.getPathId(p)).digest('base64');
-      }
-    });
-
-    // Setup Token Data
-    const tokenData = {
-      federationInvite: true,
-      vPaths: vPaths,
-      username: req.user.username
-    };
-
-    if(typeof req.body.url === 'string') {
-      tokenData.url = req.body.url;
-    }
-
-    res.json({ token: jwt.sign(tokenData, config.program.secret, {}) });
-  });
-
-  mstream.get('/api/v1/federation/stats', (req, res) => {
+  mstream.get('/api/v1/federation/health', (req, res) => {
     res.json({
-      deviceId: sync.getId(),
-      uiAddress: sync.getUiAddress()
+      server: packageJson.version,
+      name: config.program.federation.serverName || os.hostname(),
+      libraries: req.user.vpaths,
+      discovery: discoveryCapability(),
     });
-  });
-
-  const apiProxy = httpProxy.createProxyServer();
-
-  apiProxy.on('proxyReq', (proxyReq, req, _res, _options) => {
-    proxyReq.path = proxyReq.path.replace('/api/v1/syncthing-proxy', '');
-
-    if (proxyReq.path.charAt(0) !== '/') {
-      proxyReq.path = '/' + proxyReq.path;
-    }
-
-    if (req.body) {
-      const bodyData = JSON.stringify(req.body);
-      // incase if content-type is application/x-www-form-urlencoded -> we need to change to application/json
-      proxyReq.setHeader('Content-Type','application/json');
-      proxyReq.setHeader('Content-Length', Buffer.byteLength(bodyData));
-      // stream the content
-      proxyReq.write(bodyData);
-    }
-  });
-
-  apiProxy.on('error', (err, req, res) => {
-    res.writeHead(500, { 'Content-Type': 'text/plain' });
-    res.end('Something went wrong. And we are reporting a custom error message.');
-  });
-
-  mstream.all('/api/v1/syncthing-proxy/{*path}', (req, res) => {
-    // Add the auth token as a cookie so all contents of the iframe use it
-    if (req.token) { res.cookie('x-access-token', req.token); }
-    apiProxy.web(req, res, {target: 'http://' + sync.getUiAddress(), changeOrigin: true});
-  });
-
-  mstream.all('/api/v1/syncthing-proxy/', (req, res) => {
-    // Add the auth token as a cookie so all contents of the iframe use it
-    if (req.token) { res.cookie('x-access-token', req.token); }
-    apiProxy.web(req, res, {target: 'http://' + sync.getUiAddress(), changeOrigin: true});
   });
 }

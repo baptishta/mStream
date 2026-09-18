@@ -13,14 +13,19 @@ function genEventId() {
   return crypto.randomBytes(12).toString('hex');
 }
 
-function getPeriodRange(period, offset) {
+// Exported for the regression test (wrapped-period-range.test.mjs).
+export function getPeriodRange(period, offset) {
   const now = new Date();
   let start, end, label;
 
   switch (period) {
     case 'weekly': {
       const weekStart = new Date(now);
-      weekStart.setDate(weekStart.getDate() - weekStart.getDay() + 1 + (offset * 7));
+      // Monday-based week, but getDay() is Sunday-based (0=Sun..6=Sat):
+      // Sunday must map to the Monday 6 days BACK, not tomorrow's Monday —
+      // the old `- getDay() + 1` put every Sunday into next week's window.
+      const daysSinceMonday = (weekStart.getDay() + 6) % 7;
+      weekStart.setDate(weekStart.getDate() - daysSinceMonday + (offset * 7));
       weekStart.setHours(0, 0, 0, 0);
       const weekEnd = new Date(weekStart);
       weekEnd.setDate(weekEnd.getDate() + 7);
@@ -68,7 +73,17 @@ function getPeriodRange(period, offset) {
     }
   }
 
-  return { start: start.toISOString(), end: end.toISOString(), label };
+  // The bounds are compared as TEXT against play_events.started_at, which
+  // SQLite writes as 'YYYY-MM-DD HH:MM:SS' (datetime('now') — UTC, space
+  // separator, no milliseconds). They MUST use that exact format: TEXT
+  // comparison is lexicographic, and toISOString()'s 'T' separator sorts
+  // AFTER ' ', so any event whose date equals the window's start date
+  // compared as before-the-window — silently dropping every play made on
+  // the first day of the period (and, mirrored at the exclusive end bound,
+  // leaking end-date plays into the previous period). Surfaced 2026-07-01,
+  // when "This Month" lost all of that day's plays.
+  const toSqliteUtc = (d) => d.toISOString().slice(0, 19).replace('T', ' ');
+  return { start: toSqliteUtc(start), end: toSqliteUtc(end), label };
 }
 
 // Parse "vpath/rel/path.mp3" with access validation
@@ -242,25 +257,43 @@ export function setup(mstream) {
     const coverage = Math.min(100, (allTimePlayed / totalTracks) * 100);
 
     // ── Listening by hour and weekday ──────────────────────────
+    // One indexed GROUP BY replaces fetching every in-period row and paying
+    // a fresh Intl.DateTimeFormat per row — that loop blocked the event
+    // loop for 8.4 s at 50k in-period events (2026-07 audit H7). strftime
+    // bins by the stored (UTC) digits, which is what the old code's
+    // local-parse-then-getHours() read back out for these
+    // 'YYYY-MM-DD HH:MM:SS' strings, so the buckets are unchanged (modulo
+    // the old path's DST artifact, where a spring-forward local hour
+    // shifted a stored 02:xx into the 03 bucket).
     const hourData = new Array(24).fill(0);
     const weekdayData = new Array(7).fill(0);
-    const timeRows = d().prepare(`
-      SELECT started_at FROM play_events
+    for (const b of d().prepare(`
+      SELECT CAST(strftime('%H', started_at) AS INTEGER) AS h,
+             CAST(strftime('%w', started_at) AS INTEGER) AS w,
+             COUNT(*) AS c
+      FROM play_events
       WHERE user_id = ? AND started_at >= ? AND started_at < ?
-    `).all(uid, start, end);
-
-    let earliestPlay = null;
-    for (const row of timeRows) {
-      try {
-        const dt = new Date(row.started_at);
-        hourData[dt.getHours()]++;
-        weekdayData[dt.getDay()]++;
-        const timeStr = dt.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
-        if (!earliestPlay || dt.getHours() < new Date('2000-01-01T' + earliestPlay).getHours()) {
-          earliestPlay = timeStr;
-        }
-      } catch (_) {}
+      GROUP BY h, w
+    `).all(uid, start, end)) {
+      if (b.h >= 0 && b.h < 24) { hourData[b.h] += b.c; }
+      if (b.w >= 0 && b.w < 7) { weekdayData[b.w] += b.c; }
     }
+
+    // Earliest time-of-day in the period. The old per-row comparison fed
+    // its own '09:13 AM' output back through `new Date('2000-01-01T…')`,
+    // got Invalid Date → NaN comparison → false, and froze on row 1 — it
+    // reported the period's FIRST event, not its earliest hour. MIN over
+    // the stored time-of-day is the intended value; the single
+    // toLocaleTimeString call keeps the exact wire format.
+    const earliestTod = d().prepare(`
+      SELECT MIN(strftime('%H:%M:%S', started_at)) AS tod
+      FROM play_events
+      WHERE user_id = ? AND started_at >= ? AND started_at < ?
+    `).get(uid, start, end)?.tod;
+    const earliestPlay = earliestTod
+      ? new Date('2000-01-01 ' + earliestTod)
+        .toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
+      : null;
 
     // ── Top listening day ──────────────────────────────────────
     const topDay = d().prepare(`
@@ -399,7 +432,6 @@ export function setup(mstream) {
     if (!candidates.length) return res.json([]);
 
     const earlyDate = new Date(candidates.sort()[0]);
-    const now = new Date();
     const periods = [];
 
     const configs = [

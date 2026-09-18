@@ -1,0 +1,381 @@
+name: Build Rust Launcher
+
+# Two duties, mirroring build-rust-parser.yml:
+#   - PR check (build + clippy on all three desktop OSes) so the crate can't
+#     bit-rot between phases.
+#   - On master pushes touching the crate: build the four shipped launcher
+#     binaries, self-test each, and COMMIT them to bin/rust-launcher/ — the
+#     bundler (scripts/build-bun.mjs) stages the launcher from there as the
+#     bundle's double-click face (mStream.exe / .app executable /
+#     mstream-desktop). Keep launcher PRs source-only; CI owns the binaries.
+#
+# Deliberately NOT built: linux-arm64 and the musl targets. Those bundles are
+# headless-leaning (Pi servers, Alpine/NAS containers) and the gtk/appindicator
+# cross-build isn't worth carrying until someone asks — build-bun.mjs ships
+# them server-only and says so.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build + self-test only; do not commit the binaries'
+        type: boolean
+        default: false
+  push:
+    branches: [master]
+    # package.json is here because build.rs stamps the Windows VersionInfo
+    # from it: the release version bump must retrigger the binary build or
+    # the shipped mStream.exe reports the PREVIOUS version in Explorer.
+    # Cheap for non-release package.json edits — the commit job no-ops when
+    # nothing changed (unix binaries don't embed the version at all, but the
+    # provenance stamp records it, so a version bump always commits).
+    # Release process (docs/deploy.md): bump WITHOUT tagging, wait for this
+    # workflow's commit, tag THAT commit — build-bun's tag build asserts the
+    # stamp's tree AND version against the tag and refuses otherwise.
+    #
+    # The two icons are launcher INPUTS that live outside rust-launcher/:
+    # build.rs embeds mstream-logo-cut.ico as the exe icon and tray_app.rs
+    # include_bytes!()s icon.png as the tray icon. Without them here an icon
+    # change never rebuilt the committed launcher — and the provenance stamp
+    # (tree + version) couldn't see it either, so a tag shipped the old icon
+    # green. Both are also recorded in the stamp (lines 3-4) for that reason.
+    paths:
+      - 'rust-launcher/**'
+      - 'package.json'
+      - 'build/mstream-logo-cut.ico'
+      - 'build/icon.png'
+      # This file too: a change to how the binaries are built, checked or
+      # STAMPED must re-land the set (e.g. a new stamp format) right away —
+      # otherwise the next tag build fails on the old stamp until an unrelated
+      # launcher push happens by. A no-op run costs a few runner-minutes.
+      - '.github/workflows/build-rust-launcher.yml'
+  pull_request:
+    paths:
+      - 'rust-launcher/**'
+      - 'package.json'
+      - 'build/mstream-logo-cut.ico'
+      - 'build/icon.png'
+      - '.github/workflows/build-rust-launcher.yml'
+
+# One run at a time per ref: two master pushes touching the crate write the
+# SAME four binary paths, and binaries can't be content-merged, so runs must
+# not overlap. Never cancel: each finished run commits a consistent set.
+# NOTE that serialization alone does not order the RESULT: a queued run still
+# checks out its own (older) trigger sha and must not clobber binaries a
+# newer run already landed — the commit job below handles that (it commits
+# onto the CURRENT master tip and stands down when newer launcher inputs
+# have already landed there), instead of rebasing a binaries commit, which
+# conflicted on every queued run.
+concurrency:
+  group: build-rust-launcher-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ── PR gate: compile + lint everywhere the launcher ships. ────────────────
+  check:
+    name: check (${{ matrix.os }})
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-launcher
+
+      - name: Build (release)
+        working-directory: rust-launcher
+        run: cargo build --release --locked
+
+      - name: Clippy
+        working-directory: rust-launcher
+        run: cargo clippy --release --locked -- -D warnings
+
+  # ── Shipped binaries: build, self-test, commit (master pushes). ───────────
+  build:
+    name: Build ${{ matrix.binary_name }}
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.runner }}
+    # linux-x64 builds inside debian:11 (glibc 2.31): a binary linked on
+    # ubuntu-latest inherits a GLIBC_2.34 floor and the shipped
+    # mstream-desktop dies at the dynamic linker — SILENTLY, Terminal=false —
+    # on Debian 11 / Ubuntu 20.04-era distros the bundle otherwise supports
+    # (the same floor build-bun.mjs works around for rust-parser with a
+    # static musl fallback; gtk makes a static launcher impractical, so we
+    # lower the link floor instead). RHEL/Rocky 8 (2.28) stays below the
+    # floor: actions' node20 runtime needs >= 2.28 itself, so bullseye is as
+    # low as a container build goes — install.md documents the floor.
+    container: ${{ matrix.container }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            binary_name: mstream-launcher-win32-x64.exe
+
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            binary_name: mstream-launcher-darwin-x64
+
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            binary_name: mstream-launcher-darwin-arm64
+
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            container: debian:11
+            binary_name: mstream-launcher-linux-x64
+    steps:
+      # Container leg first: the checkout action and rustup both need these,
+      # and a debian container starts bare (root, no sudo — none needed).
+      # zstd keeps actions/cache on its fast path inside the container.
+      - name: Install container build deps
+        if: matrix.container
+        run: |
+          apt-get update
+          apt-get install -y curl ca-certificates git build-essential pkg-config zstd \
+            libgtk-3-dev libayatana-appindicator3-dev
+
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-launcher
+          key: ${{ matrix.target }}
+
+      - name: Build
+        working-directory: rust-launcher
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Regression guard for the floor: if this leg ever loses its container
+      # (or the container image moves), fail loudly instead of shipping a
+      # launcher that dies at the dynamic linker on supported distros.
+      - name: Assert glibc floor <= 2.31
+        if: matrix.container
+        run: |
+          bin="rust-launcher/target/${{ matrix.target }}/release/mstream-launcher"
+          max=$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
+          echo "max glibc symbol version: ${max:-none}"
+          worst=$(printf '%s\n2.31\n' "$max" | sort -V | tail -1)
+          if [ -n "$max" ] && [ "$worst" != "2.31" ] && [ "$max" != "2.31" ]; then
+            echo "::error::launcher links GLIBC_$max > 2.31 — the container floor regressed"
+            exit 1
+          fi
+
+      # The launcher must stay runnable on a STOCK desktop install: its only
+      # acceptable hard runtime deps are glibc and GTK3 (universal on desktop
+      # distros). Any other NEEDED entry means a dependency grew a link-time
+      # requirement most user machines won't satisfy — exactly how tray-icon's
+      # default `libxdo` feature shipped a launcher that died at the dynamic
+      # loader (libxdo.so.3 is xdotool's lib), caught only by the v6.20.0 tag
+      # smoke. The appindicator lib is deliberately NOT allowlisted: tray-icon
+      # dlopens it at runtime, where a miss degrades to "tray unavailable"
+      # instead of a binary that won't start — the shape we want new deps to
+      # take. This can't run on the PR leg (no linux binary is built there),
+      # so it guards the shipped artifact, the one that matters.
+      - name: Assert NEEDED libs are glibc + GTK3 only
+        if: matrix.container
+        run: |
+          bin="rust-launcher/target/${{ matrix.target }}/release/mstream-launcher"
+          objdump -p "$bin" | awk '/NEEDED/{print "  NEEDED", $2}'
+          bad=""
+          for so in $(objdump -p "$bin" | awk '/NEEDED/{print $2}'); do
+            case "$so" in
+              libgtk-3.so.*|libgdk-3.so.*|libgdk_pixbuf-2.0.so.*|libcairo.so.*) ;;
+              libglib-2.0.so.*|libgobject-2.0.so.*|libgio-2.0.so.*) ;;
+              libc.so.*|libm.so.*|libdl.so.*|libpthread.so.*|librt.so.*|libgcc_s.so.*) ;;
+              *) bad="$bad $so" ;;
+            esac
+          done
+          if [ -n "$bad" ]; then
+            echo "::error::launcher hard-links non-stock libs:$bad — make the dep dlopen (like appindicator) or drop the feature that links it"
+            exit 1
+          fi
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          src="rust-launcher/target/${{ matrix.target }}/release/mstream-launcher"
+          if [[ "${{ matrix.binary_name }}" == *.exe ]]; then src="${src}.exe"; fi
+          mkdir -p staging
+          cp "$src" "staging/${{ matrix.binary_name }}"
+
+      # Gate the commit on the binary actually executing. --autostart=status
+      # runs the scriptable CLI path end to end (arg parse, auto-launch
+      # registration lookup, stdout result) with no display, no server, and no
+      # side effects — exactly what a headless runner can prove. darwin-x64
+      # runs under Rosetta on the arm64 runner, same trick rust-parser uses.
+      - name: Self-test the freshly built binary
+        shell: bash
+        run: |
+          bin="staging/${{ matrix.binary_name }}"
+          out="$("$bin" --autostart=status)"
+          echo "self-test --autostart=status -> '$out'"
+          echo "$out" | grep -qE 'enabled|disabled' \
+            || { echo "::error::self-test: launcher produced no status"; exit 1; }
+
+      # build.rs downgrades a resource-compile failure (no rc.exe/llvm-rc on
+      # the host, a moved .ico) to a cargo:warning so `cargo check` stays
+      # usable from any host — which means the SHIPPED exe could quietly lack
+      # its icon and VersionInfo, and nothing here looked. Read it back the way
+      # Windows does (Get-Item ... .VersionInfo = the Win32 version API): the
+      # contract build.rs bakes must be present, with the version package.json
+      # says. A tag build asserts the same thing later, but red HERE names the
+      # cause on the commit that produced it, not on release day.
+      - name: Assert VersionInfo was embedded (win)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $pkg = Get-Content package.json -Raw | ConvertFrom-Json
+          $parts = @(([string]$pkg.version).Split('-')[0].Split('.') | ForEach-Object { $n = 0; [void][int]::TryParse($_, [ref]$n); $n })
+          while ($parts.Count -lt 4) { $parts += 0 }
+          $want = ($parts[0..3] -join '.')
+          $v = (Get-Item "staging/${{ matrix.binary_name }}").VersionInfo
+          "ProductName='$($v.ProductName)' ProductVersion='$($v.ProductVersion)' FileVersionRaw=$($v.FileVersionRaw) CompanyName='$($v.CompanyName)' FileDescription='$($v.FileDescription)'"
+          $bad = @()
+          if ($v.ProductName -ne 'mStream') { $bad += "ProductName='$($v.ProductName)'" }
+          if ($v.ProductVersion -ne $want) { $bad += "ProductVersion='$($v.ProductVersion)' (want $want)" }
+          if ($v.FileVersionRaw.ToString() -ne $want) { $bad += "FileVersionRaw=$($v.FileVersionRaw) (want $want)" }
+          if ([string]::IsNullOrWhiteSpace($v.CompanyName)) { $bad += 'CompanyName blank' }
+          if ($bad.Count -gt 0) {
+            Write-Host "::error::the built launcher lacks its VersionInfo contract ($($bad -join '; ')) — build.rs's resource compile was skipped or wrong; see its cargo:warning in the Build step"
+            exit 1
+          }
+          Write-Host 'VersionInfo embedded and matches package.json'
+
+      # Long enough for a next-week "Re-run failed jobs" to still find its
+      # SIBLING artifacts: with 1-day retention, a re-run after that could
+      # download one fresh binary next to three expired ones and the commit job
+      # would stamp the whole set as built from this sha (it now refuses an
+      # incomplete set, see below — but a refusal costs a full re-run).
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.binary_name }}
+          path: staging/${{ matrix.binary_name }}
+          retention-days: 7
+
+  commit-binaries:
+    name: Commit binaries
+    needs: build
+    if: ${{ github.event_name != 'pull_request' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      # Into a scratch dir, NOT bin/: the inventory below must see exactly what
+      # this run built. Downloading straight over bin/ let a partial set (an
+      # expired sibling artifact after a late re-run) silently keep the
+      # previous binaries for the missing legs under a fresh stamp.
+      - name: Download all binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: staging
+          merge-multiple: true
+
+      - name: Commit and push
+        env:
+          TRIGGER_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 1. Inventory: all four shipped binaries, non-empty. Anything less
+          #    is not a set this sha built — refuse rather than stamp it.
+          missing=""
+          for name in mstream-launcher-win32-x64.exe mstream-launcher-darwin-x64 mstream-launcher-darwin-arm64 mstream-launcher-linux-x64; do
+            [ -s "staging/$name" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::not all launcher binaries were built by this run (missing:$missing) — an artifact expired or a leg was skipped; re-run ALL jobs (or dispatch the workflow), never 'failed jobs only'"
+            exit 1
+          fi
+
+          # 2. Provenance stamp, computed from the TRIGGER sha — the source
+          #    these binaries were built from — never from whatever master
+          #    tip we commit onto below:
+          #      1. rust-launcher/ tree hash
+          #      2. package.json version (build.rs bakes it into the Windows
+          #         exe's VersionInfo; a version bump changes package.json but
+          #         not the launcher tree — v6.20.1 shipped an mStream.exe
+          #         reading 6.20.0 on a tree-only stamp)
+          #      3. build/mstream-logo-cut.ico blob (the exe icon, build.rs)
+          #      4. build/icon.png blob (the tray icon, tray_app.rs)
+          #    build-bun's tag build asserts all four against the tag itself,
+          #    so a tag cut inside a rebuild window — or after an icon-only
+          #    change — is a red run with instructions instead of a stale
+          #    launcher shipped green.
+          stamp="$(mktemp)"
+          {
+            git rev-parse "$TRIGGER_SHA:rust-launcher"
+            git show "$TRIGGER_SHA:package.json" | node -pe "JSON.parse(require('fs').readFileSync(0, 'utf8')).version"
+            git rev-parse "$TRIGGER_SHA:build/mstream-logo-cut.ico"
+            git rev-parse "$TRIGGER_SHA:build/icon.png"
+          } > "$stamp"
+          echo "stamp for $TRIGGER_SHA:"; sed 's/^/  /' "$stamp"
+
+          # 3. Land on the CURRENT tip and commit there — never rebase a
+          #    binaries commit. Runs are serialized (concurrency group) but a
+          #    queued run still checks out its own, older trigger sha; rebasing
+          #    its commit onto a tip that already carries a newer run's
+          #    binaries conflicted on every file (binaries can't be merged),
+          #    the job went red, and master kept whatever was there. Instead:
+          #    fetch the tip, stand down if newer launcher INPUTS already
+          #    landed on it (the run for that newer sha owns bin/ — it has run,
+          #    or will), else put OUR set on top of the tip.
+          for attempt in 1 2 3 4 5; do
+            git fetch --depth=1 origin "$BRANCH"
+            git checkout -q --detach FETCH_HEAD
+            if ! git diff --quiet "$TRIGGER_SHA" FETCH_HEAD -- rust-launcher package.json build/mstream-logo-cut.ico build/icon.png; then
+              echo "master already carries launcher inputs newer than $TRIGGER_SHA — that push's run owns bin/rust-launcher/; standing down without committing"
+              exit 0
+            fi
+            mkdir -p bin/rust-launcher
+            cp staging/mstream-launcher-* bin/rust-launcher/
+            # Artifact zips strip the mode: restore on disk AND force 100755 in
+            # the index (a 644 launcher ships as a non-runnable file).
+            chmod +x bin/rust-launcher/mstream-launcher-*
+            cp "$stamp" bin/rust-launcher/.source-tree
+            git add bin/rust-launcher/mstream-launcher-* bin/rust-launcher/.source-tree
+            git update-index --chmod=+x bin/rust-launcher/mstream-launcher-*
+            if git diff --cached --quiet; then
+              echo "No binary changes to commit (master already has this exact set)"
+              exit 0
+            fi
+            git commit -q -m "ci: update pre-built mstream-launcher binaries"
+            if git push origin "HEAD:$BRANCH"; then
+              echo "pushed $(git rev-parse --short HEAD) onto $BRANCH"
+              exit 0
+            fi
+            # Someone (a sibling binary workflow, a merge) pushed between our
+            # fetch and our push: drop our commit and go again from the new tip.
+            echo "push rejected (attempt $attempt) — the tip moved; retrying from the new tip"
+            git reset -q --hard FETCH_HEAD
+            sleep $(( (RANDOM % 5) + 2 ))
+          done
+          echo "::error::could not push after 5 attempts"
+          exit 1

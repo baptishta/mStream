@@ -1,6 +1,10 @@
 // SQLite schema definitions and migration system for mStream.
 // Uses PRAGMA user_version for tracking which migrations have been applied.
 //
+// This module is SQL-first: the only import is the zero-dependency LRC
+// parser, which the V59 `js` hook uses to derive lyrics_search_text from
+// rows that predate the column (a computation SQL triggers can't express).
+//
 // ── TRIGGER SURVIVAL WARNING ──────────────────────────────────────────────
 // V31 attaches AFTER triggers to `tracks`, `artists`, and `albums` to keep
 // the FTS5 virtual tables (`fts_tracks`, `fts_artists`, `fts_albums`) in
@@ -11,6 +15,9 @@
 // re-create them silently breaks search on every upgrade past that
 // migration. The trigger DDL lives in SCHEMA_V31 — grep there.
 // ──────────────────────────────────────────────────────────────────────────
+
+import { lrcToSearchText } from '../api/subsonic/lrc-parser.js';
+import { HASH_GENERATION } from './audio-hash.js';
 
 // Bumped to 42 after rebasing onto master's V36 (tracks.source). The
 // torrent feature's six migrations land as V37..V42 — see
@@ -40,7 +47,41 @@
 // V52 repairs canonical-hash drift in the user-state tables: mis-keyed
 // rows re-keyed (with merge), '' hashes normalized to NULL, dead all-null
 // rows dropped, user_bookmarks gains its rekey index. See SCHEMA_V52.
-export const SCHEMA_VERSION = 52;
+// V53 adds tracks.lyrics_source (lyrics provenance, mirrors album_art_source)
+// and rebuilds fts_tracks with a denormalised `lyrics` column + recreated
+// tracks_*_fts triggers, so a song is findable by a lyric line. See SCHEMA_V53.
+// V54 adds audio_analysis_lookups — the per-track attempt cache for the
+// post-scan essentia BPM/key enrichment pass (cooldowns so undecodable /
+// low-confidence files aren't re-analysed every batch). See SCHEMA_V54.
+// V55 ingests external-service IDs from embedded tags — MusicBrainz
+// recording/release-track MBID, AcoustID, ISRC + provenance on tracks, and a
+// release-group MBID on albums (the scanners now also fill the long-existing
+// albums.mbz_album_id). See SCHEMA_V55.
+// V56 adds acoustid_lookups — the per-track attempt cache for the AcoustID
+// fingerprint identification pass (cooldowns so unmatched / undecodable
+// files aren't re-fingerprinted and re-queried every batch). See SCHEMA_V56.
+// V57 adds the federation tables — keys this server minted for read-only
+// peers (federation_keys + per-key library grants) and the remote servers
+// this server can read (federation_peers). See SCHEMA_V57.
+// V58 adds federation_peers.use_discovery — the per-peer opt-out for
+// outbound discovery-over-federation queries. See SCHEMA_V58.
+// V59 adds tracks.lyrics_search_text — the timestamp-stripped rendition of
+// synced LRC — and rebuilds fts_tracks to index it instead of raw LRC, so
+// numeric queries stop matching `[mm:ss.xx]` stamp digits. First migration
+// with a `js` hook (in-transaction JS population). See SCHEMA_V59.
+// V60 introduces threshold-hybrid sampled hashing: tracks.hash_v stamps
+// the hashing generation and hash_transitions records re-key identities.
+// See SCHEMA_V60.
+// V61 adds composite (user_id, <stat>) indexes on user_metadata so the
+// homepage-stats endpoints seek instead of scanning tracks. See SCHEMA_V61.
+// V62 adds per-key bandwidth limits + expiry on federation_keys
+// (stream_kbps / daily_mb / max_streams, 0 = unlimited; expires_at, NULL =
+// never) and the federation_key_usage per-day byte/request counters that
+// back the daily quota and the admin usage readout. See SCHEMA_V62.
+// V63 indexes cue_points.library_id and play_events.library_id so the
+// library-delete cascade seeks instead of scanning. See SCHEMA_V63.
+// V64 indexes tracks.year so the DLNA By-Year browse seeks. See SCHEMA_V64.
+export const SCHEMA_VERSION = 66;
 
 export const SCHEMA_V1 = `
   -- Users
@@ -105,9 +146,13 @@ export const SCHEMA_V1 = `
     bitrate INTEGER,
     format TEXT,
     file_size INTEGER,
-    -- file_hash is a content MD5 of the raw file bytes (hex, lowercase).
-    -- Changes on ANY byte change, including tag edits. Used for whole-file
-    -- integrity (e.g. waveform cache — bytes change → re-render).
+    -- file_hash is a content hash of the raw file bytes (hex, lowercase).
+    -- Below the 25MB sampling threshold: MD5 of every byte, changing on
+    -- ANY byte change including tag edits. At/above it (since V60 /
+    -- hash_v generation 2): a domain-prefixed sampled MD5 over three
+    -- windows + the length — see src/db/audio-hash.js — so it is NOT a
+    -- whole-file integrity checksum for big files. tracks.hash_v records
+    -- which scheme generation a row's hashes were computed under.
     --
     -- Companion column audio_hash (added in migration V14) hashes just the
     -- audio payload region, skipping tag metadata. It is the PREFERRED
@@ -683,7 +728,7 @@ export const SCHEMA_V20 = `
   --                        the same track don't enqueue twice)
   --
   -- fetched_at is ms epoch. TTL logic lives in the handler
-  -- (src/api/lyrics-lrclib.js) not here — the table just records
+  -- (src/api/lyrics-cache.js) not here — the table just records
   -- "when" and the code decides "how stale".
   CREATE TABLE IF NOT EXISTS lyrics_cache (
     audio_hash  TEXT PRIMARY KEY,
@@ -888,6 +933,11 @@ export const SCHEMA_V28 = `
   -- status:
   --   'running' — worker is alive (or was when the row was written)
   --   'success' — finished cleanly
+  --   'partial' — exited 0 but some files failed (error_message carries
+  --               the count + a sample); rendered distinctly (orange).
+  --               Counts as a scheduler attempt and as the progress
+  --               denominator; excluded only from "last successful
+  --               run" semantics
   --   'failed'  — worker errored or exited non-zero; error_message set
   --   'skipped' — another run was already in flight for this dest;
   --               recorded so the user sees why the trigger didn't
@@ -1944,6 +1994,533 @@ export const SCHEMA_V52 = `
   CREATE INDEX IF NOT EXISTS idx_user_bookmarks_hash ON user_bookmarks(track_hash);
 `;
 
+export const SCHEMA_V53 = `
+  -- ── Lyrics provenance + lyrics full-text search ──────────────────────
+  --
+  -- PART 1 (FTS-independent): tracks.lyrics_source records where a track's
+  -- lyrics came from. A future proactive lyrics backfill fills the lyrics_*
+  -- columns for lyric-less tracks; this provenance lets the scanner's UPSERT
+  -- keep a backfilled value instead of NULLing it on the next rescan — the
+  -- exact role album_art_source plays for art (V48). 'embedded'/'sidecar'
+  -- = scanner-owned (local to the file); a provider name (e.g. 'lrclib')
+  -- = backfill-owned. Backfilled here from the existing V19 lyrics columns,
+  -- computed from data already in the DB — so NOT rescanRequired. (NULL is
+  -- safe for the eventual guard too; this just makes intent explicit and
+  -- the column queryable from day one.)
+  ALTER TABLE tracks ADD COLUMN lyrics_source TEXT;
+  UPDATE tracks SET lyrics_source = CASE
+    WHEN lyrics_sidecar_mtime IS NOT NULL                              THEN 'sidecar'
+    WHEN lyrics_embedded IS NOT NULL OR lyrics_synced_lrc IS NOT NULL  THEN 'embedded'
+    ELSE NULL
+  END;
+
+  -- PART 2: add a denormalised \`lyrics\` column to fts_tracks so a song is
+  -- findable by a remembered line. FTS5 has no ALTER TABLE ADD COLUMN, so a
+  -- column add means drop + recreate + repopulate. The three tracks_*_fts
+  -- triggers carry the new value and must be recreated too (the artists_/
+  -- albums_ fan-out triggers touch only artist_name/album_name and are left
+  -- untouched; FTS5 has no external indexes to rebuild). Assumes FTS5 — same
+  -- as V31, which creates these tables unguarded; node:sqlite always bundles
+  -- it. The indexed value is COALESCE(lyrics_embedded, lyrics_synced_lrc):
+  -- plain wins, else the synced LRC text. (CORRECTION, fixed in V59: this
+  -- migration assumed the [mm:ss.xx] stamps "tokenise away". Only the
+  -- brackets/colons do — unicode61 keeps the DIGITS as tokens, so any
+  -- 2-digit query matched most synced tracks via timestamps. V59 re-points
+  -- the index at the stripped lyrics_search_text; this SQL is immutable
+  -- history and correct only as the V53→V58 state.) Mirrors the V31 backfill
+  -- join (LEFT JOIN keeps NULL-FK rows). See the trigger-survival note up top.
+  DROP TRIGGER tracks_ai_fts;
+  DROP TRIGGER tracks_au_fts;
+  DROP TRIGGER tracks_ad_fts;
+  DROP TABLE fts_tracks;
+
+  CREATE VIRTUAL TABLE fts_tracks USING fts5(
+    title, artist_name, album_name, filepath, lyrics,
+    tokenize = 'unicode61 remove_diacritics 1'
+  );
+
+  INSERT INTO fts_tracks(rowid, title, artist_name, album_name, filepath, lyrics)
+    SELECT t.id, t.title, a.name, al.name, t.filepath,
+           COALESCE(t.lyrics_embedded, t.lyrics_synced_lrc)
+    FROM tracks t
+    LEFT JOIN artists a  ON a.id  = t.artist_id
+    LEFT JOIN albums  al ON al.id = t.album_id;
+
+  CREATE TRIGGER tracks_ai_fts AFTER INSERT ON tracks BEGIN
+    INSERT INTO fts_tracks(rowid, title, artist_name, album_name, filepath, lyrics)
+    VALUES (
+      NEW.id,
+      NEW.title,
+      (SELECT name FROM artists WHERE id = NEW.artist_id),
+      (SELECT name FROM albums  WHERE id = NEW.album_id),
+      NEW.filepath,
+      COALESCE(NEW.lyrics_embedded, NEW.lyrics_synced_lrc)
+    );
+  END;
+
+  CREATE TRIGGER tracks_ad_fts AFTER DELETE ON tracks BEGIN
+    DELETE FROM fts_tracks WHERE rowid = OLD.id;
+  END;
+
+  -- lyrics_embedded / lyrics_synced_lrc join the UPDATE OF allowlist so a
+  -- lyrics write reindexes; without them the denormalised copy goes stale.
+  CREATE TRIGGER tracks_au_fts AFTER UPDATE OF title, artist_id, album_id, filepath, lyrics_embedded, lyrics_synced_lrc ON tracks BEGIN
+    UPDATE fts_tracks
+       SET title       = NEW.title,
+           artist_name = (SELECT name FROM artists WHERE id = NEW.artist_id),
+           album_name  = (SELECT name FROM albums  WHERE id = NEW.album_id),
+           filepath    = NEW.filepath,
+           lyrics      = COALESCE(NEW.lyrics_embedded, NEW.lyrics_synced_lrc)
+     WHERE rowid = NEW.id;
+  END;
+`;
+
+// V54: per-track attempt cache for the post-scan essentia BPM/key pass.
+//
+// The analysis counterpart to album_art_lookups (V51): the enrichment
+// worker (src/db/audio-analysis-backfill.mjs) decodes each track that has
+// no analysed bpm/musical_key, runs essentia, and writes a row here so a
+// file it couldn't help — undecodable (e.g. a codec ffmpeg here can't
+// handle), or one whose tempo/key estimate fell below the confidence
+// floor — isn't re-decoded on every scan batch.
+//
+// Keyed on the CANONICAL hash COALESCE(audio_hash, file_hash) — not a
+// tracks FK — exactly like lyrics_cache (V20): a cache row survives a
+// rescan that reshuffles track ids, a tag rewrite that leaves the audio
+// region untouched, and a file moving between libraries with the same
+// bytes. Rows for deleted tracks are pruned by the worker's orphan sweep.
+//
+//   outcome = 'analyzed' — got a usable bpm and/or key; the column(s) are
+//                          populated and the row records provenance + attempt
+//                          count. NOTE: when essentia resolves only ONE of
+//                          bpm/key (e.g. ambient/free-tempo material), the
+//                          other column stays NULL, so the NULL gate keeps the
+//                          track eligible; the long cooldown (analyzedCooldownSec)
+//                          then re-decodes it once per cooldown window — a known
+//                          minor inefficiency for the off-by-default pass.
+//           = 'lowconf'  — essentia ran but the estimate was below the
+//                          confidence/strength floor; long cooldown
+//           = 'error'    — decode failed / timed out; short cooldown so a
+//                          transient blip retries soon
+//
+// Starts empty; NOT rescanRequired (the pass discovers its own work from
+// the bpm/musical_key NULL gate).
+export const SCHEMA_V54 = `
+  CREATE TABLE IF NOT EXISTS audio_analysis_lookups (
+    audio_hash      TEXT PRIMARY KEY,
+    last_attempt_at INTEGER NOT NULL,
+    outcome         TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 1
+  );
+`;
+
+// ── External-service IDs (MusicBrainz / AcoustID / ISRC) — Phase 1 ────────
+//
+// Both scanners read these identifiers out of embedded tags (the same frames
+// MusicBrainz Picard / beets write) but mStream previously dropped them — only
+// the seeded "Various Artists" sentinel ever populated an mbz_* column. They
+// are now ingested verbatim; a later enrichment pass will DERIVE them for
+// badly-tagged files via acoustic fingerprinting (Chromaprint → AcoustID),
+// at which point mbz_id_source distinguishes 'tag' from 'acoustid'.
+//
+// tracks:
+//   mbz_recording_id     — MusicBrainz RECORDING MBID: the stable, cross-
+//                          release per-file identity and the anchor every
+//                          external lookup keys on (AcoustID, ListenBrainz).
+//                          Beware the historical tag-naming quirk: it lives in
+//                          ID3 UFID 'http://musicbrainz.org' / Vorbis
+//                          MUSICBRAINZ_TRACKID / MP4 'MusicBrainz Track Id'.
+//                          Both tag libraries (lofty / music-metadata) already
+//                          un-confuse this, so each scanner reads the RECORDING
+//                          id here.
+//   mbz_release_track_id — MusicBrainz (release) Track MBID: the per-release
+//                          appearance (MUSICBRAINZ_RELEASETRACKID). Release-
+//                          specific and far more volatile than the recording.
+//   acoustid_id          — AcoustID cluster UUID, when the file carries one.
+//   isrc                 — first ISRC (a recording may have several; we keep
+//                          one per file, matching the 1:1 track model).
+//   mbz_id_source        — provenance: 'tag' when any track-level id above was
+//                          read from the file. Mirrors bpm_source; reserved
+//                          for 'acoustid' from the future fingerprint pass.
+//
+// albums:
+//   mbz_release_group_id — MusicBrainz Release-Group MBID: the logical "album
+//                          across editions" — a better fit for mStream's
+//                          release-group-less album model than the release
+//                          MBID. (albums.mbz_album_id, the release MBID, has
+//                          existed since V1; the scanners now fill it too.)
+//
+// rescanRequired: true — these are tag-sourced tracks/albums columns, so an
+// upgrade force-rescans to repopulate them for already-scanned libraries
+// (same rationale as V14/V16/V18/V19). Empty columns stay valid until then.
+export const SCHEMA_V55 = `
+  ALTER TABLE tracks ADD COLUMN mbz_recording_id TEXT;
+  ALTER TABLE tracks ADD COLUMN mbz_release_track_id TEXT;
+  ALTER TABLE tracks ADD COLUMN acoustid_id TEXT;
+  ALTER TABLE tracks ADD COLUMN isrc TEXT;
+  ALTER TABLE tracks ADD COLUMN mbz_id_source TEXT;
+  ALTER TABLE albums ADD COLUMN mbz_release_group_id TEXT;
+`;
+
+// ── AcoustID lookup ledger — external-ID Phase 2 ───────────────────────────
+//
+// Failure cooldowns for the acoustid-backfill worker (mirror of V54's
+// audio_analysis_lookups): one row per canonical hash whose LAST attempt did
+// not produce a recording MBID. Success writes no row — a matched track has
+// tracks.mbz_recording_id set and drops out of the eligible set. Outcomes:
+// 'nomatch' / 'lowconf' / 'undecodable' (long cooldown), 'error' (short).
+export const SCHEMA_V56 = `
+  CREATE TABLE IF NOT EXISTS acoustid_lookups (
+    audio_hash      TEXT PRIMARY KEY,
+    last_attempt_at INTEGER NOT NULL,
+    outcome         TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 1
+  );
+`;
+
+// ── Federation (ticket-paired read-only server federation) ─────────────────
+//
+// Two sides of a pairing, deliberately separate tables:
+//
+//   federation_keys      — keys THIS server minted. A key is the credential a
+//                          remote friend server presents (x-federation-key
+//                          header + the iroh pipe handshake) for read-only
+//                          access to the granted libraries. bound_endpoint_id
+//                          is TOFU state: NULL until the first successful
+//                          pipe handshake binds the key to that dialer's iroh
+//                          EndpointId; afterwards other endpoints are
+//                          rejected, so a leaked ticket dies on redemption.
+//   federation_key_libraries — per-key library grants. A join table (not a
+//                          JSON column) so ON DELETE CASCADE keeps grants
+//                          consistent when a key or a library is deleted, and
+//                          grants survive library renames.
+//   federation_peers     — remote servers THIS server can read: their iroh
+//                          EndpointTicket and the key THEY minted for us.
+//                          last_seen/last_status cache the latest health
+//                          check for the admin UI.
+export const SCHEMA_V57 = `
+  CREATE TABLE IF NOT EXISTS federation_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    last_used TEXT,
+    bound_endpoint_id TEXT,
+    bound_at TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS federation_key_libraries (
+    key_id INTEGER NOT NULL REFERENCES federation_keys(id) ON DELETE CASCADE,
+    library_id INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+    PRIMARY KEY (key_id, library_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS federation_peers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    endpoint_ticket TEXT NOT NULL,
+    api_key TEXT NOT NULL UNIQUE,
+    added_at TEXT DEFAULT (datetime('now')),
+    last_seen TEXT,
+    last_status TEXT
+  );
+`;
+
+// ── Discovery over federation (per-peer opt-out) ────────────────────────────
+//
+// use_discovery gates the OUTBOUND direction only: whether this server sends
+// similarity queries (seed-track embedding vectors) to that peer from the
+// Discover panel. Sending a vector tells the peer what you're listening to,
+// so cautious pairings can switch it off per peer. Default ON: pairing
+// already exposes comparable activity (the peer sees every browse and
+// stream request we make against it). The INBOUND direction needs no flag —
+// answering a peer's vector query exposes nothing beyond what the key's
+// library grants already allow it to download outright.
+// V59: sampled-hash generation stamp + transition ledger.
+//
+// hash_v records which hashing generation a row's file_hash/audio_hash
+// were computed under (1 = the full-only era, 2 = threshold-hybrid
+// sampled above 25MB — see src/db/audio-hash.js). Hash EQUALITY is only
+// meaningful within one generation: move re-homing and duplicate
+// pairing must compare same-generation rows, and the boot convergence
+// check re-arms the force-rescan epoch while any row remains below the
+// current generation.
+//
+// hash_transitions is the re-key ledger: when a re-parse changes a
+// row's canonical identity (the V60 epoch does this for every file
+// above the sampling threshold), the scanner records old→new here after
+// migrating the in-DB user state. checkQueueDrainedSideEffects applies
+// the ledger to keyspaces the scanner can't reach — discovery.db's
+// embeddings/lookup ledger — then drains it. old_hash is the PK:
+// re-recording a chain step replaces cleanly, and the applier collapses
+// chains before applying. Not part of any user-facing surface.
+export const SCHEMA_V60 = `
+  ALTER TABLE tracks ADD COLUMN hash_v INTEGER NOT NULL DEFAULT 1;
+
+  -- Pre-stamp: below generation 2's sampling threshold the full-MD5
+  -- scheme is UNCHANGED, so every hash a sub-threshold row already
+  -- holds is byte-identical under gen 2 (the audio payload can never
+  -- exceed the file, so file_size < threshold bounds both hashes).
+  -- Stamping them here shrinks the re-key epoch from the whole library
+  -- to the >=25MB minority. 26214400 is DELIBERATELY a literal, not the
+  -- imported constant: this migration describes the v1->v2 transition
+  -- whose threshold is frozen at 25MB — a future threshold change is a
+  -- new generation with its own migration, never an edit here. NULL
+  -- file_size rows fail the comparison and stay v1 for the epoch.
+  UPDATE tracks SET hash_v = 2 WHERE file_size < 26214400;
+
+  -- Self-emptying partial index for the boot convergence probe
+  -- (task-queue runAfterBoot: WHERE hash_v < 2). After convergence it
+  -- indexes zero rows, making the every-boot probe O(1) instead of a
+  -- full scan of the wide tracks table — and unlike a persisted
+  -- "converged" flag it stays correct when a stale scanner writes new
+  -- below-generation rows. A future generation bump must ship a
+  -- replacement index (WHERE hash_v < N) alongside its migration.
+  CREATE INDEX IF NOT EXISTS idx_tracks_hash_v_stale
+    ON tracks(hash_v) WHERE hash_v < 2;
+
+  CREATE TABLE IF NOT EXISTS hash_transitions (
+    old_hash TEXT PRIMARY KEY,
+    new_hash TEXT NOT NULL
+  );
+`;
+
+// V61: composite (user_id, <stat>) indexes on user_metadata. They let the
+// homepage-stats endpoints (most-played / recently-played / rated) be served
+// by driving FROM user_metadata — seek this user's played/rated rows via the
+// index and order by the stat — instead of the old tracks-driven LEFT JOIN
+// that scanned the whole tracks table and sorted. Index-only, no rescan.
+export const SCHEMA_V61 = `
+  CREATE INDEX IF NOT EXISTS idx_user_metadata_user_playcount  ON user_metadata(user_id, play_count);
+  CREATE INDEX IF NOT EXISTS idx_user_metadata_user_lastplayed ON user_metadata(user_id, last_played);
+  CREATE INDEX IF NOT EXISTS idx_user_metadata_user_rating     ON user_metadata(user_id, rating);
+`;
+
+// ── Federation bandwidth limits + expiry (per minted key) ──────────────────
+//
+// Abuse control for federated readers: every response to an x-federation-key
+// request is metered (api/federation-limits.js), and the three limit columns
+// bound what one key may pull. 0 means unlimited on all three — existing
+// keys get 0 via the ALTER defaults, so upgrades change nothing until an
+// admin sets a limit.
+//
+//   stream_kbps — token-bucket rate cap shared across the key's concurrent
+//                 /media streams;
+//   daily_mb    — per-UTC-day transfer quota. Enforced with a 429 on the
+//                 byte-heavy routes only, so browse/health keep answering
+//                 and the peer's UI can say WHY playback stopped;
+//   max_streams — concurrent /media response cap.
+//
+// expires_at is a hard cutoff for the whole credential: past it, the key
+// fails the auth wall AND the iroh pipe handshake (shared `expired` check
+// computed in SQL — db/federation.js). NULL = never expires, which is what
+// every pre-V62 key gets. One semantic on purpose: it time-boxes a friend's
+// access AND quietly kills a ticket that was never redeemed, without a
+// second "redeem-by" concept. The row survives expiry so the admin can
+// renew (edit the date) or revoke; usage history stays intact. Stored in
+// SQLite's canonical UTC 'YYYY-MM-DD HH:MM:SS' via datetime(?), so
+// lexicographic comparison against datetime('now') is chronological — the
+// check never round-trips through JS Date parsing (which reads that format
+// as LOCAL time).
+//
+// federation_key_usage is the quota's memory: one row per key per UTC day,
+// written by a throttled in-process accumulator (not per request). Rows
+// older than ~90 days are pruned opportunistically by the same flusher.
+export const SCHEMA_V62 = `
+  ALTER TABLE federation_keys ADD COLUMN stream_kbps INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE federation_keys ADD COLUMN daily_mb INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE federation_keys ADD COLUMN max_streams INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE federation_keys ADD COLUMN expires_at TEXT;
+
+  CREATE TABLE IF NOT EXISTS federation_key_usage (
+    key_id INTEGER NOT NULL REFERENCES federation_keys(id) ON DELETE CASCADE,
+    day TEXT NOT NULL,
+    bytes INTEGER NOT NULL DEFAULT 0,
+    requests INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (key_id, day)
+  );
+`;
+
+// Library deletes cascade into cue_points (library_id ON DELETE CASCADE)
+// and null out play_events.library_id (ON DELETE SET NULL). Neither table
+// indexed library_id — cue_points only has it as the SECOND column of
+// idx_cue_points_file — so every library delete paid a full scan of both
+// tables, and play_events grows without bound (2026-07 audit H2; part of
+// a 5.7 s writer-lock hold at 20k tracks).
+export const SCHEMA_V63 = `
+  CREATE INDEX IF NOT EXISTS idx_cue_points_library ON cue_points(library_id);
+  CREATE INDEX IF NOT EXISTS idx_play_events_library ON play_events(library_id);
+`;
+
+// tracks.year had no index, so DLNA's "By Year" surface full-scanned the
+// table three ways: the year list (GROUP BY year), each year's child count,
+// and each year's track page (2026-07 audit). Partial because roughly the
+// only rows that matter are the tagged ones — untagged tracks are excluded
+// from every By-Year query by `year IS NOT NULL AND year > 0`, and leaving
+// them out keeps the index small on libraries with sparse year tags.
+export const SCHEMA_V64 = `
+  CREATE INDEX IF NOT EXISTS idx_tracks_year ON tracks(year) WHERE year IS NOT NULL;
+`;
+
+// Every wrapped-stats query is `WHERE user_id = ? AND started_at >= ? AND
+// started_at < ?`, and play_events grows without bound — the single-column
+// indexes (V7-era user_id, started_at) made the planner pick one and filter
+// the rest, which on a one-user server means walking the user's ENTIRE
+// listening history per stats query, ~10 queries per page view (2026-07
+// audit M2: 215 ms @13k events, 1.62 s @150k, statement-level). The
+// composite turns each into a tight range seek.
+export const SCHEMA_V65 = `
+  CREATE INDEX IF NOT EXISTS idx_play_events_user_time ON play_events(user_id, started_at);
+`;
+
+// V66: rescan marker only — no schema change, same shape as V49.
+//
+// The Rust scanner used to drop track/disc numbers written in the combined
+// "N/total" form wherever lofty's typed accessors don't split it: Vorbis
+// DISCNUMBER (FLAC/OGG/Opus) and RIFF INFO's ITRK (WAV). It now parses those
+// itself (parse_num_of in rust-parser/src/main.rs) — but only when a file is
+// actually re-parsed, and unchanged files ride the mtime fast-path. Without a
+// forced re-parse, every library scanned by an older build keeps its NULLs:
+// a multi-disc FLAC set stays interleaved and a WAV album stays in
+// alphabetical order in the album view, until the user guesses at a manual
+// force-rescan. rescanRequired writes the .rescan-pending marker so the next
+// boot runs the resumable migration rescan and repairs them automatically.
+//
+// SELECT 1 because the runner unconditionally exec()s migration SQL inside
+// its transaction — a trivial statement keeps that path uniform.
+export const SCHEMA_V66 = `
+  SELECT 1;
+`;
+
+export const SCHEMA_V58 = `
+  ALTER TABLE federation_peers ADD COLUMN use_discovery INTEGER NOT NULL DEFAULT 1;
+`;
+
+// ── Lyrics search text (timestamp-stripped index rendition) ────────────────
+//
+// V53 indexed COALESCE(lyrics_embedded, lyrics_synced_lrc) into
+// fts_tracks.lyrics on the assumption that LRC `[mm:ss.xx]` stamps
+// "tokenise away". They don't: unicode61 drops the brackets/colons but
+// keeps the DIGITS as tokens, so for synced-only tracks (sidecar .lrc +
+// most LRCLib backfill hits) any 2-digit lyric query — "22", "45" —
+// matched ~85% of them through timestamps alone, snippet() output came
+// back stamp-cluttered, and LRC header tags ([ar:], [ti:]) were indexed
+// as lyric words.
+//
+// tracks.lyrics_search_text is the fix: the plain-words rendition of
+// lyrics_synced_lrc (stamps, header tags, and enhanced-LRC inline stamps
+// stripped by lrcToSearchText — see src/api/subsonic/lrc-parser.js).
+// NULL when the track has no synced lyrics. The searchable value
+// everywhere becomes COALESCE(lyrics_embedded, lyrics_search_text):
+//   - fts_tracks.lyrics (backfill INSERT + the recreated triggers below)
+//   - the search route's LIKE fallback (src/api/search.js)
+// lyrics_embedded still wins the COALESCE untouched — plain tag text has
+// no stamps to strip (extraction diverts timed-looking payloads to the
+// synced slot), so it needs no companion column.
+//
+// WRITER CONTRACT: every code path that writes lyrics_synced_lrc MUST
+// write lyrics_search_text in the same statement, or the track silently
+// drops out of lyrics search (the triggers can't derive it — stripping
+// needs JS/Rust). Writers today: src/db/scanner.mjs upsert,
+// rust-parser/src/main.rs upsert, src/db/lyrics-backfill.mjs.
+//
+// This is the first migration with a `js` hook: deriving the column for
+// EXISTING rows is regex work SQL can't express, so the runner calls
+// migrateV59LyricsSearchText(db) inside the same per-version
+// transaction, sandwiched between this SQL (drop triggers + old index)
+// and SCHEMA_V59_FTS_REBUILD (new index + triggers) so the rebuild's
+// INSERT…SELECT reads fully-populated rows and no trigger fires during
+// population. NOT rescanRequired: derived from data already in the DB.
+export const SCHEMA_V59 = `
+  ALTER TABLE tracks ADD COLUMN lyrics_search_text TEXT;
+
+  -- Old triggers + index carry raw-LRC lyrics; both are replaced after the
+  -- js hook populates the new column. Dropping FIRST means the hook's
+  -- per-row UPDATEs sync no FTS index (fts_tracks is gone) — the rebuild
+  -- below re-reads everything in one INSERT…SELECT instead.
+  DROP TRIGGER tracks_ai_fts;
+  DROP TRIGGER tracks_au_fts;
+  DROP TRIGGER tracks_ad_fts;
+  DROP TABLE fts_tracks;
+`;
+
+// Second half of V59, exec'd by the js hook AFTER population. Same table
+// shape and trigger names as V53 — only the lyrics value source changes.
+// (Kept in a separate constant, not a second MIGRATIONS entry, so
+// user_version never points between the halves.)
+export const SCHEMA_V59_FTS_REBUILD = `
+  CREATE VIRTUAL TABLE fts_tracks USING fts5(
+    title, artist_name, album_name, filepath, lyrics,
+    tokenize = 'unicode61 remove_diacritics 1'
+  );
+
+  INSERT INTO fts_tracks(rowid, title, artist_name, album_name, filepath, lyrics)
+    SELECT t.id, t.title, a.name, al.name, t.filepath,
+           COALESCE(t.lyrics_embedded, t.lyrics_search_text)
+    FROM tracks t
+    LEFT JOIN artists a  ON a.id  = t.artist_id
+    LEFT JOIN albums  al ON al.id = t.album_id;
+
+  CREATE TRIGGER tracks_ai_fts AFTER INSERT ON tracks BEGIN
+    INSERT INTO fts_tracks(rowid, title, artist_name, album_name, filepath, lyrics)
+    VALUES (
+      NEW.id,
+      NEW.title,
+      (SELECT name FROM artists WHERE id = NEW.artist_id),
+      (SELECT name FROM albums  WHERE id = NEW.album_id),
+      NEW.filepath,
+      COALESCE(NEW.lyrics_embedded, NEW.lyrics_search_text)
+    );
+  END;
+
+  CREATE TRIGGER tracks_ad_fts AFTER DELETE ON tracks BEGIN
+    DELETE FROM fts_tracks WHERE rowid = OLD.id;
+  END;
+
+  -- lyrics_synced_lrc stays in the allowlist even though the indexed value
+  -- no longer reads it: writers change it and lyrics_search_text together,
+  -- so the extra column costs nothing on real writes but keeps the FTS row
+  -- re-COALESCEd if some future path updates synced alone.
+  CREATE TRIGGER tracks_au_fts AFTER UPDATE OF title, artist_id, album_id, filepath, lyrics_embedded, lyrics_synced_lrc, lyrics_search_text ON tracks BEGIN
+    UPDATE fts_tracks
+       SET title       = NEW.title,
+           artist_name = (SELECT name FROM artists WHERE id = NEW.artist_id),
+           album_name  = (SELECT name FROM albums  WHERE id = NEW.album_id),
+           filepath    = NEW.filepath,
+           lyrics      = COALESCE(NEW.lyrics_embedded, NEW.lyrics_search_text)
+     WHERE rowid = NEW.id;
+  END;
+`;
+
+// V59 js hook. Runs inside the migration's BEGIN IMMEDIATE…COMMIT (see
+// runMigrations in src/db/manager.js), between SCHEMA_V59 (triggers +
+// old index dropped) and the rebuild it execs at the end — so a crash
+// anywhere rolls the whole version back atomically.
+//
+// Chunked by id cursor rather than one big SELECT so memory stays flat
+// on synced-heavy libraries (each chunk's rows are fully materialised
+// before the interleaved UPDATEs, avoiding write-during-iterate on the
+// same table). Uses only prepare/all/run/exec — the surface both
+// node:sqlite and the Bun driver shim provide.
+export function migrateV59LyricsSearchText(db) {
+  const sel = db.prepare(`
+    SELECT id, lyrics_synced_lrc FROM tracks
+    WHERE lyrics_synced_lrc IS NOT NULL AND id > ?
+    ORDER BY id LIMIT 1000
+  `);
+  const upd = db.prepare('UPDATE tracks SET lyrics_search_text = ? WHERE id = ?');
+  let lastId = 0;
+  for (;;) {
+    const rows = sel.all(lastId);
+    if (rows.length === 0) { break; }
+    for (const r of rows) {
+      upd.run(lrcToSearchText(r.lyrics_synced_lrc), r.id);
+      lastId = r.id;
+    }
+  }
+  db.exec(SCHEMA_V59_FTS_REBUILD);
+}
+
 // rescanRequired: true — marks migrations that change the tracks table schema
 // and need a force rescan to populate new fields. When applied, a marker file
 // is written so the next boot triggers rescanAll() instead of scanAll().
@@ -2125,4 +2702,79 @@ export const MIGRATIONS = [
   // re-keyed with merge, '' hashes normalized, dead rows dropped) and
   // adds the bookmarks rekey index. No rescan: rows only. See SCHEMA_V52.
   { version: 52, sql: SCHEMA_V52 },
+  // V53 adds tracks.lyrics_source (lyrics provenance for the proactive
+  // lyrics backfill, mirroring album_art_source) and rebuilds fts_tracks
+  // with a denormalised `lyrics` column — plus the three recreated
+  // tracks_*_fts triggers — so a song is findable by a remembered line.
+  // lyrics_source is backfilled from the existing V19 lyrics columns and
+  // the FTS index repopulates in-migration; no rescan. See SCHEMA_V53.
+  { version: 53, sql: SCHEMA_V53 },
+  // V54 adds audio_analysis_lookups — the per-track attempt cache for the
+  // post-scan essentia BPM/key enrichment pass. Starts empty; no rescan
+  // (the pass discovers work from the bpm/musical_key NULL gate). See
+  // SCHEMA_V54.
+  { version: 54, sql: SCHEMA_V54 },
+  // V55 ingests external-service IDs (MusicBrainz recording/release-track
+  // MBID, AcoustID, ISRC + provenance) on tracks and a release-group MBID on
+  // albums — read from embedded tags by both scanners. rescanRequired so an
+  // upgrade repopulates them for already-scanned libraries. See SCHEMA_V55.
+  { version: 55, sql: SCHEMA_V55, rescanRequired: true },
+  // V56 adds the acoustid_lookups failure-cooldown ledger for the AcoustID
+  // fingerprint pass. Pure new table — no rescan needed. See SCHEMA_V56.
+  { version: 56, sql: SCHEMA_V56 },
+  // V57 adds the federation tables (minted keys + per-key library grants +
+  // known peers). Pure new tables — no rescan needed. See SCHEMA_V57.
+  { version: 57, sql: SCHEMA_V57 },
+  // V58 adds federation_peers.use_discovery, the per-peer opt-out for
+  // outbound discovery-over-federation queries. Additive column with a
+  // default — no rescan needed. See SCHEMA_V58.
+  { version: 58, sql: SCHEMA_V58 },
+  // V59 adds tracks.lyrics_search_text and re-points fts_tracks.lyrics at
+  // it, so LRC timestamp digits stop matching numeric lyric queries. The
+  // js hook populates the column from existing synced rows and execs the
+  // FTS rebuild, all inside the version's transaction. Derived from data
+  // already in the DB — no rescan needed. See SCHEMA_V59.
+  { version: 59, sql: SCHEMA_V59, js: migrateV59LyricsSearchText },
+  // V60 introduces threshold-hybrid sampled hashing: hash_v stamps which
+  // hashing generation a row's file_hash/audio_hash belong to, and
+  // hash_transitions records old→new canonical identities as rows re-key
+  // so external keyspaces (discovery.db, waveform cache) follow along.
+  // Sub-threshold rows are pre-stamped gen 2 (their hashes are unchanged
+  // by construction), so the rescanRequired epoch — which task-queue runs
+  // in generation-aware hashEpoch mode, re-parsing only below-generation
+  // rows — costs the >=25MB minority, not the whole library. Task-queue
+  // re-arms the epoch at boot while any row remains below the current
+  // generation; scanners that can't stamp the current generation are
+  // rejected by the --hash-generation capability probe (task-queue
+  // findRustParser) and the JS scanner runs instead, so a stale prebuilt
+  // binary can neither loop the epoch nor mislabel rows post-epoch.
+  // rescanEpochId marks the epoch GENERATION-SCOPED: when this is the
+  // only rescan-requiring migration in an upgrade, manager.js writes it
+  // as the marker content and the boot epoch runs in hashEpoch mode
+  // (see task-queue) instead of full force.
+  { version: 60, sql: SCHEMA_V60, rescanRequired: true,
+    rescanEpochId: `hashgen-${HASH_GENERATION}` },
+  // V61 adds composite (user_id, play_count|last_played|rating) indexes on
+  // user_metadata so the homepage-stats endpoints can be served from
+  // user_metadata instead of a full tracks scan. Index-only, no rescan.
+  { version: 61, sql: SCHEMA_V61 },
+  // V62 adds the per-key federation bandwidth limits (0 = unlimited) and
+  // expiry (NULL = never) — existing keys are untouched by both — plus the
+  // federation_key_usage per-day counters behind the daily quota. Additive
+  // columns + a new empty table — no rescan needed. See SCHEMA_V62.
+  { version: 62, sql: SCHEMA_V62 },
+  // V63 indexes the two library_id foreign keys the library-delete cascade
+  // walks. Index-only, no rescan. See SCHEMA_V63.
+  { version: 63, sql: SCHEMA_V63 },
+  // V64 indexes tracks.year for the DLNA By-Year browse. Index-only, no
+  // rescan. See SCHEMA_V64.
+  { version: 64, sql: SCHEMA_V64 },
+  // V65 indexes play_events(user_id, started_at) for the wrapped-stats
+  // period windows. Index-only, no rescan. See SCHEMA_V65.
+  { version: 65, sql: SCHEMA_V65 },
+  // V66 is a rescan marker with no schema change: rust-parser now reads
+  // track/disc numbers written as "N/total" in Vorbis DISCNUMBER and RIFF
+  // INFO, and only a re-parse can backfill the NULLs older builds left.
+  // See SCHEMA_V66.
+  { version: 66, sql: SCHEMA_V66, rescanRequired: true },
 ];

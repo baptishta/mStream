@@ -1,3 +1,14 @@
+// HTML-escape a value bound for an iziToast title/message (iziToast
+// renders both via innerHTML) or a t() interpolation param (t() does
+// not escape params, and some translation strings are intentionally
+// HTML, e.g. `Delete <b>{{username}}</b>?`). Shared by every view;
+// a few components also carry an older method-scoped copy.
+function escHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
 const ADMINDATA = (() => {
   const module = {};
 
@@ -22,6 +33,9 @@ const ADMINDATA = (() => {
   // db stuff
   module.dbParams = {};
   module.dbParamsUpdated = { ts: 0 };
+  // lyrics backfill settings (config.lyrics)
+  module.lyricsParams = {};
+  module.lyricsParamsUpdated = { ts: 0 };
   // server settings
   module.serverParams = {};
   module.serverParamsUpdated = { ts: 0 };
@@ -35,11 +49,6 @@ const ADMINDATA = (() => {
   // shared playlists
   module.sharedPlaylists = [];
   module.sharedPlaylistUpdated = { ts: 0 };
-  // federation
-  module.federationEnabled = { val: false };
-  module.federationParams = {};
-  module.federationParamsUpdated = { ts: 0 };
-  module.federationInviteToken = { val: null };
   // dlna
   module.dlnaParams = {};
   module.dlnaParamsUpdated = { ts: 0 };
@@ -49,6 +58,14 @@ const ADMINDATA = (() => {
 
   module.irohParams = {};
   module.irohParamsUpdated = { ts: 0 };
+  // federation
+  module.federationParams = {};
+  module.federationParamsUpdated = { ts: 0 };
+  module.federationKeys = { list: [] };
+  module.federationPeers = { list: [] };
+  // The key row the edit-limits modal is acting on (modals are global
+  // components, so per-row context rides shared state, not props).
+  module.federationLimitsTarget = { key: null };
   // torrent (UX-layer settings — client + whitelist gating)
   module.torrentParams = {
     client:       'disabled',
@@ -144,29 +161,39 @@ const ADMINDATA = (() => {
     }
   };
 
+  // The `.ts` stamp is what the view's spinner gates on, so it has to land
+  // even when the request fails — otherwise a failed load is indistinguishable
+  // from a slow one and the spinner runs forever. Same idiom as getDlnaParams
+  // and friends below.
   module.getFolders = async () => {
-    const res = await API.axios({
-      method: 'GET',
-      url: `${API.url()}/api/v1/admin/directories`
-    });
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/admin/directories`
+      });
 
-    Object.keys(res.data).forEach(key=>{
-      module.folders[key] = res.data[key];
-    });
-
+      Object.keys(res.data).forEach(key=>{
+        module.folders[key] = res.data[key];
+      });
+    } catch (err) {
+      console.error('failed to load directories', err);
+    }
     module.foldersUpdated.ts = Date.now();
   };
 
   module.getUsers = async () => {
-    const res = await API.axios({
-      method: 'GET',
-      url: `${API.url()}/api/v1/admin/users`
-    });
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/admin/users`
+      });
 
-    Object.keys(res.data).forEach(key=>{
-      module.users[key] = res.data[key];
-    });
-
+      Object.keys(res.data).forEach(key=>{
+        module.users[key] = res.data[key];
+      });
+    } catch (err) {
+      console.error('failed to load users', err);
+    }
     module.usersUpdated.ts = Date.now();
   };
 
@@ -183,16 +210,32 @@ const ADMINDATA = (() => {
     module.dbParamsUpdated.ts = Date.now();
   }
 
-  module.getServerParams = async () => {
+  module.getLyricsParams = async () => {
     const res = await API.axios({
       method: 'GET',
-      url: `${API.url()}/api/v1/admin/config`
+      url: `${API.url()}/api/v1/admin/lyrics`
     });
 
     Object.keys(res.data).forEach(key=>{
-      module.serverParams[key] = res.data[key];
+      module.lyricsParams[key] = res.data[key];
     });
 
+    module.lyricsParamsUpdated.ts = Date.now();
+  }
+
+  module.getServerParams = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/admin/config`
+      });
+
+      Object.keys(res.data).forEach(key=>{
+        module.serverParams[key] = res.data[key];
+      });
+    } catch (err) {
+      console.error('failed to load server config', err);
+    }
     module.serverParamsUpdated.ts = Date.now();
   }
 
@@ -221,33 +264,19 @@ const ADMINDATA = (() => {
   }
 
   module.getTranscodeParams = async () => {
-    const res = await API.axios({
-      method: 'GET',
-      url: `${API.url()}/api/v1/admin/transcode`
-    });
-
-    Object.keys(res.data).forEach(key=>{
-      module.transcodeParams[key] = res.data[key];
-    });
-
-    module.transcodeParamsUpdated.ts = Date.now();
-  }
-
-  module.getFederationParams = async () => {
     try {
       const res = await API.axios({
         method: 'GET',
-        url: `${API.url()}/api/v1/federation/stats`
+        url: `${API.url()}/api/v1/admin/transcode`
       });
-  
-      module.federationEnabled.val = true;
 
       Object.keys(res.data).forEach(key=>{
-        module.federationParams[key] = res.data[key];
+        module.transcodeParams[key] = res.data[key];
       });
-    }catch (err) {}
-
-    module.federationParamsUpdated.ts = Date.now();
+    } catch (err) {
+      console.error('failed to load transcode params', err);
+    }
+    module.transcodeParamsUpdated.ts = Date.now();
   }
 
   module.getDlnaParams = async () => {
@@ -281,6 +310,37 @@ const ADMINDATA = (() => {
       Object.keys(res.data).forEach(key => { module.irohParams[key] = res.data[key]; });
     } catch (err) {}
     module.irohParamsUpdated.ts = Date.now();
+  }
+
+  module.getFederation = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/admin/federation`
+      });
+      Object.keys(res.data).forEach(key => { module.federationParams[key] = res.data[key]; });
+    } catch (err) {}
+    module.federationParamsUpdated.ts = Date.now();
+  }
+
+  module.getFederationKeys = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/admin/federation/keys`
+      });
+      module.federationKeys.list = res.data;
+    } catch (err) {}
+  }
+
+  module.getFederationPeers = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/admin/federation/peers`
+      });
+      module.federationPeers.list = res.data;
+    } catch (err) {}
   }
 
   module.getTorrentParams = async () => {
@@ -405,7 +465,7 @@ const ADMINDATA = (() => {
   }
 
   // Jukebox status card. `available: false` means autoBootServerAudio is
-  // disabled or the rust-server-audio binary isn't reachable — the UI
+  // disabled or the mstream-player binary isn't reachable — the UI
   // hides the whole card in that case.
   module.jukeboxStatus = { available: false };
   module.jukeboxStatusUpdated = { ts: 0 };
@@ -470,7 +530,20 @@ const ADMINDATA = (() => {
         url: `${API.url()}/api`
       });
       module.version.val = res.data.server;
-    }catch (err) {} 
+    }catch (err) {}
+  }
+
+  // Release-update state (GET /api/v1/admin/update). `s` is the whole status
+  // object; the About view polls it while a download is in flight.
+  module.updateStatus = { s: null };
+  module.getUpdateStatus = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/admin/update`
+      });
+      module.updateStatus.s = res.data;
+    }catch (err) {}
   }
 
   module.getWinDrives = async () => {
@@ -500,7 +573,10 @@ const ADMINDATA = (() => {
   module.backupDestinations = [];
   module.backupDestinationsUpdated = { ts: 0 };
   module.backupStatus = { active: null, queueLength: 0 };
-  module.backupPlatform = { value: null, homedir: null };
+  // defaultExcludes is declared here (not added later) so Vue 2's
+  // observer picks it up — properties added after observation aren't
+  // reactive, and the add form watches this to seed its patterns field.
+  module.backupPlatform = { value: null, homedir: null, defaultExcludes: null };
   // Hand-off slot for backup-history-modal: the main view stashes the
   // destination row here when "History" is clicked, the modal reads it
   // on creation. Mirrors the selectedUser / sharedSelect pattern.
@@ -537,6 +613,7 @@ const ADMINDATA = (() => {
       });
       module.backupPlatform.value = res.data.platform;
       module.backupPlatform.homedir = res.data.homedir;
+      module.backupPlatform.defaultExcludes = res.data.defaultExcludes || null;
     } catch (_err) {}
   };
 
@@ -550,7 +627,6 @@ ADMINDATA.getUsers();
 ADMINDATA.getDbParams();
 ADMINDATA.getServerParams();
 ADMINDATA.getServerAudioInfo();
-ADMINDATA.getFederationParams();
 ADMINDATA.getDlnaParams();
 ADMINDATA.getSubsonicParams();
 ADMINDATA.getIroh();
@@ -694,6 +770,19 @@ I18N.onChange(() => { I18NSTATE.version += 1; });
   });
 })();
 
+// The p2p announce identity, shared between the Discovery page card
+// (loadDiscoveryP2p fills it from the status route) and the description
+// modal. One object referenced from both components' data() so a save in
+// the modal re-renders the card without a refetch. Declared BEFORE every
+// view component: a URL-hash deep-link mounts its view synchronously while
+// the tail of this file is still in the const temporal dead zone.
+const P2PIDENTITY = { serverName: '', serverDescription: '' };
+
+// Same shared-object pattern (and the same must-be-hoisted TDZ rule) for
+// the editable p2p settings: the Discovery card fills it from the status
+// route, the max-storage modal edits it.
+const P2PSETTINGS = { maxPeerDbStorageMb: 500, autoFetchCount: 6, rotationDays: 7, peerRetentionDays: 30 };
+
 const foldersView = Vue.component('folders-view', {
   data() {
     return {
@@ -792,6 +881,18 @@ const foldersView = Vue.component('folders-view', {
       }
     },
     methods: {
+      // iziToast renders title/message as HTML (its internal helper does
+      // div.innerHTML = value), and the i18n t() helper interpolates
+      // params into translation strings WITHOUT escaping (some strings
+      // are intentionally HTML, e.g. removeTitle's <b>{{folder}}</b>). So
+      // any library/vpath name or root path — admin-set, and arbitrary
+      // when created via config.json or loki migration — must be escaped
+      // before it reaches a toast title or a t() param.
+      _esc: function(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
+          '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+        }[c]));
+      },
       // V21: per-library followSymlinks flag. Default false —
       // operators opt in per library when they want the scanner to
       // traverse symlinks inside that vpath.
@@ -808,12 +909,12 @@ const foldersView = Vue.component('folders-view', {
             Vue.set(ADMINDATA.folders[vpath], 'followSymlinks', value);
           }
           iziToast.success({
-            title: `Symlink policy updated for ${vpath}`,
+            title: `Symlink policy updated for ${this._esc(vpath)}`,
             position: 'topCenter', timeout: 2500,
           });
         } catch (err) {
           iziToast.error({
-            title: `Failed: ${err.message || '?'}`,
+            title: `Failed: ${this._esc(err.message || '?')}`,
             position: 'topCenter', timeout: 3000,
           });
         }
@@ -894,7 +995,11 @@ const foldersView = Vue.component('folders-view', {
           zindex: 99999,
           layout: 2,
           maxWidth: 600,
-          title: t('admin.folders.removeTitle', { folder: folder }),
+          // Escape the folder (a library root path — admin-set, possibly
+          // HTML-bearing) BEFORE interpolation: t() does not escape params
+          // and removeTitle is intentionally HTML (<b>{{folder}}</b>), so
+          // escaping the whole result would show a literal <b> instead.
+          title: t('admin.folders.removeTitle', { folder: this._esc(folder) }),
           message: t('admin.folders.removeMessage'),
           position: 'center',
           buttons: [
@@ -1121,7 +1226,10 @@ const usersView = Vue.component('users-view', {
           displayMode: 'once',
           id: 'question',
           zindex: 99999,
-          title: t('admin.users.deleteTitle', { username: username }),
+          // Escape BEFORE interpolation: t() doesn't escape params and
+          // deleteTitle is intentionally HTML (`Delete <b>{{username}}</b>?`);
+          // usernames have no server-side character validation.
+          title: t('admin.users.deleteTitle', { username: escHtml(username) }),
           position: 'center',
           buttons: [
             [`<button><b>${t('admin.users.deleteButton')}</b></button>`, async (instance, toast) => {
@@ -1227,7 +1335,7 @@ const advancedView = Vue.component('advanced-view', {
   computed: {
     activePlayerLabel: function() {
       if (!this.audioInfo.backend) { return 'None'; }
-      if (this.audioInfo.backend === 'rust') { return 'rust-server-audio (native)'; }
+      if (this.audioInfo.backend === 'rust') { return 'mstream-player (native)'; }
       if (this.audioInfo.backend === 'cli') { return (this.audioInfo.player || 'cli') + ' (CLI fallback)'; }
       return this.audioInfo.player || 'Unknown';
     },
@@ -1861,11 +1969,25 @@ const dbView = Vue.component('db-view', {
   data() {
     return {
       dbParams: ADMINDATA.dbParams,
-      dbStats: '',
       sharedPlaylists: ADMINDATA.sharedPlaylists,
       sharedPlaylistsTS: ADMINDATA.sharedPlaylistUpdated,
-      isPullingStats: false,
-      isPullingShared: false
+      isPullingShared: false,
+      // Latest GET /api/v1/scan/status payload (queue + per-pass
+      // enrichment status + coverage). Null until the first poll lands;
+      // stale-but-shown on transient poll failures (same philosophy as
+      // the player's scan-progress widget — a blip shouldn't blank the
+      // panel).
+      enrichStatus: null,
+      // Live per-library rows from GET /api/v1/scan/progress — empty
+      // between scans. Rendered in the Scan Queue & Stats card so the
+      // page that starts a scan also shows it moving (the player top
+      // bar renders the same rows for everyone else).
+      scanProgress: [],
+      // Local mirror of config.lyrics.backfill for the card's lyrics
+      // switch — same late-added-key reactivity dodge lyrics-view uses
+      // (ADMINDATA.lyricsParams gains keys after this component has
+      // already observed the bare object).
+      lyricsBackfill: false
     };
   },
   template: `
@@ -1904,15 +2026,60 @@ const dbView = Vue.component('db-view', {
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Generate waveforms after scans:</b> {{dbParams.generateWaveforms}}</td>
+                      <td><b>BPM/key tracks analysed per pass:</b> {{dbParams.analyzeBpmPerRun}}</td>
                       <td>
-                        [<a v-on:click="toggleGenerateWaveforms()">{{ t('admin.settings.edit') }}</a>]
+                        [<a v-on:click="openModal('edit-analyze-bpm-per-run-modal')">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Analyse BPM + key (deprecated — no effect until the essentia scanner ships):</b> {{dbParams.analyzeBpm}}</td>
+                      <td><b>BPM estimation method:</b> {{dbParams.analyzeBpmMethod}}</td>
                       <td>
-                        [<a v-on:click="toggleAnalyzeBpm()">{{ t('admin.settings.edit') }}</a>]
+                        [<a v-on:click="openModal('edit-analyze-bpm-method-modal')">{{ t('admin.settings.edit') }}</a>]
+                      </td>
+                    </tr>
+                    <tr>
+                      <td><b>BPM/key analysis window (seconds, 0 = whole file):</b> {{dbParams.analyzeBpmWindowSec}}</td>
+                      <td>
+                        [<a v-on:click="openModal('edit-analyze-bpm-window-sec-modal')">{{ t('admin.settings.edit') }}</a>]
+                      </td>
+                    </tr>
+                    <tr>
+                      <td><b>Ignore dot-hidden files (.name.mp3) when scanning:</b> {{dbParams.ignoreDotFiles}}</td>
+                      <td>
+                        [<a v-on:click="toggleIgnoreDotFiles()">{{ t('admin.settings.edit') }}</a>]
+                      </td>
+                    </tr>
+                    <tr>
+                      <td><b>Ignore dot-hidden folders (.name/) when scanning:</b> {{dbParams.ignoreDotFolders}}</td>
+                      <td>
+                        [<a v-on:click="toggleIgnoreDotFolders()">{{ t('admin.settings.edit') }}</a>]
+                      </td>
+                    </tr>
+                    <tr>
+                      <td><b>Watch libraries for changes (instant scans, local disks):</b> {{dbParams.watcherEnabled}}</td>
+                      <td>
+                        [<a v-on:click="toggleWatcherEnabled()">{{ t('admin.settings.edit') }}</a>]
+                      </td>
+                    </tr>
+                    <tr>
+                      <td><b>Tracks identified per AcoustID pass:</b> {{dbParams.acoustidPerRun}}</td>
+                      <td>
+                        [<a v-on:click="openModal('edit-acoustid-per-run-modal')">{{ t('admin.settings.edit') }}</a>]
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        <b>Discovery embedding model:</b> {{dbParams.discoveryModel}}
+                        <span v-if="dbParams.discoveryModel === 'effnet-discogs'"> — Discogs-EffNet by MTG-UPF (CC BY-NC-SA 4.0, non-commercial)</span>
+                      </td>
+                      <td>
+                        [<a v-on:click="exportDiscoveryData()">Export</a>]
+                      </td>
+                    </tr>
+                    <tr>
+                      <td><b>Discovery tracks embedded per pass:</b> {{dbParams.discoveryPerRun}}</td>
+                      <td>
+                        [<a v-on:click="openModal('edit-discovery-per-run-modal')">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                   </tbody>
@@ -1926,12 +2093,6 @@ const dbView = Vue.component('db-view', {
                 <span class="card-title">{{ t('admin.db.albumArtLookup') }}</span>
                 <table>
                   <tbody>
-                    <tr>
-                      <td><b>{{ t('admin.db.autoLookup') }}</b> {{ dbParams.autoAlbumArt ? t('admin.settings.enabled') : t('admin.settings.disabled') }}</td>
-                      <td>
-                        [<a v-on:click="toggleAutoAlbumArt()">{{ t('admin.settings.edit') }}</a>]
-                      </td>
-                    </tr>
                     <tr>
                       <td><b>{{ t('admin.db.autoArtMode') }}</b> {{ dbParams.autoAlbumArtMode === 'all' ? t('admin.db.autoArtModeAll') : t('admin.db.autoArtModeMissing') }}</td>
                       <td>
@@ -1979,15 +2140,87 @@ const dbView = Vue.component('db-view', {
             <div class="card">
               <div class="card-content">
                 <span class="card-title">{{ t('admin.db.scanQueueStats') }}</span>
+                <p v-if="enrichStatus">
+                  <template v-if="enrichStatus.queue.activeTask">
+                    Now running: <b>{{ passLabel(enrichStatus.queue.activeTask) }}</b><span v-if="enrichStatus.queue.queued.length"> · {{ enrichStatus.queue.queued.length }} queued ({{ enrichStatus.queue.queued.map(passLabel).join(', ') }})</span>
+                  </template>
+                  <template v-else-if="enrichStatus.queue.queued.length">
+                    {{ enrichStatus.queue.queued.length }} queued ({{ enrichStatus.queue.queued.map(passLabel).join(', ') }})
+                  </template>
+                  <template v-else>
+                    Task queue idle<span v-if="enrichStatus.totals"> · {{ enrichStatus.totals.tracks.toLocaleString() }} tracks indexed</span>
+                  </template>
+                </p>
+                <div v-for="sp in scanProgress" v-bind:key="sp.vpath" class="enrich-scan-row">
+                  <div class="enrich-scan-head">
+                    <b>{{ sp.vpath }}</b>
+                    <span class="enrich-scan-pct">{{ sp.pct != null ? sp.pct + '%' : 'Counting…' }}</span>
+                    <span class="enrich-muted">{{ sp.expected ? sp.scanned.toLocaleString() + ' / ' + sp.expected.toLocaleString() : sp.scanned.toLocaleString() + ' files' }}</span>
+                  </div>
+                  <div class="enrich-bar enrich-bar-scan">
+                    <div v-if="sp.pct != null" class="enrich-bar-fill" v-bind:style="{ width: sp.pct + '%' }"></div>
+                    <div v-else class="enrich-bar-ind"></div>
+                  </div>
+                  <div v-if="sp.currentFile" class="enrich-muted enrich-scan-file">{{ sp.currentFile }}</div>
+                </div>
                 <a v-on:click="scanDB" class="waves-effect waves-light btn">{{ t('admin.db.startScan') }}</a>
                 <a v-on:click="forceRescan" class="waves-effect waves-light btn orange">{{ t('admin.db.forceRescan') }}</a>
-                <a v-on:click="pullStats" class="waves-effect waves-light btn">{{ t('admin.db.pullStats') }}</a>
-                <div v-if="isPullingStats === true">
-                  <svg class="spinner" width="65px" height="65px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
-                </div>
-                <pre v-else>
-                  {{dbStats}}
-                </pre>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="col s12">
+            <div class="card">
+              <div class="card-content">
+                <span class="card-title">Enrichment Status</span>
+                <p v-if="!enrichStatus" class="enrich-muted">Loading…</p>
+                <template v-else>
+                  <table class="enrich-table">
+                    <thead>
+                      <tr>
+                        <th>Pass</th>
+                        <th>Enabled</th>
+                        <th>Status</th>
+                        <th>Last run</th>
+                        <th>Coverage</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="p in enrichStatus.enrichment" v-bind:key="p.pass">
+                        <td><b>{{ passLabel(p.pass) }}</b></td>
+                        <td>
+                          <div class="switch enrich-switch">
+                            <label>
+                              <input type="checkbox" v-bind:checked="passEnabled(p.pass)" v-on:click.prevent="togglePass(p.pass)">
+                              <span class="lever"></span>
+                            </label>
+                          </div>
+                        </td>
+                        <td>
+                          <span class="enrich-badge" v-bind:class="'enrich-badge-' + p.state">{{ stateLabel(p) }}</span>
+                          <div v-if="p.state === 'running' && p.progress && p.progress.total" class="enrich-bar">
+                            <div class="enrich-bar-fill" v-bind:style="{ width: pctOf(p.progress.attempted, p.progress.total) + '%' }"></div>
+                          </div>
+                          <span v-if="p.state === 'running' && p.progress" class="enrich-muted">{{ p.progress.attempted.toLocaleString() }} / {{ p.progress.total ? p.progress.total.toLocaleString() : '?' }}</span>
+                        </td>
+                        <td>
+                          <span v-if="p.lastRun" v-bind:class="{ 'enrich-failed': p.lastRun.outcome === 'failed' }">{{ lastRunSummary(p.lastRun) }}</span>
+                          <span v-else class="enrich-muted">—</span>
+                        </td>
+                        <td>
+                          <template v-if="p.coverage">
+                            <div class="enrich-bar enrich-bar-coverage">
+                              <div class="enrich-bar-fill" v-bind:style="{ width: pctOf(p.coverage.done, p.coverage.done + p.coverage.remaining) + '%' }"></div>
+                            </div>
+                            {{ p.coverage.done.toLocaleString() }} / {{ (p.coverage.done + p.coverage.remaining).toLocaleString() }} {{ p.coverage.unit }}<span class="enrich-muted">{{ outcomesSummary(p.coverage.outcomes) }}</span>
+                          </template>
+                          <span v-else class="enrich-muted">—</span>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </template>
               </div>
             </div>
           </div>
@@ -2036,25 +2269,6 @@ const dbView = Vue.component('db-view', {
       </div>
     </div>`,
   methods: {
-    pullStats: async function() {
-      try {
-        this.isPullingStats = true;
-        const res = await API.axios({
-          method: 'GET',
-          url: `${API.url()}/api/v1/admin/db/scan/stats`
-        });
-
-        this.dbStats = res.data
-      } catch (err) {
-        iziToast.error({
-          title: t('admin.db.pullDataFailed'),
-          position: 'topCenter',
-          timeout: 3500
-        });
-      } finally {
-        this.isPullingStats = false;
-      }
-    },
     loadShared: async function() {
       try {
         this.isPullingShared = true;
@@ -2355,6 +2569,143 @@ const dbView = Vue.component('db-view', {
         ]
       });
     },
+    // Dot-entry ignore toggles. Applied on the NEXT scan: enabling
+    // removes already-indexed dot-hidden entries (the sweep converges
+    // them out); disabling brings them back on the next scan. Names
+    // starting with '..' are never treated as hidden.
+    toggleIgnoreDot: function(field, route, noun) {
+      iziToast.question({
+        timeout: 20000,
+        close: false,
+        overlayClose: true,
+        overlay: true,
+        displayMode: 'once',
+        id: 'question',
+        zindex: 99999,
+        layout: 2,
+        maxWidth: 600,
+        title: `<b>${this.dbParams[field] === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')} ignoring dot-hidden ${noun}?</b>`,
+        message: 'Takes effect on the next scan; already-indexed matching entries are removed (or re-added) then.',
+        position: 'center',
+        buttons: [
+          [`<button><b>${this.dbParams[field] === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')}</b></button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+            API.axios({
+              method: 'POST',
+              url: `${API.url()}/api/v1/admin/db/params/${route}`,
+              data: { [field]: !this.dbParams[field] }
+            }).then(() => {
+              Vue.set(ADMINDATA.dbParams, field, !this.dbParams[field]);
+              iziToast.success({
+                title: t('admin.settings.updated'),
+                position: 'topCenter',
+                timeout: 3500
+              });
+            }).catch(() => {
+              iziToast.error({
+                title: t('admin.settings.failed'),
+                position: 'topCenter',
+                timeout: 3500
+              });
+            });
+          }, true],
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+          }],
+        ]
+      });
+    },
+    toggleIgnoreDotFiles: function() {
+      this.toggleIgnoreDot('ignoreDotFiles', 'ignore-dot-files', 'files');
+    },
+    toggleIgnoreDotFolders: function() {
+      this.toggleIgnoreDot('ignoreDotFolders', 'ignore-dot-folders', 'folders');
+    },
+    // Filesystem-watcher toggle. Live: the server starts/stops the
+    // watchers on POST — no reboot. Same confirm-toast pattern as the
+    // other boolean scan params.
+    toggleWatcherEnabled: function() {
+      iziToast.question({
+        timeout: 20000,
+        close: false,
+        overlayClose: true,
+        overlay: true,
+        displayMode: 'once',
+        id: 'question',
+        zindex: 99999,
+        layout: 2,
+        maxWidth: 600,
+        title: `<b>${this.dbParams.watcherEnabled === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')} watching libraries for changes?</b>`,
+        message: 'Changed files trigger a targeted scan within seconds. Network mounts (NAS shares) usually emit no change events — the scheduled scan interval still covers those.',
+        position: 'center',
+        buttons: [
+          [`<button><b>${this.dbParams.watcherEnabled === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')}</b></button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+            API.axios({
+              method: 'POST',
+              url: `${API.url()}/api/v1/admin/db/params/watcher-enabled`,
+              data: { watcherEnabled: !this.dbParams.watcherEnabled }
+            }).then(() => {
+              Vue.set(ADMINDATA.dbParams, 'watcherEnabled', !this.dbParams.watcherEnabled);
+              iziToast.success({
+                title: t('admin.settings.updated'),
+                position: 'topCenter',
+                timeout: 3500
+              });
+            }).catch(() => {
+              iziToast.error({
+                title: t('admin.settings.failed'),
+                position: 'topCenter',
+                timeout: 3500
+              });
+            });
+          }, true],
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+          }],
+        ]
+      });
+    },
+    toggleAnalyzeAcoustid: function() {
+      iziToast.question({
+        timeout: false,
+        close: false,
+        overlay: true,
+        displayMode: 'once',
+        id: 'question',
+        zindex: 99999,
+        layout: 2,
+        maxWidth: 600,
+        title: `<b>${this.dbParams.analyzeAcoustid === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')} AcoustID identification? (post-scan; sends acoustic fingerprints of un-identified tracks to api.acoustid.org and fills in MusicBrainz recording IDs)</b>`,
+        position: 'center',
+        buttons: [
+          [`<button><b>${this.dbParams.analyzeAcoustid === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')}</b></button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+            API.axios({
+              method: 'POST',
+              url: `${API.url()}/api/v1/admin/db/params/analyze-acoustid`,
+              data: { analyzeAcoustid: !this.dbParams.analyzeAcoustid }
+            }).then(() => {
+              Vue.set(ADMINDATA.dbParams, 'analyzeAcoustid', !this.dbParams.analyzeAcoustid);
+              iziToast.success({
+                title: t('admin.settings.updated'),
+                position: 'topCenter',
+                timeout: 3500
+              });
+            }).catch(() => {
+              iziToast.error({
+                title: t('admin.settings.failed'),
+                position: 'topCenter',
+                timeout: 3500
+              });
+            });
+          }, true],
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+          }],
+        ]
+      });
+    },
     toggleAnalyzeBpm: function() {
       // DEPRECATED — currently a no-op: scan-time BPM/key analysis was
       // removed with scan-time decode and returns as the separate
@@ -2372,7 +2723,7 @@ const dbView = Vue.component('db-view', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: `<b>${this.dbParams.analyzeBpm === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')} BPM + key detection? (deprecated — no effect until the essentia scanner ships)</b>`,
+        title: `<b>${this.dbParams.analyzeBpm === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')} essentia BPM + key analysis? (post-scan, CPU-heavy — runs in the background and fills tracks with no BPM/key tag)</b>`,
         position: 'center',
         buttons: [
           [`<button><b>${this.dbParams.analyzeBpm === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')}</b></button>`, (instance, toast) => {
@@ -2400,6 +2751,70 @@ const dbView = Vue.component('db-view', {
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
           }],
         ]
+      });
+    },
+    toggleCollectDiscoveryData: function() {
+      iziToast.question({
+        timeout: 20000,
+        close: false,
+        overlayClose: true,
+        overlay: true,
+        displayMode: 'once',
+        id: 'question',
+        zindex: 99999,
+        layout: 2,
+        maxWidth: 600,
+        title: `<b>${this.dbParams.collectDiscoveryData === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')} music-discovery data collection? (stores per-track audio fingerprint IDs + embeddings in a separate discovery.db you can export; disabling keeps existing data — but if the discovery network is enabled, new music will stop reaching your published snapshot)</b>`,
+        position: 'center',
+        buttons: [
+          [`<button><b>${this.dbParams.collectDiscoveryData === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')}</b></button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+            API.axios({
+              method: 'POST',
+              url: `${API.url()}/api/v1/admin/db/params/collect-discovery-data`,
+              data: { collectDiscoveryData: !this.dbParams.collectDiscoveryData }
+            }).then(() => {
+              Vue.set(ADMINDATA.dbParams, 'collectDiscoveryData', !this.dbParams.collectDiscoveryData);
+              iziToast.success({
+                title: t('admin.settings.updated'),
+                position: 'topCenter',
+                timeout: 3500
+              });
+            }).catch(() => {
+              iziToast.error({
+                title: t('admin.settings.failed'),
+                position: 'topCenter',
+                timeout: 3500
+              });
+            });
+          }, true],
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+          }],
+        ]
+      });
+    },
+    exportDiscoveryData: function() {
+      // Build a fresh snapshot, then pull it down. The endpoint 404s until
+      // collection has been enabled at least once.
+      API.axios({
+        method: 'POST',
+        url: `${API.url()}/api/v1/admin/db/discovery-export`
+      }).then((response) => {
+        iziToast.success({
+          title: `Discovery export ready: ${response.data.rowCount} tracks`,
+          position: 'topCenter',
+          timeout: 3500
+        });
+        window.location.href = `${API.url()}/api/v1/admin/db/discovery-export/download?token=${API.token()}`;
+      }).catch((err) => {
+        iziToast.error({
+          title: (err && err.response && err.response.status === 404)
+            ? 'Enable music-discovery data collection first'
+            : t('admin.settings.failed'),
+          position: 'topCenter',
+          timeout: 3500
+        });
       });
     },
     toggleSkipImg: function() {
@@ -2495,8 +2910,267 @@ const dbView = Vue.component('db-view', {
     openModal: function(modalView) {
       modVM.currentViewModal = modalView;
       M.Modal.getInstance(document.getElementById('admin-modal')).open();
+    },
+    fetchEnrichStatus: async function() {
+      // Two GETs per tick: /scan/status (queue + passes + coverage) and
+      // /scan/progress (live per-library rows, empty between scans).
+      // Guarded separately so a transient failure on one keeps the other
+      // fresh; both keep their last snapshot through failures rather
+      // than toasting every few seconds.
+      const [status, progress] = await Promise.allSettled([
+        API.axios({ method: 'GET', url: `${API.url()}/api/v1/scan/status` }),
+        API.axios({ method: 'GET', url: `${API.url()}/api/v1/scan/progress` }),
+      ]);
+      if (status.status === 'fulfilled') { this.enrichStatus = status.value.data; }
+      if (progress.status === 'fulfilled' && Array.isArray(progress.value.data)) {
+        this.scanProgress = progress.value.data;
+      }
+    },
+    passLabel: function(kind) {
+      return {
+        scan: 'Library Scan',
+        backup: 'Backup',
+        waveform: 'Waveforms',
+        albumart: 'Album Art',
+        lyrics: 'Lyrics',
+        audioanalysis: 'BPM / Key',
+        discovery: 'Discovery Embeddings',
+        acoustid: 'AcoustID IDs',
+      }[kind] || kind;
+    },
+    // The card's per-pass switches bind to the CONFIG toggle for each
+    // pass, not the status API's combined gate — a pass switched on but
+    // blocked by its environment keeps its switch on while the badge
+    // explains ("Off — waiting for ffmpeg"). Lyrics is the odd one out:
+    // its toggle lives in config.lyrics, mirrored in lyricsBackfill.
+    passEnabled: function(kind) {
+      if (kind === 'lyrics') { return this.lyricsBackfill === true; }
+      return this.dbParams[{
+        waveform: 'generateWaveforms',
+        albumart: 'autoAlbumArt',
+        audioanalysis: 'analyzeBpm',
+        discovery: 'collectDiscoveryData',
+        acoustid: 'analyzeAcoustid',
+      }[kind]] === true;
+    },
+    // Dispatch to the same handlers the old settings rows used —
+    // passes with side effects worth a beat of thought (CPU-heavy BPM,
+    // external AcoustID calls, discovery collection) keep their
+    // confirm dialogs; album art and lyrics flip directly. The switch
+    // renders from config state, so it only visibly flips after the
+    // POST (and any confirm) succeeds.
+    togglePass: function(kind) {
+      ({
+        waveform: this.toggleGenerateWaveforms,
+        albumart: this.toggleAutoAlbumArt,
+        lyrics: this.toggleLyricsBackfill,
+        audioanalysis: this.toggleAnalyzeBpm,
+        discovery: this.toggleCollectDiscoveryData,
+        acoustid: this.toggleAnalyzeAcoustid,
+      }[kind]).call(this);
+    },
+    toggleLyricsBackfill: function() {
+      const next = !this.lyricsBackfill;
+      API.axios({
+        method: 'POST',
+        url: `${API.url()}/api/v1/admin/lyrics/backfill`,
+        data: { backfill: next }
+      }).then(() => {
+        this.lyricsBackfill = next;
+        Vue.set(ADMINDATA.lyricsParams, 'backfill', next);
+        iziToast.success({ title: t('admin.settings.updated'), position: 'topCenter', timeout: 3500 });
+      }).catch(() => {
+        iziToast.error({ title: t('admin.settings.failed'), position: 'topCenter', timeout: 3500 });
+      });
+    },
+    stateLabel: function(p) {
+      if (p.state === 'disabled') {
+        // Config-off is the unremarkable case — keep the badge terse.
+        // Environment reasons are the surprising ones worth spelling out.
+        if (p.disabledReason === 'config') { return 'Off'; }
+        const reason = {
+          'no-ffmpeg': 'waiting for ffmpeg',
+          'no-api-key': 'no API key',
+          'no-binary': 'rust-parser unavailable',
+          'binary-unsupported': 'rust-parser outdated',
+          'runtime-unavailable': 'ML runtime unavailable',
+        }[p.disabledReason] || p.disabledReason;
+        return `Off — ${reason}`;
+      }
+      const base = { idle: 'Idle', queued: 'Queued', running: 'Running' }[p.state] || p.state;
+      // A pass can be ENABLED and still degraded — the waveform pass runs
+      // its ffmpeg half while the rust half sits out on a generation
+      // mismatch. Without this the badge read plain "Idle", identical to a
+      // healthy server, and the operator had no way to see that half the
+      // producer never runs.
+      if (p.enabled && p.disabledReason) {
+        const why = {
+          'binary-generation-mismatch': 'rust-parser outdated (ffmpeg half only)',
+        }[p.disabledReason] || p.disabledReason;
+        return `${base} — ${why}`;
+      }
+      return base;
+    },
+    pctOf: function(part, whole) {
+      if (!whole) { return 0; }
+      return Math.min(100, Math.round((part / whole) * 100));
+    },
+    // "45 fetched · 3 not found · 1 error" from a lastRun.counts /
+    // coverage.outcomes object. Vocabulary differs per pass; unknown keys
+    // fall through verbatim so a new worker counter still renders.
+    countsSummary: function(counts) {
+      const labels = {
+        generated: 'generated', updated: 'fetched', deduped: 'already had',
+        analyzed: 'analysed', embedded: 'embedded', matched: 'identified',
+        found: 'found', hit: 'found',
+        notFound: 'not found', notfound: 'not found', nomatch: 'no match',
+        lowconf: 'low-confidence', undecodable: 'undecodable',
+        failed: 'failed', errors: 'errors', error: 'errors',
+        attempted: 'attempted', total: 'planned',
+      };
+      return Object.entries(counts || {})
+        .filter(([k, v]) => v > 0 && k !== 'attempted' && k !== 'total')
+        .map(([k, v]) => `${v.toLocaleString()} ${labels[k] || k}`)
+        .join(' · ');
+    },
+    outcomesSummary: function(outcomes) {
+      const s = this.countsSummary(outcomes);
+      return s ? ` · ${s}` : '';
+    },
+    lastRunSummary: function(lastRun) {
+      const head = { completed: 'Completed', failed: 'FAILED', killed: 'Stopped' }[lastRun.outcome] || lastRun.outcome;
+      const ago = this.timeAgo(lastRun.finishedAt);
+      const counts = this.countsSummary(lastRun.counts);
+      const tail = counts || (lastRun.outcome === 'completed' ? 'nothing to do' : '');
+      return `${head} ${ago}${tail ? ' — ' + tail : ''}${lastRun.hitCap ? ' · more queued' : ''}`;
+    },
+    timeAgo: function(epochMs) {
+      const s = Math.max(0, Math.round((Date.now() - epochMs) / 1000));
+      if (s < 60) { return 'just now'; }
+      if (s < 3600) { return `${Math.round(s / 60)}m ago`; }
+      if (s < 86400) { return `${Math.round(s / 3600)}h ago`; }
+      return `${Math.round(s / 86400)}d ago`;
     }
+  },
+  created: function() {
+    this.fetchEnrichStatus();
+    // 4s keeps the running pass's progress feeling live without leaning
+    // on the server: the endpoint's coverage counts are memoised
+    // server-side, so a poll between passes is two cheap map reads.
+    this.enrichTimer = setInterval(() => { this.fetchEnrichStatus(); }, 4000);
+    // Seed the card's lyrics switch. Until (or if never) resolved the
+    // switch just shows off — the badge still tells the truth from the
+    // status poll.
+    ADMINDATA.getLyricsParams().then(() => {
+      this.lyricsBackfill = ADMINDATA.lyricsParams.backfill === true;
+    }).catch(() => { /* toggle stays off; badge still accurate */ });
+  },
+  beforeDestroy: function() {
+    if (this.enrichTimer) { clearInterval(this.enrichTimer); }
   }
+});
+
+const lyricsView = Vue.component('lyrics-view', {
+  data() {
+    return {
+      loaded: false,
+      // Local mirrors of config.lyrics, populated in created() so the
+      // template binds to reactive data fields (not late-added keys on
+      // the shared ADMINDATA object). The backfill on/off switch lives
+      // in the Database view's Enrichment Status card.
+      writeSidecar: false,
+      providers: { lrclib: true, netease: false, kugou: false },
+    };
+  },
+  template: `
+    <div>
+      <div class="container">
+        <div class="row">
+          <div class="col s12">
+            <div class="card">
+              <div class="card-content">
+                <span class="card-title">Lyrics Backfill</span>
+                <p>After each library scan, proactively look up lyrics for tracks that don't already have them (from their tags or a sidecar file). Off by default — the on/off switch lives in Database &rarr; Enrichment Status.</p>
+                <table v-if="loaded">
+                  <tbody>
+                    <tr>
+                      <td><b>Write fetched lyrics to sidecar files (.lrc next to each track):</b> {{ writeSidecar ? 'Enabled' : 'Disabled' }}</td>
+                      <td>
+                        [<a v-on:click="toggleWriteSidecar()">edit</a>]
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+          <div class="col s12">
+            <div class="card">
+              <div class="card-content">
+                <span class="card-title">Lyrics Sources</span>
+                <p>Which providers to query, in priority order — the first one with a match wins. <b>LRCLib</b> is the recommended default. <b>NetEase</b> and <b>Kugou</b> are unofficial third-party APIs (better coverage for CJK / Asian music) and are off by default; enable them only if you want them.</p>
+                <div v-if="loaded">
+                  <p><label><input type="checkbox" class="filled-in" v-model="providers.lrclib" v-on:change="saveProviders()" /><span>LRCLib (lrclib.net)</span></label></p>
+                  <p><label><input type="checkbox" class="filled-in" v-model="providers.netease" v-on:change="saveProviders()" /><span>NetEase Cloud Music &mdash; unofficial</span></label></p>
+                  <p><label><input type="checkbox" class="filled-in" v-model="providers.kugou" v-on:change="saveProviders()" /><span>Kugou &mdash; unofficial</span></label></p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`,
+  created: async function () {
+    try {
+      await ADMINDATA.getLyricsParams();
+      this.writeSidecar = !!ADMINDATA.lyricsParams.writeSidecar;
+      const list = Array.isArray(ADMINDATA.lyricsParams.providers) ? ADMINDATA.lyricsParams.providers : ['lrclib'];
+      this.providers = {
+        lrclib: list.includes('lrclib'),
+        netease: list.includes('netease'),
+        kugou: list.includes('kugou'),
+      };
+    } catch (err) {
+      iziToast.error({ title: 'Failed to load lyrics settings', position: 'topCenter', timeout: 3000 });
+    }
+    this.loaded = true;
+  },
+  methods: {
+    toggleWriteSidecar: function () {
+      const next = !this.writeSidecar;
+      API.axios({
+        method: 'POST',
+        url: `${API.url()}/api/v1/admin/lyrics/write-sidecar`,
+        data: { writeSidecar: next }
+      }).then(() => {
+        this.writeSidecar = next;
+        Vue.set(ADMINDATA.lyricsParams, 'writeSidecar', next);
+        iziToast.success({ title: 'Saved', position: 'topCenter', timeout: 2000 });
+      }).catch(() => {
+        iziToast.error({ title: 'Update failed', position: 'topCenter', timeout: 3000 });
+      });
+    },
+    saveProviders: function () {
+      const order = ['lrclib', 'netease', 'kugou'];
+      const list = order.filter(p => this.providers[p]);
+      if (list.length === 0) {
+        // At least one source is required — re-enable LRCLib and bail.
+        this.providers.lrclib = true;
+        iziToast.warning({ title: 'Keep at least one source enabled', position: 'topCenter', timeout: 3000 });
+        return;
+      }
+      API.axios({
+        method: 'POST',
+        url: `${API.url()}/api/v1/admin/lyrics/providers`,
+        data: { providers: list }
+      }).then(() => {
+        Vue.set(ADMINDATA.lyricsParams, 'providers', list.slice());
+        iziToast.success({ title: 'Saved', position: 'topCenter', timeout: 2000 });
+      }).catch(() => {
+        iziToast.error({ title: 'Update failed', position: 'topCenter', timeout: 3000 });
+      });
+    },
+  },
 });
 
 const rpnView = Vue.component('rpn-view', {
@@ -2634,7 +3308,9 @@ const rpnView = Vue.component('rpn-view', {
 const infoView = Vue.component('info-view', {
   data() {
     return {
-      version: ADMINDATA.version
+      version: ADMINDATA.version,
+      update: ADMINDATA.updateStatus,
+      updateBusy: false,
     };
   },
   template: `
@@ -2663,7 +3339,161 @@ const infoView = Vue.component('info-view', {
           </div>
         </div>
       </div>
-    </div>`
+      <div class="row">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Software Updates</span>
+              <div v-if="!update.s">checking...</div>
+              <table v-else>
+                <tbody>
+                  <tr>
+                    <td><b>Installed:</b> v{{update.s.current}}<span v-if="!update.s.available && update.s.lastCheckAt"> &mdash; up to date</span></td>
+                    <td>[<a v-on:click="updCheckNow()">check now</a>]</td>
+                  </tr>
+                  <tr v-if="update.s.available">
+                    <td><b>Available:</b> v{{update.s.latest}} &mdash; {{updLine()}}</td>
+                    <td>
+                      <span v-if="updAction()">[<a v-on:click="updDoAction()">{{updAction()}}</a>] </span>
+                      <a v-else-if="!update.s.skipped && update.s.downloadUrl" v-bind:href="update.s.downloadUrl" target="_blank" rel="noopener">[downloads page] </a>
+                      <span v-if="update.s.skipped">[<a v-on:click="updSetSkip('')">unskip</a>]</span>
+                      <span v-else title="Hold this version back: never download or restart into it (e.g. after rolling back). Cleared by unskip or the next release.">[<a v-on:click="updSetSkip(update.s.latest)">skip</a>]</span>
+                    </td>
+                  </tr>
+                  <tr v-if="update.s.error">
+                    <td colspan="2" style="color:#c62828;">{{update.s.error}}</td>
+                  </tr>
+                  <tr>
+                    <td><b title="notify: report only. stage (default): download updates in the background; applying still takes a restart or a click. auto: additionally restart into the update when the server is idle (headless installs need a process supervisor that restarts mStream).">Mode:</b> {{update.s.mode}}</td>
+                    <td>[<a v-on:click="updCycleMode()">change</a>]</td>
+                  </tr>
+                  <tr>
+                    <td><b title="One request a day to the release feed on GitHub. Off = never phones home; 'check now' still works.">Daily check:</b> {{update.s.check ? 'on' : 'off'}}</td>
+                    <td>[<a v-on:click="updToggleCheck()">{{update.s.check ? 'disable' : 'enable'}}</a>]</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`,
+  mounted: function() {
+    ADMINDATA.getUpdateStatus();
+    this.updPoll = setInterval(() => { ADMINDATA.getUpdateStatus(); }, 5000);
+  },
+  beforeDestroy: function() {
+    clearInterval(this.updPoll);
+  },
+  methods: {
+    updLine: function() {
+      const s = this.update.s;
+      if (s.notifyOnly) { return 'this build is too old to self-update; re-run the install command'; }
+      if (s.skipped) { return 'held back (skipped) - it will not be downloaded or applied'; }
+      if (s.downloading) { return 'downloading...'; }
+      const stagedIsLatest = s.staged && s.stagedVersion === s.latest;
+      if (stagedIsLatest && s.method === 'managed') { return 'downloaded and staged; it takes over on the next restart'; }
+      if (stagedIsLatest && s.method === 'inno') { return 'installer downloaded and verified'; }
+      if (stagedIsLatest && s.method === 'pkg') { return 'installer downloaded; the running app keeps playing until you restart it after installing'; }
+      if (s.method === 'managed' || s.method === 'inno') { return 'not downloaded yet'; }
+      if (s.method === 'pkg') { return 'download the installer, then run it'; }
+      if (s.method === 'deb-rpm') { return 'installed from a deb/rpm package; update it with your package manager'; }
+      if (s.method === 'docker') { return 'running in Docker; pull the updated image'; }
+      if (s.method === 'npm-source') { return 'running from npm/source; update with npm or git'; }
+      return 'this copy was extracted by hand; download the new bundle or use the one-line installer';
+    },
+    updAction: function() {
+      const s = this.update.s;
+      if (s.notifyOnly || s.downloading || s.skipped) { return null; }
+      // Act only on a staged copy of the CURRENT latest: with an older
+      // version staged and a newer one advertised, the click must never
+      // apply the old one while the line names the new one.
+      if (s.staged && s.stagedVersion === s.latest) {
+        if (s.method === 'managed') { return 'restart into it'; }
+        if (s.method === 'inno') { return 'install now'; }
+        if (s.method === 'pkg') { return 'open installer'; }
+        return null;
+      }
+      if (s.method === 'managed' || s.method === 'inno' || s.method === 'pkg') { return 'download'; }
+      return null;
+    },
+    updDoAction: async function() {
+      if (this.updateBusy) { return; }
+      this.updateBusy = true;
+      const s = this.update.s;
+      try {
+        // Same predicate as updAction(): with an OLDER version staged and a
+        // newer latest advertised, the visible action is "download" — the
+        // click must never fall into the apply branch and restart into the
+        // stale one.
+        if (s.staged && s.stagedVersion === s.latest) {
+          const res = await API.axios({ method: 'POST', url: `${API.url()}/api/v1/admin/update/apply` });
+          iziToast.success({
+            title: res.data.exiting ? 'mStream is restarting into the update'
+              : res.data.opened ? 'Installer opened'
+              : 'Requested - the tray app applies it within a minute',
+            position: 'topCenter', timeout: 4000
+          });
+        } else {
+          await API.axios({ method: 'POST', url: `${API.url()}/api/v1/admin/update/download` });
+          iziToast.success({ title: 'Download started', position: 'topCenter', timeout: 2500 });
+        }
+        await ADMINDATA.getUpdateStatus();
+      } catch (err) {
+        iziToast.error({ title: 'Update action failed', position: 'topCenter', timeout: 3500 });
+      } finally {
+        this.updateBusy = false;
+      }
+    },
+    updCheckNow: async function() {
+      try {
+        const res = await API.axios({ method: 'POST', url: `${API.url()}/api/v1/admin/update/check` });
+        ADMINDATA.updateStatus.s = res.data;
+        if (res.data.error && !res.data.available) {
+          // Covers both failure classes: transport ('Update check failed:
+          // ...') and validation ('Release feed rejected: ...').
+          iziToast.warning({ title: 'Update check failed', message: String(res.data.error).slice(0, 120), position: 'topCenter', timeout: 4000 });
+        } else {
+          iziToast.success({
+            title: res.data.available ? `mStream v${res.data.latest} is available` : 'You are up to date',
+            position: 'topCenter', timeout: 3000
+          });
+        }
+      } catch (err) {
+        iziToast.error({ title: 'Update check failed', position: 'topCenter', timeout: 3500 });
+      }
+    },
+    updSetSkip: async function(ver) {
+      try {
+        await API.axios({ method: 'POST', url: `${API.url()}/api/v1/admin/update/settings`, data: { skipVersion: ver } });
+        await ADMINDATA.getUpdateStatus();
+        iziToast.success({ title: ver ? `v${ver} will be skipped` : 'Version skip cleared', position: 'topCenter', timeout: 2500 });
+      } catch (err) {
+        iziToast.error({ title: 'Failed to change skip setting', position: 'topCenter', timeout: 3500 });
+      }
+    },
+    updCycleMode: async function() {
+      const order = ['notify', 'stage', 'auto'];
+      const next = order[(order.indexOf(this.update.s.mode) + 1) % order.length];
+      try {
+        await API.axios({ method: 'POST', url: `${API.url()}/api/v1/admin/update/settings`, data: { mode: next } });
+        Vue.set(ADMINDATA.updateStatus.s, 'mode', next);
+        iziToast.success({ title: `Update mode: ${next}`, position: 'topCenter', timeout: 2500 });
+      } catch (err) {
+        iziToast.error({ title: 'Failed to change update mode', position: 'topCenter', timeout: 3500 });
+      }
+    },
+    updToggleCheck: async function() {
+      const next = !this.update.s.check;
+      try {
+        await API.axios({ method: 'POST', url: `${API.url()}/api/v1/admin/update/settings`, data: { check: next } });
+        Vue.set(ADMINDATA.updateStatus.s, 'check', next);
+        iziToast.success({ title: next ? 'Daily update check enabled' : 'Daily update check disabled', position: 'topCenter', timeout: 2500 });
+      } catch (err) {
+        iziToast.error({ title: 'Failed to change update check', position: 'topCenter', timeout: 3500 });
+      }
+    },
+  }
 });
 
 const transcodeView = Vue.component('transcode-view', {
@@ -2832,342 +3662,311 @@ const transcodeView = Vue.component('transcode-view', {
   }
 });
 
-// ── Federation tab placeholder ──────────────────────────────────────
-//
-// The full federation UI is disabled while the feature is being rebuilt
-// around the new local-backup story (see src/server.js for the matching
-// server-side disable). The original `federationMainPanel` (two-tab
-// Federation/Syncthing UI with embedded syncthing iframe) and the
-// original feature-aware `federationView` are preserved below as a
-// block comment so they're easy to restore later. The
-// `federation-generate-invite-modal` definition + its registration
-// further down in this file are similarly preserved-and-disabled.
-//
-// While disabled, the Federation entry in the admin sidebar renders
-// the Coming Soon component defined directly below.
+// ── Federation ──────────────────────────────────────────────────────
+// Ticket-paired read-only library sharing between mStream servers over
+// a dedicated iroh endpoint. Three cards: status/toggle, keys this
+// server minted (with their swap-ready tickets), and peers this server
+// can read. Same hardcoded-English style as the iroh Quick Connect
+// panel above.
 const federationView = Vue.component('federation-view', {
-  template: `
-    <div class="row">
-      <div class="container">
-        <div class="card">
-          <div class="card-content center-align">
-            <i class="material-icons large" style="margin-top: 16px;">cloud_sync</i>
-            <h4 style="margin-top: 8px;">Coming Soon &mdash; Federation</h4>
-            <p style="font-size: 1.1rem; margin: 16px auto; max-width: 560px;">
-              This feature will allow easy backups across multiple machines.
-            </p>
-            <p style="margin-top: 24px; opacity: 0.7;">
-              <em>Powered by Syncthing</em>
-            </p>
-          </div>
-        </div>
-      </div>
-    </div>`,
-});
-
-// ── Disabled: original federationMainPanel + federationView ─────────
-// Restore both Vue.component(...) calls (and re-enable the federation/
-// syncthing wiring on the server side) when bringing federation back.
-// The block is wrapped in /* */ so the file still parses; the only
-// edit to the verbatim original is renaming federationView → 
-// federationView_disabled inside the comment so accidentally
-// uncommenting can't silently re-register the `federation-view`
-// name and shadow the Coming Soon component above.
-/*
-const federationMainPanel = Vue.component('federation-main-panel', {
   data() {
     return {
-      params: ADMINDATA.federationParams,
-      paramsTS: ADMINDATA.federationParamsUpdated,
-      enabled: ADMINDATA.federationEnabled,
-      syncthingUrl: "",
-      tabs: null,
-      enablePending: false,
-
-      currentToken: '',
-      parsedTokenData: null,
-      submitPending: false
+      fedTS: ADMINDATA.federationParamsUpdated,
+      fed: ADMINDATA.federationParams,
+      keys: ADMINDATA.federationKeys,
+      peers: ADMINDATA.federationPeers,
+      togglePending: false,
+      // Add-peer form state
+      peerTicket: '',
+      peerName: '',
+      addPeerPending: false,
+      // Per-row pending flags (Vue.set'd by id)
+      rowPending: {},
     };
   },
-  template: `
-    <div>
-      <ul id="syncthing-tabs" class="tabs tabs-fixed-width">
-        <li class="tab"><a class="active" href="#sync-tab-1">{{ t('admin.federation.tabFederation') }}</a></li>
-        <li v-on:click="setSyncthingUrl()" class="tab"><a href="#sync-tab-2">{{ t('admin.federation.tabSyncthing') }}</a></li>
-      </ul>
-      <div id="sync-tab-1">
-        <div class="container">
-          <div class="row">
-            <div class="col s12">
-              <div class="card">
-                <div class="card-content">
-                  <span class="card-title">{{ t('admin.federation.title') }}</span>
-                  <table>
-                    <tbody>
-                      <tr>
-                        <td><b>{{ t('admin.federation.deviceId') }}</b> {{params.deviceId}}</td>
-                      </tr>
-                    </tbody>
-                  </table>
-                  <p v-on:click="openFederationGenerateInviteModal()">{{ t('admin.modal.generateInvite') }}</p>
-                </div>
-                <div class="card-action flow-root">
-                  <a v-on:click="enableFederation()" v-bind:class="{ 'red': enabled.val }" class="waves-effect waves-light btn right">{{ t('admin.federation.disableAction') }}</a>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-        <div class="big-container">
-          <div class="row">
-            <div class="col s12">
-              <div class="card">
-                <div class="card-content">
-                  <span class="card-title">{{ t('admin.federation.acceptInvite') }}</span>
-                  <div class="row">
-                    <div class="col s12 m12 l6">
-                      <div class="row">
-                        <div class="col s12">
-                          <label for="fed-invite-token">{{ t('admin.federation.tokenLabel') }}</label>
-                          <textarea id="fed-invite-token" v-model="currentToken" style="height: auto;" rows="4" cols="60" :placeholder="t('admin.federation.tokenPlaceholder')"></textarea>
-                        </div>
-                      </div>
-                      <div class="row">
-                        <div class="input-field col s12">
-                          <input id="fed-invite-url" required type="text" class="validate">
-                          <label for="fed-invite-url">{{ t('admin.federation.serverURL') }}</label>
-                        </div>
-                      </div>
-                    </div>
-                    <div class="col s12 m12 l6">
-                      <form @submit.prevent="acceptInvite" v-if="parsedTokenData !== null">
-                        <p>{{ t('admin.federation.selectFolders') }}</p>
-                        <div v-for="(item, key, index) in parsedTokenData.vPaths">
-                          <label>
-                            <input type="checkbox" checked/>
-                            <span>{{key}}</span>
-                          </label>
-                        </div>
-                        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-                          {{ submitPending === false ? t('admin.federation.acceptInviteButton') : t('admin.federation.working') }}
-                        </button>
-                      </form>
-                      <div v-else>
-                        <p>{{ t('admin.federation.pasteTokenHint') }}</p>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div id="sync-tab-2">
-        <iframe id="syncthing-iframe" :src="syncthingUrl"></iframe>
-      </div>
-    </div>`,
-  watch: {
-    'currentToken': function(val, preVal) {
+  computed: {
+    // Client-side preview of a pasted ticket: decode mstrfed1:<base64url(JSON)>
+    // just enough to show who/what before the admin commits. Parse errors
+    // return null and the UI shows a gentle "doesn't look right" hint.
+    peerPreview() {
+      const s = this.peerTicket.trim();
+      if (!s) { return null; }
+      const m = s.match(/^mstrfed(\d+):(.*)$/s);
+      if (!m) { return { error: true }; }
       try {
-        if (!val) { 
-          return this.parsedTokenData = null;
-        }
-
-        const decoded = jwt_decode(val);
-        this.parsedTokenData = decoded;
-      } catch(err) {
-        console.log(err)
-        this.parsedTokenData = null;
+        const b64 = m[2].replace(/-/g, '+').replace(/_/g, '/');
+        const payload = JSON.parse(atob(b64));
+        if (typeof payload.t !== 'string' || typeof payload.k !== 'string') { return { error: true }; }
+        return {
+          error: false,
+          name: typeof payload.n === 'string' ? payload.n : '(unnamed server)',
+          libraries: Array.isArray(payload.l) ? payload.l : [],
+          expires: typeof payload.e === 'string' ? payload.e.slice(0, 10) : null,
+        };
+      } catch (e) {
+        return { error: true };
       }
-    }
-  },
-  mounted: function () {
-    this.tabs = M.Tabs.init(document.getElementById('syncthing-tabs'), {});
-    this.tabs.select('test1')
-  },
-  beforeDestroy: function() {
-    this.tabs.destroy();
+    },
   },
   methods: {
-    editName: async function() {
-
+    refresh() {
+      ADMINDATA.getFederation();
+      ADMINDATA.getFederationKeys();
+      ADMINDATA.getFederationPeers();
     },
-    acceptInvite: async function() {
+    setRowPending(id, val) { Vue.set(this.rowPending, id, val); },
+    async toggle() {
+      this.togglePending = true;
       try {
-        const postData = {
-          invite: this.currentToken,
-          paths: {}
-        };
-    
-        const res = await API.axios({
-          method: 'POST',
-          url: `${API.url()}/api/v1/federation/invite/accept`,
-          data: postData
-        });
-      } catch (err) {
-        iziToast.error({
-          title: t('admin.federation.acceptFailed'),
-          position: 'topCenter',
-          timeout: 3500
-        });
+        await API.axios({ method: 'POST', url: `${API.url()}/api/v1/admin/federation`, data: { enabled: !this.fed.enabled } });
+        await ADMINDATA.getFederation();
+        await ADMINDATA.getFederationKeys(); // tickets appear/disappear with the endpoint
+        if (this.fed.enabled && this.fed.available === false) {
+          iziToast.warning({ title: 'Unavailable', message: 'Iroh has no prebuilt binary for this server’s platform; the federation endpoint could not start.' });
+        }
+      } catch (e) {
+        iziToast.error({ title: 'Error', message: 'Failed to update the federation setting.' });
       }
-
-  //   var folderNames = {};
-
-  //   var decoded = jwt_decode($('#federation-invitation-code').val());
-  //   Object.keys(decoded.vPaths).forEach(function(key) {
-  //     if($("input[type=checkbox][value="+decoded.vPaths[key]+"]").is(":checked")){
-  //       folderNames[key] = $("#" + decoded.vPaths[key]).val();
-  //     }
-  //   });
-
-  //   if (Object.keys(folderNames).length === 0) {
-  //     iziToast.error({
-  //       title: 'No directories selected',
-  //       position: 'topCenter',
-  //       timeout: 3500
-  //     });
-  //   }
-
-    // var sendThis = {
-    //   invite: $('#federation-invitation-code').val(),
-    //   paths: folderNames
-    // };
-
-  //   MSTREAMAPI.acceptFederationInvite(sendThis, function(res, err){
-  //     if (err !== false) {
-  //       boilerplateFailure(res, err);
-  //       return;
-  //     }
-
-  //     iziToast.success({
-  //       title: 'Federation Successful!',
-  //       position: 'topCenter',
-  //       timeout: 3500
-  //     });
-  //   });
+      this.togglePending = false;
     },
-    setSyncthingUrl: function() {
-      if (this.syncthingUrl !== '') { return; }
-      this.syncthingUrl = '/api/v1/syncthing-proxy/?token=' + API.token();
-    },
-    openFederationGenerateInviteModal: function() {
-      modVM.currentViewModal = 'federation-generate-invite-modal';
+    openNewTicketModal() {
+      modVM.currentViewModal = 'federation-new-ticket-modal';
       M.Modal.getInstance(document.getElementById('admin-modal')).open();
     },
-    enableFederation: function() {
-      iziToast.question({
-        timeout: 20000,
-        close: false,
-        overlayClose: true,
-        overlay: true,
-        displayMode: 'once',
-        id: 'question',
-        zindex: 99999,
-        layout: 2,
-        maxWidth: 600,
-        title: `${this.enabled.val === true ? t('admin.federation.disableTitle') : t('admin.federation.enableTitle')}`,
-        position: 'center',
-        buttons: [
-          [`<button><b>${this.enabled.val === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')}</b></button>`, async (instance, toast) => {
-            try {
-              this.enablePending = true;
-
-              await API.axios({
-                method: 'POST',
-                url: `${API.url()}/api/v1/admin/federation/enable`,
-                data: {
-                  enable: !this.enabled.val,
-                }
-              });
-
-              // update fronted data
-              Vue.set(ADMINDATA.federationEnabled, 'val', !this.enabled.val);
-
-              instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
-
-              iziToast.success({
-                title: `Syncthing ${this.enabled.val === true ? t('admin.settings.enabled') : t('admin.settings.disabled')}`,
-                position: 'topCenter',
-                timeout: 3500
-              });
-            } catch(err) {
-              iziToast.error({
-                title: t('admin.federation.toggleFailed'),
-                position: 'topCenter',
-                timeout: 3500
-              });
-            }finally {
-              this.enablePending = false;
-            }
-          }, true],
-          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
-            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
-          }],
-        ]
-      });
-    }
-  }
-});
-
-const federationView_disabled = Vue.component('federation-view-disabled', {
-  data() {
-    return {
-      paramsTS: ADMINDATA.federationParamsUpdated,
-      enabled: ADMINDATA.federationEnabled,
-      enablePending: false,
-    };
-  },
-  template: `
-    <div v-if="paramsTS.ts === 0" class="row">
-      <svg class="spinner" width="65px" height="65px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
-    </div>
-    <div v-else-if="enabled.val === false" class="row">
-      <div class="container">
-        <div class="row logo-row">
-          <h4>{{ t('admin.federation.poweredBy') }}</h4>
-          <svg xmlns="http://www.w3.org/2000/svg" max-width="200px" viewBox="0 0 429 117.3"><linearGradient id="a" gradientUnits="userSpaceOnUse" x1="58.666" y1="117.332" x2="58.666" y2="0"><stop offset="0" stop-color="#0882c8"/><stop offset="1" stop-color="#26b6db"/></linearGradient><circle fill="url(#a)" cx="58.7" cy="58.7" r="58.7"/><circle fill="none" stroke="#FFF" stroke-width="6" stroke-miterlimit="10" cx="58.7" cy="58.5" r="43.7"/><path fill="#FFF" d="M94.7 47.8c4.7 1.6 9.8-.9 11.4-5.6 1.6-4.7-.9-9.8-5.6-11.4-4.7-1.6-9.8.9-11.4 5.6-1.6 4.7.9 9.8 5.6 11.4z"/><path fill="none" stroke="#FFF" stroke-width="6" stroke-miterlimit="10" d="M97.6 39.4l-30.1 25"/><path fill="#FFF" d="M77.6 91c-.4 4.9 3.2 9.3 8.2 9.8 5 .4 9.3-3.2 9.8-8.2.4-4.9-3.2-9.3-8.2-9.8-5-.4-9.4 3.2-9.8 8.2z"/><path fill="none" stroke="#FFF" stroke-width="6" stroke-miterlimit="10" d="M86.5 91.8l-19-27.4"/><path fill="#FFF" d="M60 69.3c2.7 4.2 8.3 5.4 12.4 2.7 4.2-2.7 5.4-8.3 2.7-12.4-2.7-4.2-8.3-5.4-12.4-2.7-4.2 2.6-5.4 8.2-2.7 12.4z"/><g><path fill="#FFF" d="M21.2 61.4c-4.3-2.5-9.8-1.1-12.3 3.1-2.5 4.3-1.1 9.8 3.1 12.3 4.3 2.5 9.8 1.1 12.3-3.1s1.1-9.7-3.1-12.3z"/><path fill="none" stroke="#FFF" stroke-width="6" stroke-miterlimit="10" d="M16.6 69.1l50.9-4.7"/></g><g fill="#0891D1"><path d="M163.8 50.2c-.6-.7-6.3-4.1-11.4-4.1-3.4 0-5.2 1.2-5.2 3.5 0 2.9 3.2 3.7 8.9 5.2 8.2 2.2 13.3 5 13.3 12.9 0 9.7-7.8 13-16 13-6.2 0-13.1-2-18.2-5.3l4.3-8.6c.8.8 7.5 5 14 5 3.5 0 5.2-1.1 5.2-3.2 0-3.2-4.4-4-10.3-5.8-7.9-2.4-11.5-5.3-11.5-11.8 0-9 7.2-13.9 15.7-13.9 6.1 0 11.6 2.5 15.4 4.7l-4.2 8.4zM175 85.1c1.7.5 3.3.8 4.4.8 2 0 3.3-1.5 4.2-5.5l-11.9-31.5h9.8l7.4 23.3 6.3-23.3h8.9L192 85.5c-1.7 5.3-6.2 8.7-11.8 8.8-1.7 0-3.5-.2-5.3-.9v-8.3zM239.3 80.3h-9.6V62.6c0-4.1-1.7-5.9-4.3-5.9-2.6 0-5.8 2.3-7 5.6v18.1h-9.6V48.8h8.6v5.3c2.3-3.7 6.8-5.9 12.2-5.9 8.2 0 9.5 6.7 9.5 11.9v20.2zM261.6 48.2c7.2 0 12.3 3.4 14.8 8.3l-9.4 2.8c-1.2-1.9-3.1-3-5.5-3-4 0-7 3.2-7 8.2 0 5 3.1 8.3 7 8.3 2.4 0 4.6-1.3 5.5-3.1l9.4 2.9c-2.3 4.9-7.6 8.3-14.8 8.3-10.6 0-16.9-7.7-16.9-16.4s6.2-16.3 16.9-16.3zM302.1 78.7c-2.6 1.1-6.2 2.3-9.7 2.3-4.7 0-8.8-2.3-8.8-8.4V56.1h-4v-7.3h4v-10h9.6v10h6.4v7.3h-6.4v13.1c0 2.1 1.2 2.9 2.8 2.9 1.4 0 3-.6 4.2-1.1l1.9 7.7zM337.2 80.3h-9.6V62.6c0-4.1-1.8-5.9-4.6-5.9-2.3 0-5.5 2.2-6.7 5.6v18.1h-9.6V36.5h9.6v17.6c2.3-3.7 6.3-5.9 10.9-5.9 8.5 0 9.9 6.5 9.9 11.9v20.2zM343.4 45.2v-8.7h9.6v8.7h-9.6zm0 35.1V48.8h9.6v31.5h-9.6zM389.9 80.3h-9.6V62.6c0-4.1-1.7-5.9-4.3-5.9-2.6 0-5.8 2.3-7 5.6v18.1h-9.6V48.8h8.6v5.3c2.3-3.7 6.8-5.9 12.2-5.9 8.2 0 9.5 6.7 9.5 11.9v20.2zM395.5 64.6c0-9.2 6-16.3 14.6-16.3 4.7 0 8.4 2.2 10.6 5.8v-5.2h8.3v29.3c0 9.6-7.5 15.5-18.2 15.5-6.8 0-11.5-2.3-15-6.3l5.1-5.2c2.3 2.6 6 4.3 9.9 4.3 4.6 0 8.6-2.4 8.6-8.3v-3.1c-1.9 3.5-5.9 5.3-10 5.3-8.3.1-13.9-7.1-13.9-15.8zm23.9 3.9v-6.6c-1.3-3.3-4.2-5.5-7.1-5.5-4.1 0-7 4-7 8.4 0 4.6 3.2 8 7.5 8 2.9 0 5.3-1.8 6.6-4.3z"/></g></svg>
-        </div>
-        <a v-on:click="enableFederation()" class="waves-effect waves-light btn-large">{{ t('admin.federation.enableButton') }}</a>
-      </div>
-    </div>
-    <federation-main-panel v-else>
-    </federation-main-panel>`,
-  methods: {
-    enableFederation: async function() {
+    openLimitsModal(key) {
+      ADMINDATA.federationLimitsTarget.key = key;
+      modVM.currentViewModal = 'federation-edit-limits-modal';
+      M.Modal.getInstance(document.getElementById('admin-modal')).open();
+    },
+    fmtLimits(k) {
+      const parts = [];
+      if (k.stream_kbps > 0) { parts.push(k.stream_kbps >= 1000 ? `${+(k.stream_kbps / 1000).toFixed(1)} Mbps` : `${k.stream_kbps} kbps`); }
+      if (k.daily_mb > 0) { parts.push(k.daily_mb >= 1024 ? `${+(k.daily_mb / 1024).toFixed(1)} GB/day` : `${k.daily_mb} MB/day`); }
+      if (k.max_streams > 0) { parts.push(`${k.max_streams} stream${k.max_streams === 1 ? '' : 's'}`); }
+      return parts.length ? parts.join(' · ') : 'unlimited';
+    },
+    fmtBytes(n) {
+      if (!n) { return '0 B'; }
+      if (n >= 1024 * 1024 * 1024) { return `${+(n / (1024 * 1024 * 1024)).toFixed(2)} GB`; }
+      if (n >= 1024 * 1024) { return `${+(n / (1024 * 1024)).toFixed(1)} MB`; }
+      if (n >= 1024) { return `${+(n / 1024).toFixed(1)} KB`; }
+      return `${n} B`;
+    },
+    // Rows carry SQLite UTC 'YYYY-MM-DD HH:MM:SS' — brand it UTC before
+    // parsing or the browser reads it as local time.
+    fmtExpiry(s) {
+      const days = Math.ceil((Date.parse(`${s.replace(' ', 'T')}Z`) - Date.now()) / 86400000);
+      return days <= 1 ? 'expires today' : `expires in ${days}d`;
+    },
+    async revokeKey(key) {
+      this.setRowPending(key.id, true);
       try {
-        this.enablePending = true;
-
+        await API.axios({ method: 'DELETE', url: `${API.url()}/api/v1/admin/federation/keys/${key.id}` });
+        await ADMINDATA.getFederationKeys();
+        iziToast.success({ title: 'Revoked', message: `'${escHtml(key.name)}' can no longer read this server.`, position: 'topCenter', timeout: 3500 });
+      } catch (e) {
+        iziToast.error({ title: 'Error', message: 'Failed to revoke the key.' });
+      }
+      this.setRowPending(key.id, false);
+    },
+    async resetBinding(key) {
+      this.setRowPending(key.id, true);
+      try {
+        await API.axios({ method: 'POST', url: `${API.url()}/api/v1/admin/federation/keys/${key.id}/reset-binding` });
+        await ADMINDATA.getFederationKeys();
+        iziToast.success({ title: 'Binding reset', message: 'The next server to redeem this ticket claims it again.', position: 'topCenter', timeout: 3500 });
+      } catch (e) {
+        iziToast.error({ title: 'Error', message: 'Failed to reset the binding.' });
+      }
+      this.setRowPending(key.id, false);
+    },
+    async addPeer() {
+      this.addPeerPending = true;
+      try {
+        const data = { ticket: this.peerTicket.trim() };
+        if (this.peerName.trim()) { data.name = this.peerName.trim(); }
+        await API.axios({ method: 'POST', url: `${API.url()}/api/v1/admin/federation/peers`, data });
+        this.peerTicket = '';
+        this.peerName = '';
+        await ADMINDATA.getFederationPeers();
+        iziToast.success({ title: 'Peer added', message: 'Testing the connection in the background…', position: 'topCenter', timeout: 3500 });
+        // The async first health check lands a moment later; refresh the dots.
+        setTimeout(() => ADMINDATA.getFederationPeers(), 4000);
+      } catch (e) {
+        iziToast.error({ title: 'Error', message: escHtml((e.response && e.response.data && e.response.data.error) || 'Failed to add the peer.') });
+      }
+      this.addPeerPending = false;
+    },
+    async testPeer(peer) {
+      this.setRowPending(peer.id, true);
+      try {
+        const res = await API.axios({ method: 'POST', url: `${API.url()}/api/v1/admin/federation/peers/${peer.id}/test` });
+        await ADMINDATA.getFederationPeers();
+        if (res.data.ok) {
+          // Both values are REMOTE-controlled: peer.name defaults to the
+          // name embedded in the pasted ticket (minted by the peer), and
+          // health.libraries is whatever the peer's server replied.
+          iziToast.success({ title: 'Connected', message: `'${escHtml(peer.name)}' shares: ${escHtml(res.data.health.libraries.join(', ')) || '(nothing)'}`, position: 'topCenter', timeout: 3500 });
+        } else {
+          iziToast.warning({ title: 'Unreachable', message: escHtml(res.data.error), position: 'topCenter', timeout: 3500 });
+        }
+      } catch (e) {
+        iziToast.error({ title: 'Error', message: 'Test failed.' });
+      }
+      this.setRowPending(peer.id, false);
+    },
+    async removePeer(peer) {
+      this.setRowPending(peer.id, true);
+      try {
+        await API.axios({ method: 'DELETE', url: `${API.url()}/api/v1/admin/federation/peers/${peer.id}` });
+        await ADMINDATA.getFederationPeers();
+        iziToast.success({ title: 'Removed', message: `'${escHtml(peer.name)}' forgotten.`, position: 'topCenter', timeout: 3500 });
+      } catch (e) {
+        iziToast.error({ title: 'Error', message: 'Failed to remove the peer.' });
+      }
+      this.setRowPending(peer.id, false);
+    },
+    async toggleDiscovery(peer) {
+      this.setRowPending(peer.id, true);
+      try {
         await API.axios({
           method: 'POST',
-          url: `${API.url()}/api/v1/admin/federation/enable`,
-          data: {
-            enable: !this.enabled.val,
-          }
+          url: `${API.url()}/api/v1/admin/federation/peers/${peer.id}/discovery`,
+          data: { enabled: peer.use_discovery !== 1 },
         });
-
-        // update fronted data
-        Vue.set(ADMINDATA.federationEnabled, 'val', !this.enabled.val);
-  
-        iziToast.success({
-          title: `Syncthing ${this.enabled.val === true ? t('admin.settings.enabled') : t('admin.settings.disabled')}`,
-          position: 'topCenter',
-          timeout: 3500
-        });
-      } catch(err) {
-        iziToast.error({
-          title: t('admin.federation.toggleFailed'),
-          position: 'topCenter',
-          timeout: 3500
-        });
-      }finally {
-        this.enablePending = false;
+      } catch (e) {
+        iziToast.error({ title: 'Error', message: 'Failed to update the peer.' });
       }
-    }
-  }
+      // Refresh either way so the checkbox always mirrors the server's truth.
+      await ADMINDATA.getFederationPeers();
+      this.setRowPending(peer.id, false);
+    },
+    statusDot(peer) {
+      if (peer.last_status === 'ok') { return '#2e7d32'; }
+      if (peer.last_status) { return '#c62828'; }
+      return '#9e9e9e';
+    },
+    fmtDate(s) { return s ? s.replace('T', ' ').slice(0, 16) : '—'; },
+  },
+  mounted() { this.refresh(); },
+  template: `
+    <div v-if="fedTS.ts === 0" class="row">
+      <svg class="spinner" width="65px" height="65px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
+    </div>
+    <div v-else class="container">
+      <div class="row" style="margin-top:24px">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Federation</span>
+              <p>Pair with a friend's mStream server to share libraries <b>read-only</b>, peer-to-peer and end-to-end encrypted — no port-forwarding or DNS. You mint a ticket for the libraries you want to share; your friend pastes it into their Peers list (and mints one for you if the sharing is mutual). Distributed backups between paired servers build on this.</p>
+              <div v-if="fed.available === false" class="card-panel orange lighten-4" style="margin-top:16px">
+                <p><b>Not available on this platform.</b> The Iroh native component has no prebuilt binary for this server’s OS/CPU, so the federation endpoint can’t run here.</p>
+              </div>
+              <p><b>Tickets are credentials.</b> Anyone holding an unredeemed ticket can read the libraries it grants — send tickets over a private channel. The first server to use a ticket claims it; revoke a ticket at any time to cut access.</p>
+              <p style="margin-top:8px" v-if="fed.enabled && fed.running"><b>Status:</b>
+                <span style="color:#2e7d32">On{{ fed.online ? ' · connected to relay' : ' · connecting…' }}</span>
+                <span style="word-break:break-all;font-family:monospace;font-size:0.8em;display:block">{{ fed.endpointId }}</span>
+              </p>
+            </div>
+            <div class="card-action flow-root">
+              <a v-on:click="toggle()" :class="{disabled: togglePending}" class="waves-effect waves-light btn right">
+                {{ fed.enabled ? 'Turn Off' : 'Turn On' }}
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="fed.enabled" class="row">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Shared Libraries — Tickets You Minted</span>
+              <p style="font-size:0.9em;color:#777">Each ticket is a read-only grant for the libraries you picked. Copy it and send it to the friend it's for.</p>
+              <table v-if="keys.list.length > 0" class="striped">
+                <thead><tr><th>Name</th><th>Libraries</th><th>Limits</th><th>Today</th><th>Last used</th><th>Redeemed</th><th style="width:280px"></th></tr></thead>
+                <tbody>
+                  <tr v-for="k in keys.list" :key="k.id">
+                    <td>{{ k.name }}</td>
+                    <td>{{ k.library_names.join(', ') }}</td>
+                    <td style="font-size:0.85em">
+                      <a v-on:click="openLimitsModal(k)" style="cursor:pointer" title="Edit this key's bandwidth limits and expiry">{{ fmtLimits(k) }}</a>
+                      <div v-if="k.expired" style="color:#c62828">expired</div>
+                      <div v-else-if="k.expires_at" style="color:#777">{{ fmtExpiry(k.expires_at) }}</div>
+                    </td>
+                    <td style="font-size:0.85em" title="Bytes served to this key today (UTC)">{{ fmtBytes(k.usage_today_bytes) }}</td>
+                    <td>{{ fmtDate(k.last_used) }}</td>
+                    <td>
+                      <span v-if="k.bound_endpoint_id" style="color:#2e7d32">✔ claimed</span>
+                      <span v-else style="color:#9e9e9e">not yet</span>
+                    </td>
+                    <td class="right-align">
+                      <a v-if="k.ticket" class="btn-flat btn-small waves-effect fed-copy-button" :data-clipboard-text="k.ticket" title="Copy the ticket to send to your friend">Copy ticket</a>
+                      <a v-if="k.bound_endpoint_id" class="btn-flat btn-small waves-effect" :class="{disabled: rowPending[k.id]}" v-on:click="resetBinding(k)" title="Friend reinstalled? Let the ticket be claimed again.">Reset</a>
+                      <a class="btn-small red lighten-1 waves-effect" :class="{disabled: rowPending[k.id]}" v-on:click="revokeKey(k)">Revoke</a>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <p v-else style="color:#777">No tickets yet.</p>
+            </div>
+            <div class="card-action flow-root">
+              <a v-on:click="openNewTicketModal()" class="waves-effect waves-light btn right">New Ticket</a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="fed.enabled" class="row">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Peers — Servers You Can Read</span>
+              <table v-if="peers.list.length > 0" class="striped">
+                <thead><tr><th></th><th>Name</th><th>Status</th><th>Last seen</th><th>Discovery</th><th style="width:200px"></th></tr></thead>
+                <tbody>
+                  <tr v-for="p in peers.list" :key="p.id">
+                    <td><span :style="{color: statusDot(p)}" style="font-size:1.4em">●</span></td>
+                    <td>{{ p.name }}</td>
+                    <td style="font-size:0.85em">{{ p.last_status || 'never tested' }}</td>
+                    <td>{{ fmtDate(p.last_seen) }}</td>
+                    <td>
+                      <label title="Let the Discover panel ask this peer for similar music. Queries reveal what you're listening to — to this peer only.">
+                        <input type="checkbox" :checked="p.use_discovery === 1" :disabled="rowPending[p.id]" v-on:change="toggleDiscovery(p)"/>
+                        <span></span>
+                      </label>
+                    </td>
+                    <td class="right-align">
+                      <a class="btn-flat btn-small waves-effect" :class="{disabled: rowPending[p.id]}" v-on:click="testPeer(p)">Test</a>
+                      <a class="btn-small red lighten-1 waves-effect" :class="{disabled: rowPending[p.id]}" v-on:click="removePeer(p)">Remove</a>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <p v-else style="color:#777">No peers yet — paste a friend's ticket below.</p>
+              <div style="margin-top:16px">
+                <div class="input-field">
+                  <textarea id="fed-peer-ticket" class="materialize-textarea" v-model="peerTicket" placeholder="Paste a federation ticket (mstrfed1:…)"></textarea>
+                </div>
+                <div v-if="peerPreview && peerPreview.error" style="color:#c62828;font-size:0.9em">That doesn't look like a federation ticket.</div>
+                <div v-if="peerPreview && !peerPreview.error" class="card-panel green lighten-5" style="padding:10px">
+                  <b>{{ peerPreview.name }}</b>
+                  <span v-if="peerPreview.libraries.length"> — shares: {{ peerPreview.libraries.join(', ') }}</span>
+                  <span v-if="peerPreview.expires"> · valid until {{ peerPreview.expires }}</span>
+                </div>
+                <div class="input-field" style="max-width:320px">
+                  <input id="fed-peer-name" type="text" v-model="peerName" placeholder="Optional display name"/>
+                </div>
+                <a v-on:click="addPeer()" :class="{disabled: addPeerPending || !peerPreview || peerPreview.error}" class="waves-effect waves-light btn">Add Peer</a>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`,
 });
-*/
+
 
 
 const logsView = Vue.component('logs-view', {
@@ -3534,7 +4333,7 @@ const securityView = Vue.component('security-view', {
         });
       } catch (err) {
         iziToast.error({
-          title: err.response?.data?.error || err.message || t('admin.security.applyFailed'),
+          title: escHtml(err.response?.data?.error || err.message || t('admin.security.applyFailed')),
           position: 'topCenter',
           timeout: 4500
         });
@@ -3779,7 +4578,7 @@ const dlnaView = Vue.component('dlna-view', {
       } catch(err) {
         const msg = err && err.response && err.response.data && err.response.data.error
           ? err.response.data.error : 'Failed to update DLNA identity';
-        iziToast.error({ title: msg, position: 'topCenter', timeout: 4000 });
+        iziToast.error({ title: escHtml(msg), position: 'topCenter', timeout: 4000 });
         // Re-sync the inputs so a rejected value doesn't linger in the form.
         await ADMINDATA.getDlnaParams();
       } finally {
@@ -3917,6 +4716,10 @@ const subsonicView = Vue.component('subsonic-view', {
           <div class="card">
             <div class="card-content">
               <span class="card-title">Subsonic REST API</span>
+              <div class="card-panel amber lighten-4" style="margin-top:12px">
+                <p><b>Deprecated:</b> the Subsonic API will be removed in a future release once the first-party mStream apps are available. Development focus is on the first-party apps and their iroh-based Quick Connect, which no third-party client can offer. The Subsonic surface is frozen &mdash; crash and security fixes only, no new endpoints.</p>
+                <p style="margin-top:8px">If you rely on the Subsonic API, please say so on <a href="https://github.com/IrosTheBeggar/mStream/issues" target="_blank" rel="noopener">GitHub</a> or Discord &mdash; real usage reports are what decide the removal timeline.</p>
+              </div>
               <p>The Subsonic API lets you use third-party music apps &mdash; DSub, Symfonium, Substreamer, play:Sub, Feishin, Sonixd, and many others &mdash; as clients for your mStream library. Each user signs in with their mStream username and password (or an API key they generate on their profile) from inside the client app.</p>
               <div style="margin-top:16px">
                 <p><b>Current mode:</b> {{params.mode || 'disabled'}}</p>
@@ -4045,47 +4848,21 @@ const subsonicView = Vue.component('subsonic-view', {
         </div>
       </div>
 
-      <!-- Lyrics cache (LRCLib fallback, V20). Visible regardless of
-           Subsonic mode because /api/v1/lyrics works through the main
-           mStream auth wall (Velvet UI uses that path), so an operator
-           running Subsonic=disabled but Velvet=on still benefits. -->
+      <!-- Lyrics cache ledger (read-only). Lyrics are filled by the proactive
+           backfill worker now, configured in the dedicated "Lyrics" admin
+           section — this card only surfaces the cache / cooldown ledger and a
+           purge control. Visible regardless of Subsonic mode because the
+           ledger is shared by every lyrics path. -->
       <div v-if="stats.lyrics" class="row">
         <div class="col s12">
           <div class="card">
             <div class="card-content">
-              <span class="card-title">Lyrics Lookup (LRCLib)</span>
+              <span class="card-title">Lyrics Cache</span>
               <p>
-                When a track has no embedded lyrics and no sibling <code>.lrc</code> / <code>.txt</code> sidecar,
-                mStream can fetch from
-                <a href="https://lrclib.net" target="_blank" rel="noopener">lrclib.net</a> and cache the result.
-              </p>
-              <p style="color:#b26500;background:#fff3e0;padding:8px;border-radius:4px;margin:8px 0">
-                <small><b>Privacy:</b> enabling this sends <code>{artist, title, duration}</code>
-                over HTTPS to lrclib.net for every track that has no local lyrics.
-                No user identity is included. Disable if your server is meant to be fully offline.</small>
-              </p>
-              <p style="margin:12px 0">
-                <span class="chip" :class="stats.lyrics.lrclibEnabled ? 'green lighten-4' : 'grey lighten-3'">
-                  {{stats.lyrics.lrclibEnabled ? 'Enabled' : 'Disabled'}}
-                </span>
-                <a v-on:click="toggleLrclib()" class="btn-flat waves-effect" style="padding:0 8px">
-                  {{stats.lyrics.lrclibEnabled ? 'Disable' : 'Enable'}}
-                </a>
-              </p>
-              <p v-if="stats.lyrics.lrclibEnabled" style="margin:8px 0;padding:8px;background:#f9f9f9;border-radius:4px">
-                <label>
-                  <input type="checkbox" class="filled-in"
-                         :checked="stats.lyrics.writeSidecarEnabled"
-                         v-on:change="toggleWriteSidecar($event.target.checked)" />
-                  <span>
-                    <b>Also write <code>.lrc</code> / <code>.txt</code> sidecar next to the audio file</b><br>
-                    <small style="color:#777">
-                      Default off. When on, a successful LRCLib fetch also drops a sibling sidecar
-                      file so the lyrics travel with the track if it's copied elsewhere.
-                      Never overwrites an existing sidecar; silently skipped on read-only storage.
-                    </small>
-                  </span>
-                </label>
+                Lyrics are fetched ahead of time by the proactive backfill worker.
+                Enable it, choose providers, and toggle sidecar writing in the
+                <b>Lyrics</b> admin section. This card just shows the read-only
+                cache / cooldown ledger that the worker keeps.
               </p>
               <table v-if="stats.lyrics.cache" style="max-width:400px">
                 <tbody>
@@ -4278,36 +5055,9 @@ const subsonicView = Vue.component('subsonic-view', {
         this.testPending = false;
       }
     },
-    // V20: LRCLib lyrics-cache controls. Toggle flips the config flag;
-    // purge wipes rows (mode='full' for all, 'retry' for error/pending).
-    // Each call refreshes the stats so the UI counters stay accurate.
-    toggleLrclib: async function() {
-      const enabled = !this.stats.lyrics?.lrclibEnabled;
-      try {
-        await API.axios({
-          method: 'POST',
-          url: `${API.url()}/api/v1/admin/subsonic/lyrics-cache/enabled`,
-          data: { enabled },
-        });
-        await ADMINDATA.getSubsonicStats();
-      } catch (err) {
-        iziToast.error({ title: `Failed to ${enabled ? 'enable' : 'disable'}: ${err.message || '?'}`,
-          position: 'topCenter', timeout: 3000 });
-      }
-    },
-    toggleWriteSidecar: async function(enabled) {
-      try {
-        await API.axios({
-          method: 'POST',
-          url: `${API.url()}/api/v1/admin/subsonic/lyrics-cache/write-sidecar`,
-          data: { enabled },
-        });
-        await ADMINDATA.getSubsonicStats();
-      } catch (err) {
-        iziToast.error({ title: `Sidecar toggle failed: ${err.message || '?'}`,
-          position: 'topCenter', timeout: 3000 });
-      }
-    },
+    // Lyrics cache ledger purge (the enable / sidecar-write toggles moved to
+    // the dedicated Lyrics admin view). mode='full' wipes all rows, 'retry'
+    // clears error/pending; each call refreshes the stats counters.
     purgeLyricsCache: async function(mode) {
       try {
         const r = await API.axios({
@@ -4319,7 +5069,7 @@ const subsonicView = Vue.component('subsonic-view', {
         setTimeout(() => { this.lyricsCachePurgeMsg = null; }, 4000);
         await ADMINDATA.getSubsonicStats();
       } catch (err) {
-        iziToast.error({ title: `Purge failed: ${err.message || '?'}`,
+        iziToast.error({ title: `Purge failed: ${escHtml(err.message || '?')}`,
           position: 'topCenter', timeout: 3000 });
       }
     },
@@ -4330,7 +5080,9 @@ const subsonicView = Vue.component('subsonic-view', {
       iziToast.question({
         timeout: 20000, close: false, overlayClose: true, overlay: true,
         displayMode: 'once', id: 'admin-mint-key', zindex: 99999, layout: 2,
-        title: `Create a Subsonic API key for "${username}"?`,
+        // Usernames have no server-side character validation — escape
+        // them at every toast sink in this flow.
+        title: `Create a Subsonic API key for "${escHtml(username)}"?`,
         message: `The key will be labelled "${name}". You will see the key value once and must relay it to the user yourself.`,
         position: 'center',
         buttons: [
@@ -4338,9 +5090,9 @@ const subsonicView = Vue.component('subsonic-view', {
             try {
               const data = await ADMINDATA.mintKeyFor(username, name);
               this.adminMintedForUser = { val: data.key, name: data.name, username: data.username };
-              iziToast.success({ title: `Key created for ${username}`, position: 'topCenter', timeout: 3000 });
+              iziToast.success({ title: `Key created for ${escHtml(username)}`, position: 'topCenter', timeout: 3000 });
             } catch (err) {
-              iziToast.error({ title: `Failed to create key: ${err.message || 'unknown error'}`, position: 'topCenter', timeout: 4000 });
+              iziToast.error({ title: `Failed to create key: ${escHtml(err.message || 'unknown error')}`, position: 'topCenter', timeout: 4000 });
             } finally {
               instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             }
@@ -4376,7 +5128,7 @@ const subsonicView = Vue.component('subsonic-view', {
       iziToast.question({
         timeout: 20000, close: false, overlayClose: true, overlay: true,
         displayMode: 'once', id: 'api-key-revoke', zindex: 99999, layout: 2,
-        title: `Revoke API key "${k.name || '(unnamed)'}"?`,
+        title: `Revoke API key "${escHtml(k.name || '(unnamed)')}"?`,
         message: 'Any client using this key will stop working. You cannot undo this.',
         position: 'center',
         buttons: [
@@ -5097,6 +5849,20 @@ const torrentView = Vue.component('torrent-view', {
                         <span v-if="r.outcome === 'seeded'">
                           ✓ {{r.vpath}} → <code>{{r.addedAt}}</code>
                         </span>
+                        <span v-else-if="r.outcome === 'match_unmapped'">
+                          All files found in <b>{{r.vpath}}</b> at <code>{{r.matchedRoot}}</code>,
+                          but the path mapping for that library is
+                          {{r.mappingConfidence ? 'not confirmed' : 'not probed yet'}} —
+                          run auto-detect in "Library Access" above, then retry.
+                        </span>
+                        <span v-else-if="r.outcome === 'pad_files_missing'">
+                          All files found in <b>{{r.vpath}}</b>, but this is a hybrid torrent
+                          whose alignment (padding) files aren't on disk
+                          ({{r.padFilesPresent}}/{{r.padFilesTotal}} present).
+                          {{r.clientType}} can't seed without them — it would re-download the
+                          boundary pieces. Use qBittorrent/Deluge (which synthesize padding),
+                          or fetch this torrent's padding files first.
+                        </span>
                         <span v-else-if="r.outcome === 'partial_match'">
                           {{r.matched}}/{{r.total}} files matched in <b>{{r.vpath}}</b>; missing:
                           <span v-for="(m, i) in r.missing.slice(0, 3)" :key="i" style="font-family:monospace">
@@ -5368,6 +6134,18 @@ const torrentView = Vue.component('torrent-view', {
       </div>
     </div>`,
   methods: {
+    // iziToast renders `title`/`message` as HTML (its internal helper
+    // does div.innerHTML = value), so any interpolated server data —
+    // torrent names (attacker-controlled info.name), vpath/library
+    // names, usernames, daemon-reported version strings — must be
+    // HTML-escaped before it reaches a toast. Vue's own {{ }} template
+    // interpolation escapes automatically, but these programmatic toast
+    // calls bypass it.
+    _esc: function(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+      }[c]));
+    },
     applyClient: async function() {
       const client = this.selectedClient;
       try {
@@ -5425,7 +6203,7 @@ const torrentView = Vue.component('torrent-view', {
         });
         Vue.set(ADMINDATA.users[username], 'allowTorrent', allowTorrent);
         iziToast.success({
-          title: `${username}: torrent ${allowTorrent ? 'granted' : 'revoked'}`,
+          title: `${this._esc(username)}: torrent ${allowTorrent ? 'granted' : 'revoked'}`,
           position: 'topCenter',
           timeout: 2500
         });
@@ -5457,7 +6235,7 @@ const torrentView = Vue.component('torrent-view', {
         });
         if (res.data.ok) {
           iziToast.success({
-            title: `Reachable${res.data.version ? ' (Transmission ' + res.data.version + ')' : ''}`,
+            title: `Reachable${res.data.version ? ' (Transmission ' + this._esc(res.data.version) + ')' : ''}`,
             position: 'topCenter', timeout: 3000
           });
         } else {
@@ -5489,7 +6267,7 @@ const torrentView = Vue.component('torrent-view', {
           // Same applies to qBittorrent + Deluge below.
           await ADMINDATA.getTorrentVpathAccess();
           iziToast.success({
-            title: `Connected${res.data.version ? ' to Transmission ' + res.data.version : ''}`,
+            title: `Connected${res.data.version ? ' to Transmission ' + this._esc(res.data.version) : ''}`,
             position: 'topCenter', timeout: 3500
           });
           // Wipe the password field once it's been accepted — the
@@ -5587,7 +6365,7 @@ const torrentView = Vue.component('torrent-view', {
         Vue.set(this.accessEditPath, name, null);
         Vue.set(this.accessEditMode, name, 'view');
         iziToast.success({
-          title: `${name}: mapped → ${res.data.daemonPath} (${res.data.confidence})`,
+          title: `${this._esc(name)}: mapped → ${this._esc(res.data.daemonPath)} (${this._esc(res.data.confidence)})`,
           position: 'topCenter', timeout: 3000
         });
       } catch (err) {
@@ -5598,7 +6376,7 @@ const torrentView = Vue.component('torrent-view', {
         // is persisted — just the final state.
         await ADMINDATA.getTorrentVpathAccess();
         iziToast.error({
-          title: errorData.message || errorData.error || err.message || 'Could not verify path',
+          title: this._esc(errorData.message || errorData.error || err.message || 'Could not verify path'),
           position: 'topCenter', timeout: 5000
         });
       } finally {
@@ -5623,7 +6401,7 @@ const torrentView = Vue.component('torrent-view', {
       } catch (err) {
         const errorData = err.response?.data || {};
         iziToast.error({
-          title: errorData.message || errorData.error || err.message || 'Auto-detect failed',
+          title: this._esc(errorData.message || errorData.error || err.message || 'Auto-detect failed'),
           position: 'topCenter', timeout: 3500
         });
       } finally {
@@ -5698,7 +6476,7 @@ const torrentView = Vue.component('torrent-view', {
           Vue.delete(this.tmplDraft, name);
           await ADMINDATA.getTorrentPathTemplates();
           iziToast.success({
-            title: raw ? `${name}: template saved` : `${name}: template cleared`,
+            title: raw ? `${this._esc(name)}: template saved` : `${this._esc(name)}: template cleared`,
             position: 'topCenter', timeout: 2500
           });
         } else {
@@ -5730,6 +6508,8 @@ const torrentView = Vue.component('torrent-view', {
     seedChipClass(outcome) {
       switch (outcome) {
         case 'seeded':            return 'status-verified';
+        case 'match_unmapped':    return 'status-inferred';
+        case 'pad_files_missing': return 'status-inferred';
         case 'partial_match':     return 'status-inferred';
         case 'already_in_daemon': return 'status-inferred';
         case 'no_match':          return 'status-unconfirmed';
@@ -5741,6 +6521,8 @@ const torrentView = Vue.component('torrent-view', {
     seedChipLabel(outcome) {
       switch (outcome) {
         case 'seeded':            return '✓ Seeding';
+        case 'match_unmapped':    return '! Unmapped';
+        case 'pad_files_missing': return '! Needs padding';
         case 'partial_match':     return '~ Partial';
         case 'already_in_daemon': return '⊝ Already there';
         case 'no_match':          return '✗ Not found';
@@ -5836,7 +6618,9 @@ const torrentView = Vue.component('torrent-view', {
       try {
         await ADMINDATA.getTorrentList();
         if (this.list.error) {
-          iziToast.error({ title: this.list.error, position: 'topCenter', timeout: 3500 });
+          // Daemon-derived (listTorrents err.message) → HTML-escape before
+          // the iziToast title sink, like every other error path here.
+          iziToast.error({ title: this._esc(this.list.error), position: 'topCenter', timeout: 3500 });
         }
       } finally {
         this.listRefreshPending = false;
@@ -5866,13 +6650,13 @@ const torrentView = Vue.component('torrent-view', {
           // Surface as a warning rather than success so the operator
           // knows the daemon may still have the torrent in its session.
           iziToast.warning({
-            title:    `${t.name}: mStream record removed, daemon-side delete failed`,
-            message:  body.daemonRemoveError || 'See server logs',
+            title:    `${this._esc(t.name)}: mStream record removed, daemon-side delete failed`,
+            message:  this._esc(body.daemonRemoveError || 'See server logs'),
             position: 'topCenter', timeout: 5500,
           });
         } else {
           iziToast.success({
-            title:    `Removed ${t.name}`,
+            title:    `Removed ${this._esc(t.name)}`,
             message:  'Files on disk kept',
             position: 'topCenter', timeout: 3000,
           });
@@ -5881,7 +6665,7 @@ const torrentView = Vue.component('torrent-view', {
       } catch (err) {
         const body = err.response?.data || {};
         iziToast.error({
-          title:    body.message || body.error || err.message || 'Remove failed',
+          title:    this._esc(body.message || body.error || err.message || 'Remove failed'),
           position: 'topCenter', timeout: 4000,
         });
       } finally {
@@ -5924,12 +6708,14 @@ const torrentView = Vue.component('torrent-view', {
         await ADMINDATA.getTorrentStatus();
         if (this.status.connected) {
           iziToast.success({
-            title: `Reachable${this.status.version ? ` (${label} ${this.status.version})` : ''}`,
+            title: `Reachable${this.status.version ? ` (${this._esc(label)} ${this._esc(this.status.version)})` : ''}`,
             position: 'topCenter', timeout: 3000
           });
         } else {
           iziToast.error({
-            title: this.status.reason || 'Not reachable',
+            // Daemon-derived (testConnection err.message) → escape, mirroring
+            // the escaped version string in the reachable branch above.
+            title: this._esc(this.status.reason || 'Not reachable'),
             position: 'topCenter', timeout: 4000
           });
         }
@@ -5958,7 +6744,7 @@ const torrentView = Vue.component('torrent-view', {
         });
         if (res.data.ok) {
           iziToast.success({
-            title: `Reachable${res.data.version ? ' (qBittorrent ' + res.data.version + ')' : ''}`,
+            title: `Reachable${res.data.version ? ' (qBittorrent ' + this._esc(res.data.version) + ')' : ''}`,
             position: 'topCenter', timeout: 3000
           });
         } else {
@@ -5985,7 +6771,7 @@ const torrentView = Vue.component('torrent-view', {
           await ADMINDATA.getTorrentVpathAccess();
           await ADMINDATA.getTorrentList();
           iziToast.success({
-            title: `Connected${res.data.version ? ' to qBittorrent ' + res.data.version : ''}`,
+            title: `Connected${res.data.version ? ' to qBittorrent ' + this._esc(res.data.version) : ''}`,
             position: 'topCenter', timeout: 3500
           });
           this.qForm.password = '';
@@ -6035,7 +6821,7 @@ const torrentView = Vue.component('torrent-view', {
         });
         if (res.data.ok) {
           iziToast.success({
-            title: `Reachable${res.data.version ? ' (Deluge ' + res.data.version + ')' : ''}`,
+            title: `Reachable${res.data.version ? ' (Deluge ' + this._esc(res.data.version) + ')' : ''}`,
             position: 'topCenter', timeout: 3000
           });
         } else {
@@ -6062,7 +6848,7 @@ const torrentView = Vue.component('torrent-view', {
           await ADMINDATA.getTorrentVpathAccess();
           await ADMINDATA.getTorrentList();
           iziToast.success({
-            title: `Connected${res.data.version ? ' to Deluge ' + res.data.version : ''}`,
+            title: `Connected${res.data.version ? ' to Deluge ' + this._esc(res.data.version) : ''}`,
             position: 'topCenter', timeout: 3500
           });
           this.dForm.password = '';
@@ -6130,11 +6916,15 @@ const backupView = Vue.component('backup-view', {
       triggerType: 'after-scan',
       dailyAtHour: 3,                 // 3am — quiet hour, picked when trigger=daily
       retentionDays: 30,
-      // Comma-separated patterns the user can edit. Pre-populated with the
-      // server's default list so a fresh form looks like a fresh destination
-      // would behave (omitting excludeGlobs at create time → server applies
-      // the same defaults).
-      excludePatternsCsv: 'Thumbs.db, desktop.ini, .DS_Store, ._*',
+      // Comma-separated patterns the user can edit. Seeded from the
+      // server's default list (GET /backup/platform) so a fresh form
+      // shows what a fresh destination would actually exclude; when the
+      // user leaves it untouched, submitForm omits excludeGlobs so the
+      // row stores NULL and tracks future default changes. The platform
+      // fetch fires at page load, so it has normally landed long before
+      // this view mounts — the serverDefaultExcludes watcher below
+      // covers the race when it hasn't.
+      excludePatternsCsv: (ADMINDATA.backupPlatform.defaultExcludes || []).join(', '),
       // 0 = no throttle. The form helper text frames "200ms" as a
       // sensible value for users who want to keep streaming smooth
       // during a backup; we don't pre-fill that as a default because
@@ -6260,13 +7050,13 @@ const backupView = Vue.component('backup-view', {
 
                   <div class="row">
                     <div class="input-field col s6 m3" v-if="triggerType === 'daily'">
-                      <input v-model.number="dailyAtHour" id="backup-daily-hour" type="number" min="0" max="23" class="validate">
+                      <input v-model.number="dailyAtHour" id="backup-daily-hour" required type="number" min="0" max="23" class="validate">
                       <label for="backup-daily-hour" class="active">Hour (0–23)</label>
                     </div>
                     <div class="input-field col s6 m3">
                       <input v-model.number="retentionDays" id="backup-retention" type="number" min="0" class="validate">
                       <label for="backup-retention" class="active">Retention (days)</label>
-                      <span class="helper-text">0 = hard delete</span>
+                      <span class="helper-text">Days deleted/changed files stay recoverable in the backup's trash. 0 = no trash: old copies are deleted immediately and unrecoverably.</span>
                     </div>
                     <div class="input-field col s6 m3">
                       <input v-model.number="interFileDelayMs" id="backup-throttle" type="number" min="0" max="60000" class="validate">
@@ -6310,7 +7100,7 @@ const backupView = Vue.component('backup-view', {
 
                   <div class="row">
                     <button class="btn green waves-effect waves-light col m4 s12" type="submit"
-                            :disabled="submitPending || checkPending || checkErrors.length > 0 || !libraryName || !destPath">
+                            :disabled="submitPending || checkPending || checkErrors.length > 0 || !libraryName || !destPath || !numbersValid">
                       {{ submitPending ? 'Adding…' : 'Add destination' }}
                     </button>
                   </div>
@@ -6352,7 +7142,7 @@ const backupView = Vue.component('backup-view', {
                 <td>
                   <input type="number" min="0" max="60000"
                          :value="d.inter_file_delay_ms || 0"
-                         @change="setThrottle(d, Number($event.target.value))"
+                         @change="setThrottle(d, $event)"
                          style="margin:0;display:inline-block;width:70px;height:28px;font-size:13px;padding:0 4px"
                          :title="(d.inter_file_delay_ms || 0) === 0 ? 'No throttle' : (d.inter_file_delay_ms + 'ms between files')">
                   <span class="grey-text" style="font-size:11px">ms</span>
@@ -6366,12 +7156,14 @@ const backupView = Vue.component('backup-view', {
                   <span v-else-if="!d.lastRun" class="grey-text">never</span>
                   <span v-else :title="d.lastRun.error_message || ''" :style="{ color: statusColor(d.lastRun.status) }">
                     {{ d.lastRun.status }}
-                    <span class="grey-text" style="font-size:11px">({{ formatRunSummary(d.lastRun) }})</span>
+                    <!-- failed/skipped rows have zero counts → empty summary;
+                         suppress the parens rather than render "failed ()" -->
+                    <span v-if="formatRunSummary(d.lastRun)" class="grey-text" style="font-size:11px">({{ formatRunSummary(d.lastRun) }})</span>
                   </span>
                 </td>
                 <td>
                   <select :value="d.enabled ? 'true' : 'false'"
-                          v-on:change="setEnabled(d, $event.target.value === 'true')"
+                          v-on:change="setEnabled(d, $event)"
                           style="margin:0;display:inline-block;width:auto;height:28px;font-size:13px">
                     <option value="true">on</option>
                     <option value="false">off</option>
@@ -6379,7 +7171,9 @@ const backupView = Vue.component('backup-view', {
                 </td>
                 <td>
                   [<a v-on:click="showEditDestination(d)">Edit</a>]
-                  [<a v-on:click="runNow(d)">Run now</a>]
+                  <!-- A disabled destination always 400s on /run — grey the
+                       link out instead of offering a dead button. -->
+                  [<a v-if="d.enabled" v-on:click="runNow(d)">Run now</a><span v-else class="grey-text" style="cursor:default" title="Destination is disabled — set Enabled to 'on' to run it">Run now</span>]
                   [<a v-on:click="showHistory(d)">History</a>]
                   [<a v-on:click="removeDestination(d)" style="color:#c62828">Delete</a>]
                 </td>
@@ -6392,16 +7186,30 @@ const backupView = Vue.component('backup-view', {
   `,
   watch: {
     // sharedSelect is mutated by fileExplorerModal when the user picks a path.
-    // We watch it to populate the form, and immediately re-validate.
+    // We watch it to populate the form. (No scheduleCheck here — setting
+    // destPath fires the destPath watcher below; a second call would
+    // just reset the same debounce timer.)
     'sharedSelect.value': function (newVal) {
       if (newVal) {
         this.destPath = newVal;
-        this.scheduleCheck();
       }
     },
+    // Re-validate on ANY path change — picked via the dialog or typed/
+    // edited by hand. Without this, manual edits left checkErrors stale
+    // in both directions: a fixed path never re-enabled the submit
+    // button, and a broken path kept it enabled until the server 400'd.
+    destPath: function () { this.scheduleCheck(); },
     // Re-check when library changes — sameDrive detection depends on the
     // source path which comes from the selected library.
     libraryName: function () { this.scheduleCheck(); },
+    // Late-arriving platform data (view mounted before the boot-time
+    // fetch landed): seed the patterns field, but only if the user
+    // hasn't already typed into it.
+    serverDefaultExcludes: function (newVal, oldVal) {
+      if (this.excludePatternsCsv === (oldVal || []).join(', ')) {
+        this.excludePatternsCsv = (newVal || []).join(', ');
+      }
+    },
   },
   created: function () {
     // Reset the shared select so a stale value from another view doesn't
@@ -6426,6 +7234,23 @@ const backupView = Vue.component('backup-view', {
     if (this.checkDebounceTimer) { clearTimeout(this.checkDebounceTimer); }
   },
   computed: {
+    // The live default exclude list, from GET /backup/platform. Null
+    // until that fetch lands (see the watcher that handles the race).
+    serverDefaultExcludes() {
+      return this.platform.defaultExcludes;
+    },
+    // Client-side mirror of the server's numeric constraints so the
+    // form catches them inline instead of round-tripping to a Joi 400
+    // toast. v-model.number yields '' for a cleared field, which
+    // Number.isInteger correctly rejects.
+    numbersValid() {
+      const hourOk = this.triggerType !== 'daily'
+        || (Number.isInteger(this.dailyAtHour) && this.dailyAtHour >= 0 && this.dailyAtHour <= 23);
+      const retentionOk = Number.isInteger(this.retentionDays) && this.retentionDays >= 0;
+      const throttleOk = Number.isInteger(this.interFileDelayMs)
+        && this.interFileDelayMs >= 0 && this.interFileDelayMs <= 60000;
+      return hourOk && retentionOk && throttleOk;
+    },
     // Sum of all entries the active run has processed so far. Lines
     // up with the denominator (status.active.expectedFiles), which is
     // the previous successful run's copied+unchanged+trashed total.
@@ -6486,6 +7311,7 @@ const backupView = Vue.component('backup-view', {
     statusColor(status) {
       return status === 'success' ? '#2e7d32'
            : status === 'failed' ? '#c62828'
+           : status === 'partial' ? '#e65100'
            : status === 'skipped' ? '#f57f17'
            : '#1976d2';
     },
@@ -6496,8 +7322,12 @@ const backupView = Vue.component('backup-view', {
     },
     // Debounce path checks so we don't fire one per keystroke. 400ms feels
     // responsive without being chatty — most users either click "Browse"
-    // (one event) or type once and stop.
+    // (one event) or type once and stop. checkPending is raised HERE, not
+    // in checkPath, so the submit gate blocks for the whole debounce
+    // window — otherwise an edit followed by a quick submit would race
+    // the timer and go out against the previous path's stale results.
     scheduleCheck() {
+      this.checkPending = true;
       if (this.checkDebounceTimer) { clearTimeout(this.checkDebounceTimer); }
       this.checkDebounceTimer = setTimeout(() => this.checkPath(), 400);
     },
@@ -6506,18 +7336,19 @@ const backupView = Vue.component('backup-view', {
         this.checkErrors = [];
         this.checkWarnings = [];
         this.checkInfo = null;
+        this.checkPending = false;
         return;
       }
       const lib = this.folders[this.libraryName];
-      if (!lib) { return; }
       // Match by name → id via the libraries cache. Backend endpoints take
-      // numeric library ids; the UI uses the vpath name as the key.
-      const libraryId = lib.id;
-      if (!libraryId) {
-        // ADMINDATA.folders structure may not include id — fall back to
-        // skipping live check; submit will still validate server-side.
+      // numeric library ids; the UI uses the vpath name as the key. If the
+      // cache has no id (structure drift), skip the live check; submit
+      // still validates server-side.
+      if (!lib || !lib.id) {
+        this.checkPending = false;
         return;
       }
+      const libraryId = lib.id;
       try {
         this.checkPending = true;
         const res = await API.axios({
@@ -6546,6 +7377,20 @@ const backupView = Vue.component('backup-view', {
     async submitForm() {
       const lib = this.folders[this.libraryName];
       if (!lib) { return; }
+      // An untouched patterns field means "the defaults" — OMIT
+      // excludeGlobs so the row stores NULL and tracks future default
+      // changes (the API's three-state semantics: omitted → NULL →
+      // defaults at read time; [] → exclude nothing; array → pinned).
+      // Sending the parsed copy instead would pin today's snapshot,
+      // which the edit modal's "Reset patterns to defaults" button
+      // exists to undo. undefined keys drop out of the JSON body.
+      const parsedExcludes = this.parseExcludeCsv(this.excludePatternsCsv);
+      // If the platform fetch never landed the field seeded empty — treat
+      // blank as untouched there too (omit → defaults): pinning "exclude
+      // nothing" should require having SEEN the defaults and cleared them.
+      const isDefaultExcludes = this.serverDefaultExcludes
+        ? JSON.stringify(parsedExcludes) === JSON.stringify(this.serverDefaultExcludes)
+        : parsedExcludes.length === 0;
       try {
         this.submitPending = true;
         await API.axios({
@@ -6558,7 +7403,7 @@ const backupView = Vue.component('backup-view', {
             dailyAtHour: this.triggerType === 'daily' ? this.dailyAtHour : undefined,
             retentionDays: this.retentionDays,
             enabled: true,
-            excludeGlobs: this.parseExcludeCsv(this.excludePatternsCsv),
+            excludeGlobs: isDefaultExcludes ? undefined : parsedExcludes,
             interFileDelayMs: this.interFileDelayMs,
           },
         });
@@ -6569,13 +7414,13 @@ const backupView = Vue.component('backup-view', {
         this.dailyAtHour = 3;
         this.retentionDays = 30;
         this.interFileDelayMs = 0;
-        this.excludePatternsCsv = 'Thumbs.db, desktop.ini, .DS_Store, ._*';
+        this.excludePatternsCsv = (this.serverDefaultExcludes || []).join(', ');
         this.checkErrors = [];
         this.checkWarnings = [];
         await ADMINDATA.getBackupDestinations();
       } catch (err) {
         iziToast.error({
-          title: err.response?.data?.error || 'Failed to add destination',
+          title: escHtml(err.response?.data?.error || 'Failed to add destination'),
           position: 'topCenter',
           timeout: 4000,
         });
@@ -6588,7 +7433,8 @@ const backupView = Vue.component('backup-view', {
       modVM.currentViewModal = 'backup-edit-modal';
       M.Modal.getInstance(document.getElementById('admin-modal')).open();
     },
-    async setEnabled(dest, enabled) {
+    async setEnabled(dest, event) {
+      const enabled = event.target.value === 'true';
       try {
         await API.axios({
           method: 'PATCH',
@@ -6598,13 +7444,18 @@ const backupView = Vue.component('backup-view', {
         // Reflect locally without waiting for refetch, so the toggle stays in sync.
         Vue.set(dest, 'enabled', enabled ? 1 : 0);
       } catch (err) {
-        iziToast.error({ title: 'Toggle failed', position: 'topCenter', timeout: 3000 });
+        // Snap the <select> back: it's :value-bound, so a rejected change
+        // isn't reverted by Vue (the underlying data never moved and the
+        // vdom sees nothing to patch) — without this the UI keeps showing
+        // a state the server refused.
+        event.target.value = dest.enabled ? 'true' : 'false';
+        iziToast.error({ title: escHtml(err.response?.data?.error || 'Toggle failed'), position: 'topCenter', timeout: 3000 });
       }
     },
-    async setThrottle(dest, ms) {
+    async setThrottle(dest, event) {
       // Clamp client-side to keep an obviously-bad value from round-tripping
       // to the server only to be 400'd back. The server still re-validates.
-      const clamped = Math.max(0, Math.min(60000, Math.round(ms || 0)));
+      const clamped = Math.max(0, Math.min(60000, Math.round(Number(event.target.value) || 0)));
       try {
         await API.axios({
           method: 'PATCH',
@@ -6612,8 +7463,13 @@ const backupView = Vue.component('backup-view', {
           data: { interFileDelayMs: clamped },
         });
         Vue.set(dest, 'inter_file_delay_ms', clamped);
+        // Show the value that was actually saved. Vue can't be relied on
+        // to patch the :value-bound input when the clamp lands on the
+        // value the data already held (typed 99999 over a stored 60000).
+        event.target.value = clamped;
       } catch (err) {
-        iziToast.error({ title: 'Throttle update failed', position: 'topCenter', timeout: 3000 });
+        event.target.value = dest.inter_file_delay_ms || 0;
+        iziToast.error({ title: escHtml(err.response?.data?.error || 'Throttle update failed'), position: 'topCenter', timeout: 3000 });
       }
     },
     async runNow(dest) {
@@ -6631,13 +7487,22 @@ const backupView = Vue.component('backup-view', {
         // without waiting for the next 2s tick.
         ADMINDATA.getBackupStatus();
       } catch (err) {
-        iziToast.error({ title: 'Run failed', position: 'topCenter', timeout: 3000 });
+        iziToast.error({ title: escHtml(err.response?.data?.error || 'Run failed'), position: 'topCenter', timeout: 3000 });
       }
     },
     async showHistory(dest) {
       ADMINDATA.selectedBackupDest = dest;
       modVM.currentViewModal = 'backup-history-modal';
       M.Modal.getInstance(document.getElementById('admin-modal')).open();
+    },
+    // iziToast renders message as HTML (the <br> tags below rely on it),
+    // so anything user-controlled must be escaped before interpolation —
+    // dest_path is admin-entered and round-trips verbatim through the API.
+    // Stored self-XSS only (admins set these values), but this is the one
+    // spot in the backup UI where API data bypasses Vue's auto-escaping.
+    escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g,
+        (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     },
     removeDestination(dest) {
       iziToast.question({
@@ -6649,7 +7514,7 @@ const backupView = Vue.component('backup-view', {
         layout: 2,
         maxWidth: 600,
         title: `Delete backup destination?`,
-        message: `${dest.library_name} → ${dest.dest_path}<br><br>The destination's existing files on disk are NOT deleted; only the schedule + history record are removed. You can re-add the same path later.`,
+        message: `${this.escapeHtml(dest.library_name)} → ${this.escapeHtml(dest.dest_path)}<br><br>The destination's existing files on disk are NOT deleted; only the schedule + history record are removed. You can re-add the same path later.`,
         position: 'center',
         buttons: [
           [`<button><b>Delete</b></button>`, async (instance, toast) => {
@@ -6662,7 +7527,7 @@ const backupView = Vue.component('backup-view', {
               await ADMINDATA.getBackupDestinations();
               iziToast.success({ title: 'Deleted', position: 'topCenter', timeout: 2000 });
             } catch (err) {
-              iziToast.error({ title: 'Delete failed', position: 'topCenter', timeout: 3000 });
+              iziToast.error({ title: escHtml(err.response?.data?.error || 'Delete failed'), position: 'topCenter', timeout: 3000 });
             }
           }, true],
           [`<button>Cancel</button>`, (instance, toast) => {
@@ -6672,6 +7537,499 @@ const backupView = Vue.component('backup-view', {
       });
     },
   },
+});
+
+// The Discovery page (Config section of the nav): the p2p network card,
+// moved out of the Database page so the network has a home of its own —
+// the local-analysis settings (collect/model/per-run) stay with the scan
+// settings on the Database page, since they run whether or not p2p is on.
+const discoveryView = Vue.component('discovery-view', {
+  data() {
+    return {
+      discoveryP2p: { loaded: false, status: null, peers: [], storage: null, autoFetch: false },
+      p2pIdentity: P2PIDENTITY,
+      p2pToggling: false,
+      peerFilter: '',
+      friendTicket: '',
+      joinPending: false
+    };
+  },
+  template: `
+    <div>
+      <div class="container">
+        <div class="row">
+          <div class="col s12">
+            <div class="card">
+              <div class="card-content">
+                <span class="card-title">Discovery Network (P2P)</span>
+                <div v-if="!discoveryP2p.loaded"><p>Loading…</p></div>
+                <div v-else-if="!discoveryP2p.status || discoveryP2p.status.enabled !== true">
+                  <p>Join the discovery network to get music recommendations from other people's
+                  libraries — the player's Discover panel gains a "From the network" section, and
+                  your server appears in the catalog other operators browse.</p>
+                  <p><b>What gets shared:</b> a <b>metadata-only</b> snapshot of your library —
+                  artist, title, duration, track IDs, and audio "sound fingerprint" embeddings.
+                  <b>Never any audio files.</b> Your server's name and description are visible to
+                  everyone on the network, and by default the snapshot is published to the public
+                  community network.</p>
+                  <p>Enabling this also turns on <b>music-discovery data collection</b> (the
+                  post-scan analysis that builds the embeddings) if it isn't already on. You can
+                  disable the network here at any time; collected data stays local until you
+                  re-enable it.</p>
+                  <p v-if="discoveryP2p.status && discoveryP2p.status.binaryFound === false" style="color: #b71c1c;">
+                    The p2p-sidecar binary was not found for this platform — the network is unavailable.
+                  </p>
+                  <a v-else v-on:click="enableP2p()" :class="{disabled: p2pToggling}" class="waves-effect waves-light btn green">
+                    {{ p2pToggling ? 'Enabling…' : 'Enable Discovery Network' }}
+                  </a>
+                  <div v-if="p2pToggling" class="progress" style="max-width: 480px; margin: 10px 0 4px 0;"><div class="indeterminate"></div></div>
+                </div>
+                <div v-else>
+                  <p v-if="!discoveryP2p.status.binaryFound" style="color: #b71c1c;">
+                    The p2p-sidecar binary was not found for this platform — the network is unavailable.
+                  </p>
+                  <p><b>Endpoint:</b> <code style="word-break: break-all;">{{ discoveryP2p.status.endpointId || '(sidecar not running yet)' }}</code></p>
+                  <p><b>Announcing as:</b> {{ p2pIdentity.serverName }}
+                    <span v-if="p2pIdentity.serverDescription"> — {{ p2pIdentity.serverDescription }}</span>
+                    <span v-else style="color: #9e9e9e;"> — no description (other servers see only the name)</span>
+                    [<a v-on:click="openModal('edit-p2p-identity-modal')">{{ t('admin.settings.edit') }}</a>]
+                  </p>
+                  <p><b>Network:</b>
+                    <span v-if="discoveryP2p.status.neighbors > 0" style="color: #2e7d32;">connected
+                      — {{ discoveryP2p.status.neighbors }} mesh neighbor{{ discoveryP2p.status.neighbors === 1 ? '' : 's' }}</span>
+                    <span v-else-if="meshRecovering" style="color: #c62828;">reconnecting — the sidecar died and
+                      is being replayed automatically (attempt {{ discoveryP2p.status.recovery.attempts }})</span>
+                    <span v-else-if="discoveryP2p.status.joined" style="color: #e65100;">joined, waiting for
+                      neighbors — the mesh weaves in within a minute or two of another server coming online</span>
+                    <span v-else>not joined yet</span>
+                  </p>
+                  <p v-if="discoveryP2p.status.watchdog && discoveryP2p.status.watchdog.lastRssMb !== null"><b>Sidecar memory:</b>
+                    {{ discoveryP2p.status.watchdog.lastRssMb.toFixed(0) }} MB resident<span
+                      v-if="discoveryP2p.status.watchdog.maxRssMb > 0"> — auto-restarts over {{ discoveryP2p.status.watchdog.maxRssMb }} MB</span><span
+                      v-else style="color: #e65100;"> — memory watchdog off</span><span
+                      v-if="discoveryP2p.status.watchdog.restarts > 0" style="color: #e65100;"> ·
+                      {{ discoveryP2p.status.watchdog.restarts }} watchdog restart{{ discoveryP2p.status.watchdog.restarts === 1 ? '' : 's' }} since boot</span>
+                  </p>
+                  <div v-if="meshSearching" style="max-width: 480px;">
+                    <div class="progress" style="margin: 4px 0 6px 0;"><div class="indeterminate"></div></div>
+                    <span style="color: #757575; font-size: 0.85em;">{{ meshRecovering
+                      ? 'reconnecting — crash recovery replays the stack on a widening ladder; no action needed'
+                      : 'searching for peers — this page updates itself every few seconds' }}</span>
+                  </div>
+                  <p v-if="discoveryP2p.status.ticket" style="margin-bottom: 4px;"><b>Your ticket</b> — a friend pastes this
+                  into the box below on <i>their</i> Discovery page to befriend this server:<br>
+                    <textarea readonly rows="2" style="width:100%; font-size: 0.8em;" onclick="this.select()">{{ discoveryP2p.status.ticket }}</textarea>
+                  </p>
+                  <p style="margin: 8px 0 2px 0;"><b>Befriend a server</b> — paste the ticket from a friend's Discovery page
+                  (saved to your config, so the friendship survives restarts):</p>
+                  <div style="display: flex; gap: 8px; max-width: 640px; align-items: center; margin-bottom: 8px;">
+                    <input v-model="friendTicket" id="p2p-friend-ticket" type="text" placeholder="endpoint…"
+                      style="flex: 1; margin: 0;" v-on:keyup.enter="discoveryJoinPeer()">
+                    <a v-on:click="discoveryJoinPeer()" :class="{disabled: joinPending || !friendTicket.trim()}"
+                      class="waves-effect waves-light btn green" style="flex-shrink: 0;">
+                      {{ joinPending ? 'Joining…' : 'Join' }}</a>
+                  </div>
+                  <p v-if="discoveryP2p.storage"><b>Peer snapshots:</b>
+                    {{ discoveryBytes(discoveryP2p.storage.usedBytes) }} of {{ discoveryBytes(discoveryP2p.storage.capBytes) }} used
+                    [<a v-on:click="openModal('edit-p2p-max-storage-modal')">{{ t('admin.settings.edit') }}</a>]
+                    — auto-fetch {{ discoveryP2p.autoFetch === false ? 'off'
+                      : discoveryP2p.status.autoFetchCount === 0 ? 'on (0 servers — automatic downloads paused)'
+                      : 'on (up to ' + discoveryP2p.status.autoFetchCount + ' servers)' }}
+                    [<a v-on:click="openModal('edit-p2p-auto-fetch-count-modal')">{{ t('admin.settings.edit') }}</a>]
+                    — community seeds {{ discoveryP2p.status.communitySeeds ? 'on (public network)' : 'off (friends only)' }}
+                  </p>
+                  <p><b>Forget offline servers:</b>
+                    {{ discoveryP2p.status.peerRetentionDays > 0
+                      ? 'after ' + discoveryP2p.status.peerRetentionDays + ' days of silence'
+                      : 'never (offline servers stay listed forever)' }}
+                    [<a v-on:click="openModal('edit-p2p-peer-retention-modal')">{{ t('admin.settings.edit') }}</a>]
+                  </p>
+                  <p><b>Rotate downloads:</b>
+                    {{ discoveryP2p.status.rotationDays > 0
+                      ? 'swap the oldest unpinned download for a new server after ' + discoveryP2p.status.rotationDays + ' days'
+                      : 'never (downloads stay until removed by hand)' }}
+                    [<a v-on:click="openModal('edit-p2p-rotation-modal')">{{ t('admin.settings.edit') }}</a>]
+                  </p>
+                  <div v-if="discoveryP2p.peers.length > 5" class="input-field" style="max-width: 360px; margin: 4px 0 0 0;">
+                    <input v-model="peerFilter" id="p2p-peer-filter" type="text" placeholder="Search servers — name or description">
+                  </div>
+                  <p v-if="peerFilter && discoveryP2p.peers.length > 0" style="color: #757575; font-size: 0.85em; margin: 2px 0;">
+                    {{ filteredPeers.length }} of {{ discoveryP2p.peers.length }} servers
+                  </p>
+                  <table v-if="filteredPeers.length > 0">
+                    <thead><tr><th>Server</th><th>Tracks</th><th>Seeders</th><th>Online</th><th>Model</th><th>Downloaded</th><th></th></tr></thead>
+                    <tbody>
+                      <tr v-for="peer in filteredPeers" :key="peer.from">
+                        <td>
+                          {{ peer.payload.name || (peer.from.slice(0, 12) + '…') }}
+                          <div v-if="peer.payload.description" style="color: #757575; font-size: 0.85em; max-width: 360px;">{{ peer.payload.description }}</div>
+                        </td>
+                        <td>{{ peer.payload.rowCount }}</td>
+                        <td>{{ peer.seeders }}</td>
+                        <td :title="peer.updatedAt">{{ peer.online ? 'online' : 'offline' + discoveryAge(peer.updatedAt) }}</td>
+                        <td>{{ peer.compatible === null ? 'unknown' : (peer.compatible ? 'compatible' : 'incompatible') }}</td>
+                        <td :title="peer.fetched && peer.fetched.firstFetchedAt ? 'held since ' + peer.fetched.firstFetchedAt : ''">
+                          {{ peer.fetched ? (peer.fetched.stale ? 'update available' : 'yes') : 'no' }}<span
+                            v-if="peer.fetched && peer.fetched.pinned"> · pinned</span>
+                        </td>
+                        <td>
+                          [<a v-on:click="discoveryFetchPeer(peer.from)">{{ peer.fetched ? 'Update' : 'Download' }}</a>]
+                          <span v-if="peer.fetched">[<a v-on:click="discoveryRemovePeer(peer.from)">Remove</a>]</span>
+                          <span v-if="peer.fetched">[<a v-on:click="discoveryPinPeer(peer.from, !peer.fetched.pinned)">{{ peer.fetched.pinned ? 'Unpin' : 'Pin' }}</a>]</span>
+                          <span v-if="!peer.online && !peer.fetched">[<a v-on:click="discoveryForgetPeer(peer.from)">Forget</a>]</span>
+                          [<a v-on:click="discoveryBlockPeer(peer.from)" style="color: #b71c1c;">Block</a>]
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                  <p v-else-if="discoveryP2p.peers.length > 0">No servers match
+                    &ldquo;{{ peerFilter }}&rdquo; — [<a v-on:click="peerFilter = ''">clear</a>]</p>
+                  <p v-else>No servers heard yet — paste a friend's ticket above and give gossip a minute.</p>
+                  <p v-if="discoveryP2p.status.blockedPeers && discoveryP2p.status.blockedPeers.length > 0"
+                    style="color: #757575; font-size: 0.9em;">
+                    <b>Blocked servers</b> — announcements ignored, snapshots never fetched:<br>
+                    <span v-for="id in discoveryP2p.status.blockedPeers" :key="id" style="margin-right: 12px; white-space: nowrap;">
+                      <code>{{ id.slice(0, 12) }}…</code> [<a v-on:click="discoveryUnblockPeer(id)">Unblock</a>]
+                    </span>
+                  </p>
+                  <p>[<a v-on:click="loadDiscoveryP2p()">Refresh</a>]
+                  [<a v-on:click="disableP2p()" style="color: #b71c1c;">Disable</a>]</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`,
+  computed: {
+    // The indeterminate "something is happening" state: the feature is on
+    // but the mesh hasn't produced a neighbor yet (sidecar starting, topic
+    // joining, or genuinely alone). Once a neighbor exists the numbers
+    // speak for themselves and the bar retires.
+    meshSearching: function() {
+      const s = this.discoveryP2p.status;
+      return !!(s && s.enabled === true
+        && (!s.running || !s.joined || (s.neighbors || 0) === 0));
+    },
+    // Narrower than meshSearching: crash recovery currently owns the
+    // sidecar (#880's replay ladder — attempts zero on success). Rendered
+    // as its own state so a dead sidecar reads "reconnecting, attempt N"
+    // instead of masquerading as the indistinguishable-from-startup
+    // "searching for peers" (the 6h45m outage was invisible for exactly
+    // that reason).
+    meshRecovering: function() {
+      const s = this.discoveryP2p.status;
+      return !!(s && s.enabled === true && s.recovery
+        && (s.recovery.attempts > 0 || s.recovery.retryPending)
+        && (s.neighbors || 0) === 0);
+    },
+    // Case-insensitive substring match over what the operator can see
+    // (name, description) plus the endpoint id for exactness. Preserves
+    // the server-side seeders/online/size ordering.
+    filteredPeers: function() {
+      const q = this.peerFilter.trim().toLowerCase();
+      if (!q) { return this.discoveryP2p.peers; }
+      return this.discoveryP2p.peers.filter((p) =>
+        (p.payload.name || '').toLowerCase().includes(q)
+        || (p.payload.description || '').toLowerCase().includes(q)
+        || p.from.toLowerCase().includes(q));
+    },
+  },
+  created: async function () {
+    this.loadDiscoveryP2p();
+    // Keep the card live while it's on screen: gossip fills the catalog and
+    // the mesh weaves in over ~a minute, and nobody should have to mash
+    // Refresh to watch it. Quiet polls (no error toast) so a transient
+    // hiccup doesn't nag every 10 seconds; skipped while the tab is hidden
+    // and while an enable/disable is in flight.
+    this.pollTimer = setInterval(() => {
+      if (document.hidden || this.p2pToggling) { return; }
+      if (!this.discoveryP2p.status || this.discoveryP2p.status.enabled !== true) { return; }
+      this.loadDiscoveryP2p(true);
+    }, 10000);
+  },
+  beforeDestroy: function () {
+    if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
+  },
+  methods: {
+    openModal: function(modalView) {
+      modVM.currentViewModal = modalView;
+      M.Modal.getInstance(document.getElementById('admin-modal')).open();
+    },
+    // The consent moment. What used to be "edit the config file and
+    // restart" is now this dialog — it must say what enabling actually
+    // does before anything is published.
+    enableP2p: function() {
+      iziToast.question({
+        timeout: 30000,
+        close: false,
+        overlayClose: true,
+        overlay: true,
+        displayMode: 'once',
+        id: 'question',
+        zindex: 99999,
+        layout: 2,
+        maxWidth: 600,
+        title: `<b>Join the discovery network?</b> Your server will publish a metadata-only snapshot of its music library (never audio files) to the public discovery network, with your server's name and description visible to everyone. Music-discovery data collection will also be enabled.`,
+        position: 'center',
+        buttons: [
+          [`<button><b>Enable</b></button>`, async (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+            this.p2pToggling = true;
+            try {
+              await API.axios({
+                method: 'POST',
+                url: `${API.url()}/api/v1/admin/discovery/p2p/enabled`,
+                data: { enabled: true }
+              });
+              iziToast.success({
+                title: 'Discovery network enabled',
+                message: 'Give the mesh a minute to weave in.',
+                position: 'topCenter', timeout: 4000
+              });
+              await this.loadDiscoveryP2p();
+              // Straight into naming the server: 'mStream' next to 18k
+              // other 'mStream's is the first thing everyone would want
+              // to change, so don't make them find the edit link.
+              this.openModal('edit-p2p-identity-modal');
+            } catch (err) {
+              iziToast.error({
+                title: 'Failed to enable the discovery network',
+                message: escHtml(err.response?.data?.error || ''),
+                position: 'topCenter', timeout: 6000
+              });
+              this.loadDiscoveryP2p();
+            } finally {
+              this.p2pToggling = false;
+            }
+          }, true],
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+          }],
+        ]
+      });
+    },
+    disableP2p: function() {
+      iziToast.question({
+        timeout: 20000,
+        close: false,
+        overlayClose: true,
+        overlay: true,
+        displayMode: 'once',
+        id: 'question',
+        zindex: 99999,
+        layout: 2,
+        maxWidth: 600,
+        title: `<b>Leave the discovery network?</b> Your server stops announcing and downloading snapshots. Local discovery features (data collection, the Discover panel) keep working, and already-fetched peer data stays until removed.`,
+        position: 'center',
+        buttons: [
+          [`<button><b>${t('admin.settings.disableButton')}</b></button>`, async (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+            this.p2pToggling = true;
+            try {
+              await API.axios({
+                method: 'POST',
+                url: `${API.url()}/api/v1/admin/discovery/p2p/enabled`,
+                data: { enabled: false }
+              });
+              iziToast.success({ title: 'Discovery network disabled', position: 'topCenter', timeout: 3500 });
+            } catch (err) {
+              iziToast.error({
+                title: t('admin.settings.failed'),
+                message: escHtml(err.response?.data?.error || ''),
+                position: 'topCenter', timeout: 4000
+              });
+            } finally {
+              this.p2pToggling = false;
+              this.loadDiscoveryP2p();
+            }
+          }, true],
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+          }],
+        ]
+      });
+    },
+    loadDiscoveryP2p: async function(quiet) {
+      try {
+        const status = (await API.axios({
+          method: 'GET', url: `${API.url()}/api/v1/admin/discovery/p2p/status`
+        })).data;
+        this.discoveryP2p.status = status;
+        P2PIDENTITY.serverName = status.serverName || '';
+        P2PIDENTITY.serverDescription = status.serverDescription || '';
+        if (status.maxPeerDbStorageMb) { P2PSETTINGS.maxPeerDbStorageMb = status.maxPeerDbStorageMb; }
+        // 0 (= never forget / no auto-downloads / no rotation) is a valid
+        // value for all of these — don't truthiness-check it away.
+        if (typeof status.peerRetentionDays === 'number') { P2PSETTINGS.peerRetentionDays = status.peerRetentionDays; }
+        if (typeof status.autoFetchCount === 'number') { P2PSETTINGS.autoFetchCount = status.autoFetchCount; }
+        if (typeof status.rotationDays === 'number') { P2PSETTINGS.rotationDays = status.rotationDays; }
+        if (status.enabled === true) {
+          const cat = (await API.axios({
+            method: 'GET', url: `${API.url()}/api/v1/admin/discovery/p2p/catalog`
+          })).data;
+          this.discoveryP2p.peers = cat.peers;
+          this.discoveryP2p.storage = cat.storage;
+          this.discoveryP2p.autoFetch = cat.autoFetch;
+        }
+      } catch (err) {
+        if (quiet !== true) {
+          iziToast.error({ title: 'Failed to load discovery network status', position: 'topCenter', timeout: 3000 });
+        }
+      }
+      this.discoveryP2p.loaded = true;
+    },
+    discoveryFetchPeer: async function(endpointId) {
+      try {
+        iziToast.info({ title: 'Downloading peer snapshot…', position: 'topCenter', timeout: 2500 });
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/discovery/p2p/peer-dbs/fetch`,
+          data: { endpointId }
+        });
+        iziToast.success({ title: 'Peer snapshot downloaded', position: 'topCenter', timeout: 3000 });
+      } catch (err) {
+        iziToast.error({
+          title: 'Download failed',
+          message: escHtml(err.response?.data?.error || ''),
+          position: 'topCenter', timeout: 4000
+        });
+      }
+      this.loadDiscoveryP2p();
+    },
+    discoveryRemovePeer: async function(endpointId) {
+      try {
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/discovery/p2p/peer-dbs/remove`,
+          data: { endpointId }
+        });
+      } catch (err) {
+        iziToast.error({ title: 'Remove failed', position: 'topCenter', timeout: 3000 });
+      }
+      this.loadDiscoveryP2p();
+    },
+    // Pin = rotation immunity for a downloaded snapshot (manual downloads
+    // arrive pinned already; this is the lever for auto-fetched ones — and
+    // the undo for manual ones).
+    discoveryPinPeer: async function(endpointId, pinned) {
+      try {
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/discovery/p2p/peer-dbs/pin`,
+          data: { endpointId, pinned }
+        });
+      } catch (err) {
+        iziToast.error({
+          title: pinned ? 'Pin failed' : 'Unpin failed',
+          message: escHtml(err.response?.data?.error || ''),
+          position: 'topCenter', timeout: 3000
+        });
+      }
+      this.loadDiscoveryP2p();
+    },
+    // The befriend box: join the mesh through the pasted ticket AND persist
+    // it to bootstrapPeers (persist: true) so the friendship survives a
+    // restart. Gossip does the rest — their server shows up in the catalog
+    // within a minute or so of both being online.
+    discoveryJoinPeer: async function() {
+      const peer = this.friendTicket.trim();
+      if (!peer || this.joinPending) { return; }
+      try {
+        this.joinPending = true;
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/discovery/p2p/join`,
+          data: { peer, persist: true }
+        });
+        this.friendTicket = '';
+        iziToast.success({ title: 'Joined — their server appears in the list within a minute or so', position: 'topCenter', timeout: 4000 });
+      } catch (err) {
+        iziToast.error({
+          title: 'Join failed',
+          message: escHtml(err.response?.data?.error || ''),
+          position: 'topCenter', timeout: 4000
+        });
+      } finally {
+        this.joinPending = false;
+      }
+      this.loadDiscoveryP2p(true);
+    },
+    // Block = "make this server not exist": config blocklist + snapshot +
+    // catalog row all in one server-side action. Undo lives in the
+    // blocked-servers list below the table.
+    discoveryBlockPeer: async function(endpointId) {
+      try {
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/discovery/p2p/block`,
+          data: { endpointId }
+        });
+        iziToast.success({ title: 'Server blocked — its announcements and snapshots are now ignored', position: 'topCenter', timeout: 3500 });
+      } catch (err) {
+        iziToast.error({
+          title: 'Block failed',
+          message: escHtml(err.response?.data?.error || ''),
+          position: 'topCenter', timeout: 4000
+        });
+      }
+      this.loadDiscoveryP2p();
+    },
+    discoveryUnblockPeer: async function(endpointId) {
+      try {
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/discovery/p2p/unblock`,
+          data: { endpointId }
+        });
+        iziToast.success({ title: 'Server unblocked — it reappears on its next announcement', position: 'topCenter', timeout: 3500 });
+      } catch (err) {
+        iziToast.error({
+          title: 'Unblock failed',
+          message: escHtml(err.response?.data?.error || ''),
+          position: 'topCenter', timeout: 4000
+        });
+      }
+      this.loadDiscoveryP2p();
+    },
+    // Drop a dead server from the list right now instead of waiting out
+    // the retention window. Harmless by construction: it reappears on its
+    // next announcement if it ever comes back.
+    discoveryForgetPeer: async function(endpointId) {
+      try {
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/discovery/p2p/forget`,
+          data: { endpointId }
+        });
+        iziToast.success({ title: 'Server forgotten — it reappears if it comes back online', position: 'topCenter', timeout: 3500 });
+      } catch (err) {
+        iziToast.error({
+          title: 'Forget failed',
+          message: escHtml(err.response?.data?.error || ''),
+          position: 'topCenter', timeout: 4000
+        });
+      }
+      this.loadDiscoveryP2p();
+    },
+    discoveryBytes: function(n) {
+      if (typeof n !== 'number' || !isFinite(n)) { return '?'; }
+      if (n >= 1073741824) { return (n / 1073741824).toFixed(1) + ' GB'; }
+      if (n >= 1048576) { return (n / 1048576).toFixed(1) + ' MB'; }
+      return Math.ceil(n / 1024) + ' KB';
+    },
+    // How long ago a peer was last heard, as a table-cell suffix
+    // (' · 3d'). An offline row that's been silent for weeks should read
+    // differently from one that dropped off five minutes ago.
+    discoveryAge: function(iso) {
+      const ms = Date.now() - Date.parse(iso);
+      if (!isFinite(ms) || ms < 0) { return ''; }
+      const mins = Math.floor(ms / 60000);
+      if (mins < 60) { return ' · ' + Math.max(mins, 1) + 'm'; }
+      if (mins < 48 * 60) { return ' · ' + Math.floor(mins / 60) + 'h'; }
+      return ' · ' + Math.floor(mins / (24 * 60)) + 'd';
+    }
+  }
 });
 
 const irohView = Vue.component('iroh-view', {
@@ -6815,6 +8173,7 @@ function _initialViewFromHash() {
     'folders-view','users-view','db-view','advanced-view','info-view',
     'transcode-view','federation-view','dlna-view','subsonic-view','iroh-view',
     'torrent-view','logs-view','rpn-view','security-view','backup-view',
+    'lyrics-view','discovery-view',
   ]);
   const raw = (location.hash || '').replace(/^#/, '');
   const name = raw.startsWith('view=') ? raw.slice(5) : raw;
@@ -6834,11 +8193,13 @@ const vm = new Vue({
     'dlna-view': dlnaView,
     'subsonic-view': subsonicView,
     'iroh-view': irohView,
+    'discovery-view': discoveryView,
     'torrent-view': torrentView,
     'logs-view': logsView,
     'rpn-view': rpnView,
     'security-view': securityView,
     'backup-view': backupView,
+    'lyrics-view': lyricsView,
   },
   data: {
     currentViewMain: _initialViewFromHash(),
@@ -7578,6 +8939,672 @@ const editAutoAlbumArtPerRunView = Vue.component('edit-auto-album-art-per-run-mo
   }
 });
 
+const editAnalyzeBpmMethodView = Vue.component('edit-analyze-bpm-method-modal', {
+  data() {
+    return {
+      params: ADMINDATA.dbParams,
+      submitPending: false,
+      editValue: ADMINDATA.dbParams.analyzeBpmMethod
+    };
+  },
+  template: `
+    <form @submit.prevent="updateParam">
+      <div class="modal-content">
+        <h4>BPM estimation method</h4>
+        <div class="input-field">
+          <select v-model="editValue" id="edit-analyze-bpm-method" class="browser-default">
+            <option value="multifeature">multifeature — most accurate, confidence-gated (slow)</option>
+            <option value="degara">degara — ~6× faster, no confidence gate</option>
+          </select>
+          <span class="helper-text">multifeature can skip uncertain tracks (low-confidence estimates are not written); degara writes every plausible estimate and suits large libraries or weak hardware. Applies from the next analysis pass.</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
+        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
+        </button>
+      </div>
+    </form>`,
+  methods: {
+    updateParam: async function() {
+      try {
+        this.submitPending = true;
+
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/db/params/analyze-bpm-method`,
+          data: { analyzeBpmMethod: this.editValue }
+        });
+
+        Vue.set(ADMINDATA.dbParams, 'analyzeBpmMethod', this.editValue);
+
+        M.Modal.getInstance(document.getElementById('admin-modal')).close();
+
+        iziToast.success({
+          title: t('admin.settings.updated'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } catch(err) {
+        iziToast.error({
+          title: t('admin.modal.updateFailed'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } finally {
+        this.submitPending = false;
+      }
+    }
+  }
+});
+
+const editAnalyzeBpmWindowSecView = Vue.component('edit-analyze-bpm-window-sec-modal', {
+  data() {
+    return {
+      params: ADMINDATA.dbParams,
+      submitPending: false,
+      editValue: ADMINDATA.dbParams.analyzeBpmWindowSec
+    };
+  },
+  template: `
+    <form @submit.prevent="updateParam">
+      <div class="modal-content">
+        <h4>BPM/key analysis window</h4>
+        <div class="input-field">
+          <input v-model="editValue" id="edit-analyze-bpm-window-sec" required type="number" min="0" max="600">
+          <label for="edit-analyze-bpm-window-sec">Seconds (0 = whole file, otherwise 30–600)</label>
+          <span class="helper-text">Seconds of audio analysed per track, taken from the middle of the file. The 60 s default matches how BPM/key detectors are benchmarked and is several times faster than whole-file analysis. Applies from the next analysis pass.</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
+        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
+        </button>
+      </div>
+    </form>`,
+  mounted: function () {
+    M.updateTextFields();
+  },
+  methods: {
+    updateParam: async function() {
+      const val = Number(this.editValue);
+      if (val !== 0 && (val < 30 || val > 600)) {
+        iziToast.error({
+          title: 'Window must be 0 (whole file) or 30–600 seconds',
+          position: 'topCenter',
+          timeout: 3500
+        });
+        return;
+      }
+      try {
+        this.submitPending = true;
+
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/db/params/analyze-bpm-window-sec`,
+          data: { analyzeBpmWindowSec: val }
+        });
+
+        Vue.set(ADMINDATA.dbParams, 'analyzeBpmWindowSec', val);
+
+        M.Modal.getInstance(document.getElementById('admin-modal')).close();
+
+        iziToast.success({
+          title: t('admin.settings.updated'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } catch(err) {
+        iziToast.error({
+          title: t('admin.modal.updateFailed'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } finally {
+        this.submitPending = false;
+      }
+    }
+  }
+});
+
+const editAnalyzeBpmPerRunView = Vue.component('edit-analyze-bpm-per-run-modal', {
+  data() {
+    return {
+      params: ADMINDATA.dbParams,
+      submitPending: false,
+      editValue: ADMINDATA.dbParams.analyzeBpmPerRun
+    };
+  },
+  template: `
+    <form @submit.prevent="updateParam">
+      <div class="modal-content">
+        <h4>BPM/key tracks analysed per pass</h4>
+        <div class="input-field">
+          <input v-model="editValue" id="edit-analyze-bpm-per-run" required type="number" min="1" max="10000">
+          <label for="edit-analyze-bpm-per-run">Tracks per pass</label>
+          <span class="helper-text">Caps how many tracks one essentia pass analyses before yielding the task slot. The pass also self-limits by wall-clock time and re-runs to drain any backlog.</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
+        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
+        </button>
+      </div>
+    </form>`,
+  mounted: function () {
+    M.updateTextFields();
+  },
+  methods: {
+    updateParam: async function() {
+      try {
+        this.submitPending = true;
+
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/db/params/analyze-bpm-per-run`,
+          data: { analyzeBpmPerRun: Number(this.editValue) }
+        });
+
+        Vue.set(ADMINDATA.dbParams, 'analyzeBpmPerRun', Number(this.editValue));
+
+        M.Modal.getInstance(document.getElementById('admin-modal')).close();
+
+        iziToast.success({
+          title: t('admin.settings.updated'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } catch(err) {
+        iziToast.error({
+          title: t('admin.modal.updateFailed'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } finally {
+        this.submitPending = false;
+      }
+    }
+  }
+});
+
+const editAcoustidPerRunView = Vue.component('edit-acoustid-per-run-modal', {
+  data() {
+    return {
+      params: ADMINDATA.dbParams,
+      submitPending: false,
+      editValue: ADMINDATA.dbParams.acoustidPerRun
+    };
+  },
+  template: `
+    <form @submit.prevent="updateParam">
+      <div class="modal-content">
+        <h4>Tracks identified per AcoustID pass</h4>
+        <div class="input-field">
+          <input v-model="editValue" id="edit-acoustid-per-run" required type="number" min="1" max="10000">
+          <label for="edit-acoustid-per-run">Tracks per pass</label>
+          <span class="helper-text">Caps how many tracks one AcoustID pass fingerprints and looks up (rate-limited to ~3 requests/second) before yielding the task slot. The pass re-runs to drain any backlog.</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
+        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
+        </button>
+      </div>
+    </form>`,
+  mounted: function () {
+    M.updateTextFields();
+  },
+  methods: {
+    updateParam: async function() {
+      try {
+        this.submitPending = true;
+
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/db/params/acoustid-per-run`,
+          data: { acoustidPerRun: Number(this.editValue) }
+        });
+
+        Vue.set(ADMINDATA.dbParams, 'acoustidPerRun', Number(this.editValue));
+
+        M.Modal.getInstance(document.getElementById('admin-modal')).close();
+
+        iziToast.success({
+          title: t('admin.settings.updated'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } catch(err) {
+        iziToast.error({
+          title: t('admin.modal.updateFailed'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } finally {
+        this.submitPending = false;
+      }
+    }
+  }
+});
+
+// Name + description in one modal — the public identity other servers see
+// in their catalogs. Saves only what changed (each save re-announces
+// server-side, so a no-op field shouldn't cost a broadcast). Opened from
+// the Discovery page's identity line AND auto-opened right after enabling
+// the network, so a fresh server never sits in the catalog as 'mStream'.
+const editP2pMaxStorageView = Vue.component('edit-p2p-max-storage-modal', {
+  data() {
+    return {
+      submitPending: false,
+      editValue: P2PSETTINGS.maxPeerDbStorageMb
+    };
+  },
+  template: `
+    <form @submit.prevent="updateParam">
+      <div class="modal-content">
+        <h4>Peer snapshot storage cap</h4>
+        <div class="input-field">
+          <input v-model="editValue" id="edit-p2p-max-storage" required type="number" min="10" max="100000">
+          <label for="edit-p2p-max-storage">Max storage (MB)</label>
+          <span class="helper-text">How much disk downloaded peer snapshots may use, total. Applies to the next download immediately — lowering it below current usage blocks new downloads but never deletes anything; remove snapshots from the server list to free space.</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
+        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
+        </button>
+      </div>
+    </form>`,
+  mounted: function () {
+    M.updateTextFields();
+  },
+  methods: {
+    updateParam: async function() {
+      try {
+        this.submitPending = true;
+
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/discovery/p2p/max-storage`,
+          data: { maxPeerDbStorageMb: Number(this.editValue) }
+        });
+
+        P2PSETTINGS.maxPeerDbStorageMb = Number(this.editValue);
+
+        M.Modal.getInstance(document.getElementById('admin-modal')).close();
+
+        iziToast.success({
+          title: t('admin.settings.updated'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } catch(err) {
+        iziToast.error({
+          title: t('admin.modal.updateFailed'),
+          message: escHtml(err.response?.data?.error || ''),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } finally {
+        this.submitPending = false;
+      }
+    }
+  }
+});
+
+// Retention for the peer catalog: how many days a server may stay silent
+// before it's forgotten (0 = never). Applies from the very next hourly
+// prune pass — no restart. Downloaded snapshots pin their peer in the list
+// regardless, so this can't invisibly orphan storage.
+const editP2pPeerRetentionView = Vue.component('edit-p2p-peer-retention-modal', {
+  data() {
+    return {
+      submitPending: false,
+      editValue: P2PSETTINGS.peerRetentionDays
+    };
+  },
+  template: `
+    <form @submit.prevent="updateParam">
+      <div class="modal-content">
+        <h4>Forget offline servers</h4>
+        <div class="input-field">
+          <input v-model="editValue" id="edit-p2p-peer-retention" required type="number" min="0" max="3650">
+          <label for="edit-p2p-peer-retention">Days of silence before a server is forgotten</label>
+          <span class="helper-text">A server that hasn't announced itself in this many days is dropped from the list automatically — it reappears the moment it comes back online. Servers whose snapshot you've downloaded are never forgotten; remove the snapshot first. 0 keeps every server forever.</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
+        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
+        </button>
+      </div>
+    </form>`,
+  mounted: function () {
+    M.updateTextFields();
+  },
+  methods: {
+    updateParam: async function() {
+      try {
+        this.submitPending = true;
+
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/discovery/p2p/peer-retention`,
+          data: { peerRetentionDays: Number(this.editValue) }
+        });
+
+        P2PSETTINGS.peerRetentionDays = Number(this.editValue);
+
+        M.Modal.getInstance(document.getElementById('admin-modal')).close();
+
+        iziToast.success({
+          title: t('admin.settings.updated'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } catch(err) {
+        iziToast.error({
+          title: t('admin.modal.updateFailed'),
+          message: escHtml(err.response?.data?.error || ''),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } finally {
+        this.submitPending = false;
+      }
+    }
+  }
+});
+
+// How many peer snapshots the auto-fetch loop keeps on the local shelf.
+// Live: the next reconcile pass (announcement-driven, or the periodic
+// sweep) reads it fresh — no restart. The storage cap above still applies;
+// the shelf stops growing at whichever limit hits first.
+const editP2pAutoFetchCountView = Vue.component('edit-p2p-auto-fetch-count-modal', {
+  data() {
+    return {
+      submitPending: false,
+      editValue: P2PSETTINGS.autoFetchCount
+    };
+  },
+  template: `
+    <form @submit.prevent="updateParam">
+      <div class="modal-content">
+        <h4>Auto-download servers</h4>
+        <div class="input-field">
+          <input v-model="editValue" id="edit-p2p-auto-fetch-count" required type="number" min="0" max="50">
+          <label for="edit-p2p-auto-fetch-count">How many servers to keep downloaded automatically</label>
+          <span class="helper-text">Auto-fetch keeps up to this many servers' snapshots downloaded, picking the most useful ones it can hear that fit under the storage cap. Applies from the next check — raising it downloads more; lowering it deletes nothing. 0 pauses automatic downloads; downloading from the server list by hand still works.</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
+        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
+        </button>
+      </div>
+    </form>`,
+  mounted: function () {
+    M.updateTextFields();
+  },
+  methods: {
+    updateParam: async function() {
+      try {
+        this.submitPending = true;
+
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/discovery/p2p/auto-fetch-count`,
+          data: { autoFetchCount: Number(this.editValue) }
+        });
+
+        P2PSETTINGS.autoFetchCount = Number(this.editValue);
+
+        M.Modal.getInstance(document.getElementById('admin-modal')).close();
+
+        iziToast.success({
+          title: t('admin.settings.updated'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } catch(err) {
+        iziToast.error({
+          title: t('admin.modal.updateFailed'),
+          message: escHtml(err.response?.data?.error || ''),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } finally {
+        this.submitPending = false;
+      }
+    }
+  }
+});
+
+// How many days a downloaded snapshot may sit on a full shelf before the
+// hourly rotation pass swaps it for a server we don't hold yet. Applies
+// from the very next pass — no restart. Swap-only by design: rotation
+// never shrinks the shelf, and pinned downloads are never touched.
+const editP2pRotationView = Vue.component('edit-p2p-rotation-modal', {
+  data() {
+    return {
+      submitPending: false,
+      editValue: P2PSETTINGS.rotationDays
+    };
+  },
+  template: `
+    <form @submit.prevent="updateParam">
+      <div class="modal-content">
+        <h4>Rotate downloads</h4>
+        <div class="input-field">
+          <input v-model="editValue" id="edit-p2p-rotation" required type="number" min="0" max="3650">
+          <label for="edit-p2p-rotation">Days before a download may be swapped</label>
+          <span class="helper-text">Once the shelf is full, a snapshot held longer than this may be swapped — one per hour at most — for a server you don't have yet, so network suggestions stay fresh. Only ever a swap: nothing is dropped without a replacement, and pinned downloads are never touched. 0 turns rotation off.</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
+        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
+        </button>
+      </div>
+    </form>`,
+  mounted: function () {
+    M.updateTextFields();
+  },
+  methods: {
+    updateParam: async function() {
+      try {
+        this.submitPending = true;
+
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/discovery/p2p/rotation`,
+          data: { rotationDays: Number(this.editValue) }
+        });
+
+        P2PSETTINGS.rotationDays = Number(this.editValue);
+
+        M.Modal.getInstance(document.getElementById('admin-modal')).close();
+
+        iziToast.success({
+          title: t('admin.settings.updated'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } catch(err) {
+        iziToast.error({
+          title: t('admin.modal.updateFailed'),
+          message: escHtml(err.response?.data?.error || ''),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } finally {
+        this.submitPending = false;
+      }
+    }
+  }
+});
+
+const editP2pIdentityView = Vue.component('edit-p2p-identity-modal', {
+  data() {
+    return {
+      submitPending: false,
+      editName: P2PIDENTITY.serverName,
+      editDescription: P2PIDENTITY.serverDescription
+    };
+  },
+  template: `
+    <form @submit.prevent="updateParam">
+      <div class="modal-content">
+        <h4>Server identity on the network</h4>
+        <div class="input-field">
+          <input v-model="editName" id="edit-p2p-name" required type="text" maxlength="64">
+          <label for="edit-p2p-name">Server name ({{ editName.length }}/64 characters)</label>
+          <span class="helper-text">How your server appears in every other server's catalog.</span>
+        </div>
+        <div class="input-field">
+          <textarea v-model="editDescription" id="edit-p2p-description" class="materialize-textarea" maxlength="180"></textarea>
+          <label for="edit-p2p-description">Description ({{ editDescription.length }}/180 characters)</label>
+          <span class="helper-text">Optional blurb next to the name — say what's in your library so others can tell whether your DB is worth downloading. Changes announce immediately; the '|' character isn't allowed.</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
+        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
+        </button>
+      </div>
+    </form>`,
+  mounted: function () {
+    M.updateTextFields();
+    M.textareaAutoResize(document.getElementById('edit-p2p-description'));
+  },
+  methods: {
+    updateParam: async function() {
+      const name = this.editName.trim();
+      const description = this.editDescription.trim();
+      if (name.includes('|') || description.includes('|')) {
+        iziToast.warning({ title: `The '|' character is not allowed`, position: 'topCenter', timeout: 3500 });
+        return;
+      }
+      if (!name) {
+        iziToast.warning({ title: 'The server name must not be blank', position: 'topCenter', timeout: 3500 });
+        return;
+      }
+      try {
+        this.submitPending = true;
+
+        let announced = false;
+        if (name !== P2PIDENTITY.serverName) {
+          const res = await API.axios({
+            method: 'POST',
+            url: `${API.url()}/api/v1/admin/discovery/p2p/name`,
+            data: { name }
+          });
+          P2PIDENTITY.serverName = name;
+          announced = res.data.announced === true;
+        }
+        if (description !== P2PIDENTITY.serverDescription) {
+          const res = await API.axios({
+            method: 'POST',
+            url: `${API.url()}/api/v1/admin/discovery/p2p/description`,
+            data: { description }
+          });
+          P2PIDENTITY.serverDescription = description;
+          announced = announced || res.data.announced === true;
+        }
+
+        M.Modal.getInstance(document.getElementById('admin-modal')).close();
+
+        iziToast.success({
+          title: announced
+            ? 'Updated — announced to the network'
+            : 'Updated — will announce with the next snapshot',
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } catch(err) {
+        iziToast.error({
+          title: t('admin.modal.updateFailed'),
+          message: escHtml(err.response?.data?.error || ''),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } finally {
+        this.submitPending = false;
+      }
+    }
+  }
+});
+
+const editDiscoveryPerRunView = Vue.component('edit-discovery-per-run-modal', {
+  data() {
+    return {
+      params: ADMINDATA.dbParams,
+      submitPending: false,
+      editValue: ADMINDATA.dbParams.discoveryPerRun
+    };
+  },
+  template: `
+    <form @submit.prevent="updateParam">
+      <div class="modal-content">
+        <h4>Discovery tracks embedded per pass</h4>
+        <div class="input-field">
+          <input v-model="editValue" id="edit-discovery-per-run" required type="number" min="1" max="10000">
+          <label for="edit-discovery-per-run">Tracks per pass</label>
+          <span class="helper-text">Caps how many tracks one discovery pass embeds before yielding the task slot. Each track takes a few seconds of CPU; the pass also self-limits by wall-clock time and re-runs to drain any backlog.</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
+        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
+        </button>
+      </div>
+    </form>`,
+  mounted: function () {
+    M.updateTextFields();
+  },
+  methods: {
+    updateParam: async function() {
+      try {
+        this.submitPending = true;
+
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/db/params/discovery-per-run`,
+          data: { discoveryPerRun: Number(this.editValue) }
+        });
+
+        Vue.set(ADMINDATA.dbParams, 'discoveryPerRun', Number(this.editValue));
+
+        M.Modal.getInstance(document.getElementById('admin-modal')).close();
+
+        iziToast.success({
+          title: t('admin.settings.updated'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } catch(err) {
+        iziToast.error({
+          title: t('admin.modal.updateFailed'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } finally {
+        this.submitPending = false;
+      }
+    }
+  }
+});
+
 const editScanIntervalView = Vue.component('edit-scan-interval-modal', {
   data() {
     return {
@@ -7868,98 +9895,187 @@ const lastFMModal = Vue.component('lastfm-modal', {
   }
 });
 
-// Disabled: federation-generate-invite-modal goes with the disabled
-// Federation tab — see the block comment around the Federation tab
-// placeholder above. Restore both this definition and its registration
-// in the modal-component map at the bottom of this file when bringing
-// the federation feature back.
-/*
-const federationGenerateInvite = Vue.component('federation-generate-invite-modal', {
+
+
+// New-ticket modal for the Federation tab: name the grant, tick the
+// libraries it covers, mint, and copy the resulting mstrfed1: ticket.
+const federationNewTicketModal = Vue.component('federation-new-ticket-modal', {
   data() {
+    // Pre-fill the caps from config (federation.limits via the status
+    // route); the admin tunes or zeroes them per key right here.
+    const d = ADMINDATA.federationParams.limitDefaults || { streamKbps: 8000, dailyMb: 2048, maxStreams: 3 };
     return {
-      submitPending: false,
-      selectInstance: null,
       directories: ADMINDATA.folders,
-      federationInviteToken: ADMINDATA.federationInviteToken
+      name: '',
+      selected: [],
+      streamKbps: d.streamKbps,
+      dailyMb: d.dailyMb,
+      maxStreams: d.maxStreams,
+      expireDays: 0,
+      submitPending: false,
+      mintedTicket: null,
     };
   },
   template: `
-    <div class="modal-content">
-      <div class="row">
-        <div class="col s12 m12 l6">
-          <h4>{{ t('admin.modal.generateInvite') }}</h4>
-          <form @submit.prevent="generateToken">
-            <div class="row">
-              <div class="input-field col s12">
-                <select class="material-select" :disabled="Object.keys(directories).length === 0" id="fed-invite-dirs" multiple>
-                  <option disabled selected value="" v-if="Object.keys(directories).length === 0">{{ t('admin.users.noDirsWarning') }}</option>
-                  <option selected v-for="(key, value) in directories" :value="value">{{ value }}</option>
-                </select>
-                <label for="fed-invite-dirs">{{ t('admin.modal.dirsToShare') }}</label>
-              </div>
+    <form @submit.prevent="mint">
+      <div class="modal-content">
+        <h4>New Federation Ticket</h4>
+        <div v-if="mintedTicket === null">
+          <div class="input-field">
+            <input id="fed-ticket-name" type="text" v-model="name" placeholder="Who is this for? (e.g. Bob's NAS)" maxlength="64"/>
+          </div>
+          <p style="margin-bottom:4px"><b>Libraries this ticket can read:</b></p>
+          <p v-for="(cfg, vpath) in directories" :key="vpath" style="margin:4px 0">
+            <label><input type="checkbox" v-model="selected" :value="vpath"/><span>{{ vpath }}</span></label>
+          </p>
+          <p style="margin:16px 0 4px"><b>Bandwidth limits</b> <span style="color:#777;font-size:0.85em">— 0 means unlimited</span></p>
+          <div class="row" style="margin-bottom:0">
+            <div class="input-field col s3">
+              <input id="fed-limit-kbps" type="number" min="0" v-model.number="streamKbps"/>
+              <label for="fed-limit-kbps" class="active">Stream rate (kbps)</label>
             </div>
-            <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-              {{ submitPending === false ? t('admin.modal.createInvite') : t('admin.modal.creating') }}
-            </button>
-          </form>
+            <div class="input-field col s3">
+              <input id="fed-limit-daily" type="number" min="0" v-model.number="dailyMb"/>
+              <label for="fed-limit-daily" class="active">Daily quota (MB)</label>
+            </div>
+            <div class="input-field col s3">
+              <input id="fed-limit-streams" type="number" min="0" v-model.number="maxStreams"/>
+              <label for="fed-limit-streams" class="active">Max streams</label>
+            </div>
+            <div class="input-field col s3">
+              <input id="fed-limit-expire" type="number" min="0" v-model.number="expireDays"/>
+              <label for="fed-limit-expire" class="active">Expires (days)</label>
+            </div>
+          </div>
         </div>
-        <div class="col s12 m12 l6">
-          <blockquote>
-            {{ t('admin.modal.inviteExpiry') }}
-          </blockquote>
-          <textarea v-model="federationInviteToken.val" id="fed-textarea" style="height: auto;" rows="6" cols="60" :placeholder="t('admin.modal.invitePlaceholder')" readonly="readonly"></textarea>
-          <a href="#" class="fed-copy-button" data-clipboard-target="#fed-textarea">{{ t('admin.modal.copyClipboard') }}</a>
+        <div v-else>
+          <p><b>Ticket for '{{ name }}'</b> — copy it and send it to your friend over a private channel. Anyone holding it can read the granted libraries until it's claimed or revoked.</p>
+          <textarea readonly rows="6" cols="60" style="height:auto" :value="mintedTicket"></textarea>
         </div>
       </div>
-    </div>`,
-  mounted: function () {
-    this.selectInstance = M.FormSelect.init(document.querySelectorAll(".material-select"));
-  },
-  beforeDestroy: function() {
-    this.selectInstance[0].destroy();
-  },
+      <div class="modal-footer">
+        <a href="#!" class="modal-close waves-effect btn-flat">{{ mintedTicket === null ? 'Cancel' : 'Done' }}</a>
+        <a v-if="mintedTicket !== null" class="btn green waves-effect waves-light fed-copy-button" :data-clipboard-text="mintedTicket">Copy Ticket</a>
+        <button v-else class="btn green waves-effect waves-light" type="submit" :disabled="submitPending || !name.trim() || selected.length === 0">
+          {{ submitPending ? 'Minting…' : 'Mint Ticket' }}
+        </button>
+      </div>
+    </form>`,
   methods: {
-    generateToken: async function() {
+    mint: async function() {
+      this.submitPending = true;
       try {
-        this.submitPending = true;
-        const selectedDirs = Array.from(document.querySelectorAll('#fed-invite-dirs option:checked')).map(el => el.value);
-
-        if(selectedDirs.length === 0) {
-          iziToast.warning({
-            title: t('admin.modal.nothingToFederate'),
-            position: 'topCenter',
-            timeout: 3500
-          });
-          return;
-        }
-
-        const postData =  { vpaths: selectedDirs };
-        if (window.location.protocol === 'https') {
-          postData.url = window.location.origin;
-        }
-
+        const data = {
+          name: this.name.trim(), vpaths: this.selected,
+          streamKbps: Number(this.streamKbps) || 0,
+          dailyMb: Number(this.dailyMb) || 0,
+          maxStreams: Number(this.maxStreams) || 0,
+        };
+        const days = Number(this.expireDays) || 0;
+        if (days > 0) { data.expiresAt = new Date(Date.now() + days * 86400000).toISOString(); }
         const res = await API.axios({
           method: 'POST',
-          url: `${API.url()}/api/v1/federation/invite/generate`,
-          data: postData
+          url: `${API.url()}/api/v1/admin/federation/keys`,
+          data,
         });
-
-        this.federationInviteToken.val = res.data.token;
+        this.mintedTicket = res.data.ticket || res.data.key;
+        if (!res.data.ticket) {
+          iziToast.warning({ title: 'Endpoint not running', message: 'Minted the key, but there is no full ticket — turn federation on and re-open the key list.', position: 'topCenter', timeout: 5000 });
+        }
+        await ADMINDATA.getFederationKeys();
       } catch (err) {
-        console.log(err)
-        iziToast.error({
-          title: t('admin.modal.inviteFailed'),
-          position: 'topCenter',
-          timeout: 3500
-        });
+        iziToast.error({ title: 'Failed to mint the ticket', position: 'topCenter', timeout: 3500 });
       } finally {
         this.submitPending = false;
       }
-    }
-  }
+    },
+  },
 });
-*/
 
+const federationEditLimitsModal = Vue.component('federation-edit-limits-modal', {
+  data() {
+    const k = ADMINDATA.federationLimitsTarget.key || {};
+    return {
+      target: k,
+      streamKbps: k.stream_kbps || 0,
+      dailyMb: k.daily_mb || 0,
+      maxStreams: k.max_streams || 0,
+      // Tri-state, so saving limit tweaks can't silently restart an expiry
+      // clock: '' = leave expiry as it is, 0 = never, N = N days from now.
+      expireDays: '',
+      submitPending: false,
+    };
+  },
+  computed: {
+    currentExpiry() {
+      if (this.target.expired) { return 'expired'; }
+      if (!this.target.expires_at) { return 'never'; }
+      return `${this.target.expires_at.slice(0, 10)} (UTC)`;
+    },
+  },
+  template: `
+    <form @submit.prevent="save">
+      <div class="modal-content">
+        <h4>Limits for '{{ target.name }}'</h4>
+        <p style="color:#777;font-size:0.9em">Applies from this key's next request. 0 means unlimited.</p>
+        <div class="row" style="margin-bottom:0">
+          <div class="input-field col s4">
+            <input id="fed-edit-kbps" type="number" min="0" v-model.number="streamKbps"/>
+            <label for="fed-edit-kbps" class="active">Stream rate (kbps)</label>
+          </div>
+          <div class="input-field col s4">
+            <input id="fed-edit-daily" type="number" min="0" v-model.number="dailyMb"/>
+            <label for="fed-edit-daily" class="active">Daily quota (MB)</label>
+          </div>
+          <div class="input-field col s4">
+            <input id="fed-edit-streams" type="number" min="0" v-model.number="maxStreams"/>
+            <label for="fed-edit-streams" class="active">Max streams</label>
+          </div>
+        </div>
+        <p style="margin:8px 0 4px"><b>Expiry</b> <span :style="{color: target.expired ? '#c62828' : '#777'}" style="font-size:0.85em">— currently: {{ currentExpiry }}</span></p>
+        <div class="row" style="margin-bottom:0">
+          <div class="input-field col s6">
+            <input id="fed-edit-expire" type="number" min="0" v-model="expireDays" placeholder="leave blank to keep"/>
+            <label for="fed-edit-expire" class="active">New expiry (days from now, 0 = never)</label>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <a href="#!" class="modal-close waves-effect btn-flat">Cancel</a>
+        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending">
+          {{ submitPending ? 'Saving…' : 'Save' }}
+        </button>
+      </div>
+    </form>`,
+  methods: {
+    save: async function() {
+      this.submitPending = true;
+      try {
+        const data = {
+          streamKbps: Number(this.streamKbps) || 0,
+          dailyMb: Number(this.dailyMb) || 0,
+          maxStreams: Number(this.maxStreams) || 0,
+        };
+        if (String(this.expireDays).trim() !== '') {
+          const days = Number(this.expireDays) || 0;
+          data.expiresAt = days > 0 ? new Date(Date.now() + days * 86400000).toISOString() : null;
+        }
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/federation/keys/${this.target.id}/limits`,
+          data,
+        });
+        await ADMINDATA.getFederationKeys();
+        M.Modal.getInstance(document.getElementById('admin-modal')).close();
+        iziToast.success({ title: 'Limits updated', position: 'topCenter', timeout: 3500 });
+      } catch (err) {
+        iziToast.error({ title: 'Failed to update the limits', position: 'topCenter', timeout: 3500 });
+      } finally {
+        this.submitPending = false;
+      }
+    },
+  },
+});
 
 const nullModal = Vue.component('null-modal', {
   template: '<div>NULL MODAL ERROR: How did you get here?</div>'
@@ -8174,7 +10290,7 @@ const backupHistoryModal = Vue.component('backup-history-modal', {
           </thead>
           <tbody>
             <tr v-for="run in history" :key="run.id">
-              <td>{{ formatTime(run.started_at) }}</td>
+              <td :title="run.started_at + ' UTC'">{{ formatTime(run.started_at) }}</td>
               <td :style="{ color: statusColor(run.status) }">{{ run.status }}</td>
               <td>{{ run.trigger_reason }}</td>
               <td>{{ run.files_copied }}</td>
@@ -8221,6 +10337,7 @@ const backupHistoryModal = Vue.component('backup-history-modal', {
     statusColor(status) {
       return status === 'success' ? '#2e7d32'
            : status === 'failed' ? '#c62828'
+           : status === 'partial' ? '#e65100'
            : status === 'skipped' ? '#f57f17'
            : '#1976d2';
     },
@@ -8294,16 +10411,16 @@ const backupEditModal = Vue.component('backup-edit-modal', {
           </select>
         </div>
         <div class="input-field col s4 m2" v-if="triggerType === 'daily'">
-          <input v-model.number="dailyAtHour" id="backup-edit-hour" type="number" min="0" max="23">
+          <input v-model.number="dailyAtHour" id="backup-edit-hour" required type="number" min="0" max="23" class="validate">
           <label for="backup-edit-hour" class="active">Hour (0–23)</label>
         </div>
         <div class="input-field col s4 m2">
-          <input v-model.number="retentionDays" id="backup-edit-retention" type="number" min="0">
+          <input v-model.number="retentionDays" id="backup-edit-retention" type="number" min="0" class="validate">
           <label for="backup-edit-retention" class="active">Retention (days)</label>
-          <span class="helper-text" style="font-size:11px">0 = hard delete</span>
+          <span class="helper-text" style="font-size:11px" title="Days deleted/changed files stay recoverable in the backup's trash before being purged">0 = no trash, deletes are immediate + permanent</span>
         </div>
         <div class="input-field col s4 m2">
-          <input v-model.number="interFileDelayMs" id="backup-edit-throttle" type="number" min="0" max="60000">
+          <input v-model.number="interFileDelayMs" id="backup-edit-throttle" type="number" min="0" max="60000" class="validate">
           <label for="backup-edit-throttle" class="active">Throttle (ms/file)</label>
           <span class="helper-text" style="font-size:11px">0 = off</span>
         </div>
@@ -8340,7 +10457,7 @@ const backupEditModal = Vue.component('backup-edit-modal', {
 
       <div class="row">
         <button class="btn green waves-effect waves-light col m3 s12"
-                @click="save" :disabled="submitPending || checkPending || checkErrors.length > 0 || !destPath">
+                @click="save" :disabled="submitPending || checkPending || checkErrors.length > 0 || !destPath || !numbersValid">
           {{ submitPending ? 'Saving…' : 'Save' }}
         </button>
         <button class="btn grey waves-effect waves-light col m4 s12 offset-m1"
@@ -8357,6 +10474,19 @@ const backupEditModal = Vue.component('backup-edit-modal', {
   `,
   watch: {
     destPath: function () { this.scheduleCheck(); },
+  },
+  computed: {
+    // Same client-side mirror of the server's numeric constraints as the
+    // add form — Save is a plain @click (no <form>), so the min/max
+    // attributes alone are never enforced by the browser.
+    numbersValid() {
+      const hourOk = this.triggerType !== 'daily'
+        || (Number.isInteger(this.dailyAtHour) && this.dailyAtHour >= 0 && this.dailyAtHour <= 23);
+      const retentionOk = Number.isInteger(this.retentionDays) && this.retentionDays >= 0;
+      const throttleOk = Number.isInteger(this.interFileDelayMs)
+        && this.interFileDelayMs >= 0 && this.interFileDelayMs <= 60000;
+      return hourOk && retentionOk && throttleOk;
+    },
   },
   created() {
     // Run an initial validation so warnings (same-drive etc.) show on
@@ -8376,13 +10506,17 @@ const backupEditModal = Vue.component('backup-edit-modal', {
         .map((s) => s.trim())
         .filter((s) => s.length > 0);
     },
+    // checkPending raised here (not in checkPath) so Save is blocked for
+    // the whole debounce window — see the add form's scheduleCheck.
     scheduleCheck() {
+      this.checkPending = true;
       if (this.checkDebounceTimer) { clearTimeout(this.checkDebounceTimer); }
       this.checkDebounceTimer = setTimeout(() => this.checkPath(), 400);
     },
     async checkPath() {
       if (!this.destPath || !this.destination?.library_id) {
         this.checkErrors = []; this.checkWarnings = [];
+        this.checkPending = false;
         return;
       }
       try {
@@ -8390,7 +10524,14 @@ const backupEditModal = Vue.component('backup-edit-modal', {
         const res = await API.axios({
           method: 'POST',
           url: `${API.url()}/api/v1/admin/backup/check-path`,
-          data: { libraryId: this.destination.library_id, destPath: this.destPath },
+          data: {
+            libraryId: this.destination.library_id,
+            destPath: this.destPath,
+            // Self-exclude, exactly like the PATCH this dialog submits —
+            // otherwise previewing the destination's own unchanged path
+            // reports "already uses this path" and Save never enables.
+            excludeDestId: this.destination.id,
+          },
         });
         this.checkErrors = res.data.errors || [];
         this.checkWarnings = res.data.warnings || [];
@@ -8456,7 +10597,7 @@ const backupEditModal = Vue.component('backup-edit-modal', {
         this.close();
       } catch (err) {
         iziToast.error({
-          title: err.response?.data?.error || 'Save failed',
+          title: escHtml(err.response?.data?.error || 'Save failed'),
           position: 'topCenter', timeout: 4000,
         });
       } finally {
@@ -8481,7 +10622,7 @@ const backupEditModal = Vue.component('backup-edit-modal', {
         iziToast.success({ title: 'Patterns reset to defaults', position: 'topCenter', timeout: 2000 });
       } catch (err) {
         iziToast.error({
-          title: err.response?.data?.error || 'Reset failed',
+          title: escHtml(err.response?.data?.error || 'Reset failed'),
           position: 'topCenter', timeout: 4000,
         });
       } finally {
@@ -8510,9 +10651,8 @@ const modVM = new Vue({
     'edit-transcode-bitrate-modal': editTranscodeDefaultBitrate,
     'edit-ssl-modal': editSslModal,
     'lastfm-modal': lastFMModal,
-    // Disabled along with the federation tab — see the disabled-block
-    // comment around the federationGenerateInvite definition above.
-    // 'federation-generate-invite-modal': federationGenerateInvite,
+    'federation-new-ticket-modal': federationNewTicketModal,
+    'federation-edit-limits-modal': federationEditLimitsModal,
     'edit-rust-player-port-modal': editRustPlayerPortModal,
     'edit-album-art-services-modal': editAlbumArtServicesModal,
     'edit-log-buffer-size-modal': editLogBufferSizeModal,

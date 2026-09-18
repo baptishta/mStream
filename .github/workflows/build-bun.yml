@@ -16,14 +16,319 @@ on:
       - 'bin/**'
       - 'cli-boot-wrapper.js'
       - 'scripts/build-bun.mjs'
+      # Imported by build-bun.mjs on EVERY target (a broken stamper breaks
+      # bundling everywhere) / the win-x64 VersionInfo gate — a change to
+      # either must run the legs before merge, not first on the release tag.
+      - 'scripts/win-versioninfo.mjs'
+      - 'scripts/check-win-versioninfo.ps1'
+      # A lockfile-only dependency refresh changes what `npm ci` + `bun build
+      # --compile` embed in the shipped binaries just as much as package.json.
       - 'package.json'
+      - 'package-lock.json'
       - '.github/workflows/build-bun.yml'
+      # Launcher source changes must run the integrated bundle smokes BEFORE
+      # merge (the launcher step below builds them fresh for such PRs) — the
+      # binary-commit workflow's own gate is only compile + --autostart=status.
+      - 'rust-launcher/**'
+      # build/ carries bundle inputs the legs consume directly — icons the
+      # bundler stages and mac-entitlements-server.plist the sign step feeds
+      # to codesign. An entitlements-only PR without this filter would merge
+      # with zero CI and first run on the release tag.
+      - 'build/**'
+      # The install scripts + manifest generator have their own PR-time
+      # contract check (installer-contract job below).
+      - 'install.sh'
+      - 'install.ps1'
+      - 'scripts/release-manifest.sh'
   workflow_dispatch:
+    inputs:
+      notarize:
+        description: 'Run the full notarize+staple round-trip (normally tag-only)'
+        type: boolean
+        default: false
 
 jobs:
+  # ── The installers' contract with the manifest, checked on every PR. ─────
+  # The real manifest step only runs on tag builds, and install.sh parses the
+  # manifest with grep (no jq on a fresh box) — so a harmless-looking change
+  # to either side (pretty-printing the JSON, renaming a key, a shell
+  # portability slip) would ship broken and be found by users. This job
+  # builds fake bundles of the real SHAPE, generates a manifest with the real
+  # script, serves it locally, and runs each installer end to end against it:
+  # fetch → verify → extract → link → post-install proof. Fast (no bun build).
+  installer-contract:
+    name: installer contract (${{ matrix.os }})
+    if: github.event_name != 'push'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build fake bundles + real manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh -n install.sh
+          mkdir -p rel
+          # A fake bundle: the folder shape the installers expect, with a
+          # mstream-server that answers -V (the post-install proof) and a
+          # README. Every key, so the linux AND windows installer find theirs.
+          for key in win-x64 linux-x64 linux-arm64 linux-x64-musl linux-arm64-musl darwin-x64 darwin-arm64; do
+            b="mStream-9.9.9-$key"; mkdir -p "rel/$b"
+            case "$key" in
+              win-*)  # a .cmd is not an .exe; the windows leg's proof runs a real tiny exe below
+                      printf 'fake' > "rel/$b/mstream-server.exe"; printf 'fake' > "rel/$b/mStream.exe" ;;
+              darwin-*) mkdir -p "rel/$b/mStream.app/Contents/MacOS"
+                      printf '#!/bin/sh\n[ "$1" = -V ] && echo 9.9.9\n' > "rel/$b/mStream.app/Contents/MacOS/mstream-server"; chmod +x "rel/$b/mStream.app/Contents/MacOS/mstream-server" ;;
+              *)      printf '#!/bin/sh\n[ "$1" = -V ] && echo 9.9.9\n' > "rel/$b/mstream-server"; chmod +x "rel/$b/mstream-server"
+                      printf '[Desktop Entry]\nExec=%%INSTALL_DIR%%/mstream-desktop\n' > "rel/$b/mStream.desktop" ;;
+            esac
+            echo "fake bundle" > "rel/$b/README.txt"
+            # python's zipfile, not `zip`: the Windows runner's git-bash has
+            # no Info-ZIP, and python3 is on every runner. Unix mode bits
+            # don't survive this route, which is fine — install.sh chmods
+            # the binaries it knows about, exactly as it must for real
+            # bundles that crossed a mode-stripping hop.
+            (cd rel && python3 -m zipfile -c "$b.zip" "$b" && rm -rf "$b")
+          done
+          sh scripts/release-manifest.sh 9.9.9 rel
+          # The manifest must be valid JSON with every asset — and the
+          # generator must REFUSE a zip whose name doesn't match the version.
+          node -e "const m=JSON.parse(require('fs').readFileSync('rel/manifest.json','utf8')); if(m.version!=='9.9.9'||m.assets.length!==7) process.exit(1); console.log('manifest ok:', m.assets.length, 'assets')"
+          cp rel/mStream-9.9.9-win-x64.zip rel/mStream-9.9.9-beta.1-win-x64.zip
+          if sh scripts/release-manifest.sh 9.9.9 rel 2>/dev/null; then echo "::error::generator accepted a prerelease-named zip for 9.9.9"; exit 1; fi
+          rm rel/mStream-9.9.9-beta.1-win-x64.zip
+          # Native-installer entries (the updater verifies setup.exe/.pkg by
+          # these hashes) — exercised HERE, not first on tag day: allowlist,
+          # extra same-shape lines, and wrong-version refusal. The e2e
+          # installs below then run against a manifest that carries them,
+          # proving the scripts' name-anchored greps really ignore extras.
+          printf 'i' > rel/mStream-9.9.9-win-x64-setup.exe
+          printf 'p' > rel/mStream-9.9.9-darwin-x64.pkg
+          printf 'p' > rel/mStream-9.9.9-darwin-arm64.pkg
+          sh scripts/release-manifest.sh 9.9.9 rel
+          node -e "const m=JSON.parse(require('fs').readFileSync('rel/manifest.json','utf8')); const names=m.assets.map(a=>a.file); if(m.assets.length!==10){console.error('want 10 assets with installers, got',m.assets.length);process.exit(1)}; for(const n of ['mStream-9.9.9-win-x64-setup.exe','mStream-9.9.9-darwin-x64.pkg','mStream-9.9.9-darwin-arm64.pkg']) if(!names.includes(n)){console.error('manifest missing',n);process.exit(1)}; console.log('manifest ok with installers:', m.assets.length, 'assets')"
+          printf 'x' > rel/mStream-8.8.8-win-x64-setup.exe
+          if sh scripts/release-manifest.sh 9.9.9 rel 2>/dev/null; then echo "::error::generator accepted a wrong-version installer"; exit 1; fi
+          rm rel/mStream-8.8.8-win-x64-setup.exe
+          sh scripts/release-manifest.sh 9.9.9 rel
+
+      - name: Serve the fake release
+        shell: bash
+        run: |
+          (cd rel && python3 -m http.server 8765 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          for i in $(seq 1 20); do curl -sf http://127.0.0.1:8765/manifest.json >/dev/null && break; sleep 0.5; done
+          curl -sf http://127.0.0.1:8765/manifest.json | head -3
+
+      - name: install.sh end to end (linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export MSTREAM_RELEASE_BASE=http://127.0.0.1:8765
+          export MSTREAM_INSTALL_DIR="$RUNNER_TEMP/app" MSTREAM_BIN_DIR="$RUNNER_TEMP/bin"
+          export MSTREAM_NO_DESKTOP=1
+          sh install.sh | tee out.log
+          grep -q "mstream-server 9.9.9 runs" out.log
+          [ "$(readlink "$RUNNER_TEMP/app/current")" = "$RUNNER_TEMP/app/mStream-9.9.9-linux-x64" ]
+          [ -x "$RUNNER_TEMP/bin/mstream-server" ]
+          # same-version re-run: keep + short-circuit. Capture to a file, then
+          # grep: `sh install.sh | grep -q` closes the pipe on first match and
+          # the installer's later echo dies of EPIPE under set -e (measured:
+          # "echo: I/O error", a false failure).
+          echo keep > "$RUNNER_TEMP/app/mStream-9.9.9-linux-x64/STATE"
+          sh install.sh > rerun.log 2>&1
+          grep -q "already installed" rerun.log
+          [ -f "$RUNNER_TEMP/app/mStream-9.9.9-linux-x64/STATE" ]
+          # tampered manifest must refuse
+          sed -i 's/"sha256": "[0-9a-f]*"/"sha256": "0000000000000000000000000000000000000000000000000000000000000000"/' rel/manifest.json
+          if MSTREAM_FORCE=1 sh install.sh >/dev/null 2>&1; then echo "::error::installed despite bad hash"; exit 1; fi
+          # a bundle whose binary cannot exec here must never take over
+          # `current`: probe-before-flip refuses, exits nonzero, keeps the
+          # working install (the in-app updater treats that exit as a failed
+          # stage instead of arming a landmine for the next restart)
+          bb="mStream-9.9.10-linux-x64"
+          # sweep BEFORE creating the new bundle dir: the glob covers the
+          # fake installer files too, and rm -f refuses directories
+          rm -f rel/mStream-* rel/manifest.json
+          mkdir -p "rel/$bb"
+          printf '#!/bin/sh\nexit 1\n' > "rel/$bb/mstream-server"; chmod +x "rel/$bb/mstream-server"
+          echo broken > "rel/$bb/README.txt"
+          (cd rel && python3 -m zipfile -c "$bb.zip" "$bb" && rm -rf "$bb")
+          sh scripts/release-manifest.sh 9.9.10 rel
+          if sh install.sh > broken.log 2>&1; then echo "::error::installed a bundle that cannot exec"; exit 1; fi
+          grep -q "does not run on this system" broken.log
+          [ "$(readlink "$RUNNER_TEMP/app/current")" = "$RUNNER_TEMP/app/mStream-9.9.9-linux-x64" ]
+          # uninstall removes what was installed and nothing else. The
+          # uninstall path exits before any feed fetch, so the (now 9.9.10-
+          # only) rel dir needs no rebuilding; checkout restores install.sh
+          # from the tamper-test's sed.
+          git checkout -- . 2>/dev/null || true
+          MSTREAM_UNINSTALL=1 sh install.sh | tee un.log
+          [ ! -e "$RUNNER_TEMP/app" ] && [ ! -e "$RUNNER_TEMP/bin/mstream-server" ]
+          grep -q "left in place" un.log
+          echo "install.sh contract OK"
+
+      - name: install.ps1 end to end (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
+          # The fake win bundle needs a real exe for the -V proof: reuse the
+          # runner's own tiny "cmd /c" via a wrapper is not an exe either —
+          # so accept the proof warning path here and assert on the layout.
+          $env:MSTREAM_RELEASE_BASE = 'http://127.0.0.1:8765'
+          $env:MSTREAM_INSTALL_DIR = "$env:RUNNER_TEMP\app"
+          $env:MSTREAM_NO_DESKTOP = '1'; $env:MSTREAM_NO_PATH = '1'
+          & .\install.ps1 *>&1 | Tee-Object -Variable out
+          if (-not (Test-Path "$env:RUNNER_TEMP\app\mStream-9.9.9-win-x64\README.txt")) { throw "no install" }
+          $j = Get-Item "$env:RUNNER_TEMP\app\current" -Force
+          if (-not ($j.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "current is not a junction" }
+          # same-version re-run keeps + short-circuits
+          Set-Content "$env:RUNNER_TEMP\app\mStream-9.9.9-win-x64\STATE" keep
+          $out2 = & .\install.ps1 *>&1 | Out-String
+          if ($out2 -notmatch 'already installed') { throw "no short-circuit" }
+          if (-not (Test-Path "$env:RUNNER_TEMP\app\mStream-9.9.9-win-x64\STATE")) { throw "state deleted on re-run" }
+          # tampered manifest refused
+          (Get-Content rel\manifest.json -Raw) -replace '"sha256": "[0-9a-f]*"', ('"sha256": "' + ('0' * 64) + '"') | Set-Content rel\manifest.json -NoNewline
+          $env:MSTREAM_FORCE = '1'
+          try { & .\install.ps1 *>&1 | Out-Null; throw "installed despite bad hash" } catch { if ("$_" -notmatch 'sha256 mismatch') { throw } }
+          $env:MSTREAM_FORCE = $null
+          # a bundle whose binary cannot exec must never take over `current`:
+          # probe-before-flip refuses (throws, nonzero exit) and keeps the
+          # working install. The fake 9.9.9 exe is already non-executable,
+          # which is exactly the probe-failure shape; only the presence of a
+          # working-or-first-install current decides advisory vs refusal.
+          $bb = 'mStream-9.9.10-win-x64'
+          Remove-Item rel\mStream-*, rel\manifest.json -Force
+          # zip from INSIDE rel so entries carry no rel\ prefix
+          Push-Location rel
+          New-Item -ItemType Directory -Force $bb | Out-Null
+          Set-Content "$bb\mstream-server.exe" 'broken'
+          Set-Content "$bb\README.txt" 'broken'
+          python3 -m zipfile -c "$bb.zip" $bb
+          Remove-Item -Recurse -Force $bb
+          Pop-Location
+          # bash, not sh: git-bash's bash.exe is on the runner PATH for pwsh
+          bash scripts/release-manifest.sh 9.9.10 rel
+          try { & .\install.ps1 *>&1 | Out-Null; throw "installed a bundle that cannot exec" } catch { if ("$_" -notmatch 'does not run on this system') { throw } }
+          $j2 = Get-Item "$env:RUNNER_TEMP\app\current" -Force
+          if (($j2.Target | Select-Object -First 1) -notmatch 'mStream-9\.9\.9-win-x64$') { throw "current moved off 9.9.9: $($j2.Target)" }
+          # uninstall
+          $env:MSTREAM_UNINSTALL = '1'
+          & .\install.ps1 *>&1 | Tee-Object -Variable un
+          if (Test-Path "$env:RUNNER_TEMP\app") { throw "app root survived uninstall" }
+          if (($un | Out-String) -notmatch 'left in place') { throw "no data-home note" }
+          Write-Host "install.ps1 contract OK"
+
+      # The darwin-only paths: ~/Applications copy + sibling ownership marker,
+      # login-item re-pointing through the RIGHT launcher, and the
+      # refresh-while-running rules. Self-contained: rebuilds the fake darwin
+      # bundle with an instrumented launcher stub (records which binary ran
+      # --autostart=enable, writes the same one-line plist the auto-launch
+      # crate writes) and a server stub, then walks fresh install -> enabled
+      # upgrade -> running upgrade -> idle upgrade -> uninstall. HOME is
+      # redirected so the runner's real ~/Applications is never touched.
+      - name: install.sh end to end (macos)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOME="$RUNNER_TEMP/home"
+          mkdir -p "$HOME/Applications" "$HOME/Library/LaunchAgents"
+          export MSTREAM_STUB_DIR="$RUNNER_TEMP/stub"; mkdir -p "$MSTREAM_STUB_DIR"
+          export MSTREAM_RELEASE_BASE=http://127.0.0.1:8765
+          DKEY="darwin-$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')"
+          DEST="$HOME/Applications/mStream.app"
+          ROOT="$HOME/Library/Application Support/mStream/app"
+          cat > "$RUNNER_TEMP/stub-launcher" <<'STUB'
+          #!/bin/sh
+          d="$MSTREAM_STUB_DIR"
+          case "$1" in
+            --autostart=status) cat "$d/state" 2>/dev/null || echo disabled ;;
+            --autostart=enable)
+              echo enabled > "$d/state"
+              printf '%s\n' "$0" >> "$d/enable-calls"
+              printf '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>Label</key><string>mStream</string><key>ProgramArguments</key><array><string>%s</string><string>--autostarted</string></array><key>RunAtLoad</key><true/></dict></plist>' "$0" > "$HOME/Library/LaunchAgents/mStream.plist"
+              ;;
+            --autostart=disable) echo disabled > "$d/state"; rm -f "$HOME/Library/LaunchAgents/mStream.plist" ;;
+          esac
+          exit 0
+          STUB
+          mkrel() {
+            rm -f rel/mStream-* rel/manifest.json
+            b="mStream-$1-$DKEY"; mkdir -p "rel/$b/mStream.app/Contents/MacOS"
+            printf '%s\n' "$1" > "rel/$b/mStream.app/Contents/VERSION"
+            printf '#!/bin/sh\n[ "$1" = -V ] && echo %s\nexit 0\n' "$1" > "rel/$b/mStream.app/Contents/MacOS/mstream-server"
+            cp "$RUNNER_TEMP/stub-launcher" "rel/$b/mStream.app/Contents/MacOS/mStream"
+            chmod +x "rel/$b/mStream.app/Contents/MacOS/mstream-server" "rel/$b/mStream.app/Contents/MacOS/mStream"
+            echo "fake bundle" > "rel/$b/README.txt"
+            (cd rel && python3 -m zipfile -c "$b.zip" "$b" && rm -rf "$b")
+            sh scripts/release-manifest.sh "$1" rel >/dev/null
+          }
+          # A: fresh install - copy, sibling marker, untouched login item
+          mkrel 9.9.9
+          sh install.sh > a.log 2>&1 || { cat a.log; exit 1; }
+          [ "$(readlink "$ROOT/current")" = "$ROOT/mStream-9.9.9-$DKEY" ]
+          [ "$(cat "$DEST/Contents/VERSION")" = 9.9.9 ]
+          [ "$(head -1 "$HOME/Applications/.mstream-installer")" = 9.9.9 ]
+          [ ! -f "$MSTREAM_STUB_DIR/enable-calls" ]
+          # B: with the login item enabled, an upgrade re-points it - and the
+          # enable must run through the ~/APPLICATIONS launcher (the stable
+          # path), not $ROOT/current: the sibling-marker ownership check.
+          "$DEST/Contents/MacOS/mStream" --autostart=enable
+          : > "$MSTREAM_STUB_DIR/enable-calls"
+          mkrel 9.9.10
+          sh install.sh > b.log 2>&1 || { cat b.log; exit 1; }
+          grep -q "login item re-pointed at 9.9.10" b.log
+          [ "$(tail -1 "$MSTREAM_STUB_DIR/enable-calls")" = "$DEST/Contents/MacOS/mStream" ]
+          [ "$(head -1 "$HOME/Applications/.mstream-installer")" = 9.9.10 ]
+          # C: upgrade while mStream runs from ~/Applications - the old tree
+          # is moved aside INTACT (a live process reads webapp/sidecars from
+          # it), never rm -rf'd; the running-instance note is printed.
+          bash -c "exec -a '$DEST/Contents/MacOS/mstream-server' sleep 600" &
+          HANG=$!
+          sleep 1
+          pgrep -f "^$DEST/" >/dev/null
+          mkrel 9.9.11
+          sh install.sh > c.log 2>&1 || { cat c.log; exit 1; }
+          [ "$(cat "$DEST/Contents/VERSION")" = 9.9.11 ]
+          [ "$(ls -d "$DEST".old.* | wc -l | tr -d ' ')" = 1 ]
+          olddir=$(ls -d "$DEST".old.*)
+          [ "$(cat "$olddir/Contents/VERSION")" = 9.9.10 ]
+          [ -x "$olddir/Contents/MacOS/mstream-server" ]
+          kill -0 "$HANG"
+          grep -q "currently running from" c.log
+          # D: once idle, the next upgrade sweeps the aside
+          kill "$HANG"; wait "$HANG" 2>/dev/null || true
+          mkrel 9.9.12
+          sh install.sh > d.log 2>&1 || { cat d.log; exit 1; }
+          [ "$(cat "$DEST/Contents/VERSION")" = 9.9.12 ]
+          if ls -d "$DEST".old.* 2>/dev/null; then echo "::error::stale aside survived an idle upgrade"; exit 1; fi
+          # E: uninstall removes copy, marker, login item, root - keeps data
+          MSTREAM_UNINSTALL=1 sh install.sh > e.log 2>&1 || { cat e.log; exit 1; }
+          [ ! -e "$ROOT" ] && [ ! -e "$DEST" ]
+          [ ! -e "$HOME/Applications/.mstream-installer" ]
+          [ ! -e "$HOME/Library/LaunchAgents/mStream.plist" ]
+          grep -q "left in place" e.log
+          echo "install.sh darwin contract OK"
+
   build:
     name: ${{ matrix.key }}
     runs-on: ${{ matrix.os }}
+    # The smoke steps drive a real server: a wedged accept-but-never-respond
+    # process would otherwise sit in a retry loop until the 6-hour default,
+    # burning paid macOS/Windows runners and showing "still running" instead of
+    # a failure. Every smoke curl also carries --max-time. A full build+smoke
+    # is ~2 minutes today — but the darwin legs' notarize path waits on Apple
+    # for up to 20 minutes (notarytool --timeout below) BEFORE staple, re-zip,
+    # and the smoke battery run, so those legs get the headroom to match; the
+    # tight cap stays for every other leg.
+    timeout-minutes: ${{ startsWith(matrix.key, 'darwin') && 50 || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -64,15 +369,827 @@ jobs:
         run: |
           $V = (bun --version).Trim()
           Write-Host "bun $V - pre-fetching bun-windows-x64-baseline runtime"
-          Invoke-WebRequest "https://github.com/oven-sh/bun/releases/download/bun-v$V/bun-windows-x64-baseline.zip" -OutFile baseline.zip
+          $rel = "https://github.com/oven-sh/bun/releases/download/bun-v$V"
+          Invoke-WebRequest "$rel/bun-windows-x64-baseline.zip" -OutFile baseline.zip
+          # This runtime is EMBEDDED into the shipped mstream-server.exe —
+          # previously the only input reaching a release PE with no hash
+          # check. Verify against the Bun release's own SHASUMS256.txt: not
+          # a committed pin (that belongs with a pinned Bun version), but it
+          # binds the bytes to the release they claim to come from and fails
+          # a truncated or substituted download loudly.
+          Invoke-WebRequest "$rel/SHASUMS256.txt" -OutFile shasums.txt
+          $want = (Select-String -Path shasums.txt -Pattern 'bun-windows-x64-baseline\.zip$' |
+            ForEach-Object { ($_.Line -split '\s+')[0] } | Select-Object -First 1)
+          if (-not $want) { throw 'SHASUMS256.txt has no entry for bun-windows-x64-baseline.zip' }
+          $got = (Get-FileHash -Algorithm SHA256 baseline.zip).Hash.ToLower()
+          if ($got -ne $want.ToLower()) { throw "baseline runtime sha256 mismatch: expected $want, got $got" }
+          Write-Host "baseline runtime sha256 verified ($got)"
           Expand-Archive baseline.zip -DestinationPath baseline-rt -Force
           $exe = (Get-ChildItem -Recurse baseline-rt -Filter bun.exe | Select-Object -First 1).FullName
           if (-not $exe) { throw 'bun.exe not found in the baseline runtime archive' }
           "BUN_COMPILE_EXEC_PATH=$exe" | Add-Content -Path $env:GITHUB_ENV
           Write-Host "runtime: $exe"
 
+      # The bundler stamps Windows VersionInfo onto the staged rust sidecars
+      # with resedit (scripts/win-versioninfo.mjs). It's a devDependency, and
+      # this job installs prod-only, so add JUST that package under
+      # scripts/node_modules — a plain `npm install --no-save resedit` would
+      # reconcile the whole tree and drag every devDependency (eslint,
+      # redocly, ...) in with it; `--omit=dev` would then skip resedit itself.
+      # The bundler resolves it from scripts/ (its own directory) first.
+      #
+      # This install does NOT consult package-lock.json (verified: it happily
+      # installs with a corrupted root lock), and the code it fetches rewrites
+      # two PEs that ship — and will be code-signed. So: pin BOTH packages
+      # (resedit's `pe-library ^2.0.1` would otherwise float to whatever the
+      # registry serves that minute), run no lifecycle scripts, and then bind
+      # the result to the reviewed lockfile: npm records resolved+integrity of
+      # what it installed in scripts/node_modules/.package-lock.json; both
+      # entries must equal the root package-lock.json's. Any drift — a new
+      # publish, a registry substitution, a stale pin here vs the lock — is a
+      # red step, not a silently different stamper. Bump the pins together
+      # with the lockfile.
+      - name: Install the VersionInfo stamper (win-x64)
+        if: matrix.key == 'win-x64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --prefix scripts --no-save --no-audit --no-fund --ignore-scripts resedit@3.0.2 pe-library@2.0.1
+          node -e '
+            const want = require("./package-lock.json").packages;
+            const got = require("./scripts/node_modules/.package-lock.json").packages;
+            let bad = 0;
+            for (const name of ["node_modules/resedit", "node_modules/pe-library"]) {
+              const w = want[name], g = got[name];
+              if (!w || !g || w.version !== g.version || w.integrity !== g.integrity || w.resolved !== g.resolved) {
+                console.error(`::error::stamper dependency ${name} differs from package-lock.json: installed ${g && g.version} ${g && g.integrity} vs lock ${w && w.version} ${w && w.integrity} — bump the pins in this step together with the lockfile`);
+                bad = 1;
+              } else {
+                console.log(`ok ${name}@${g.version} matches package-lock.json (${g.integrity.slice(0, 20)}...)`);
+              }
+            }
+            process.exit(bad);
+          '
+
+      # Desktop tray launcher: the bundler stages bin/rust-launcher/<name> as
+      # the bundle's double-click face (mStream.exe / .app executable /
+      # mstream-desktop). Those binaries are CI-committed on master pushes
+      # (build-rust-launcher.yml); on PRs — and before the first commit lands —
+      # build this leg's launcher here so the bundle and its smokes cover the
+      # real product shape. Launcher-less targets (linux-arm64, musl) skip:
+      # their bundles ship server-only by design.
+      #
+      # Floor caveat: this fallback links on the leg's own runner, so the
+      # linux-x64 binary it produces carries ubuntu-latest's glibc floor
+      # (2.34+). Fine for PR bundles and their smokes (same runner), but the
+      # SHIPPABLE linux launcher is the committed one from
+      # build-rust-launcher.yml, which builds in a debian:11 container for a
+      # 2.31 floor — don't tag a release while bin/rust-launcher/ is empty.
+      - name: Build launcher (if not committed / stale for this PR / assert provenance on tags)
+        if: matrix.key == 'win-x64' || matrix.key == 'linux-x64' || matrix.key == 'darwin-arm64' || matrix.key == 'darwin-x64'
+        shell: bash
+        run: |
+          set -e
+          case "${{ matrix.key }}" in
+            win-x64)      NAME=mstream-launcher-win32-x64.exe; TARGET=x86_64-pc-windows-msvc ;;
+            linux-x64)    NAME=mstream-launcher-linux-x64;     TARGET=x86_64-unknown-linux-gnu ;;
+            darwin-arm64) NAME=mstream-launcher-darwin-arm64;  TARGET=aarch64-apple-darwin ;;
+            darwin-x64)   NAME=mstream-launcher-darwin-x64;    TARGET=x86_64-apple-darwin ;;
+          esac
+
+          # Tag builds ship the COMMITTED binaries (the linux one carries the
+          # debian:11 glibc floor an in-job rebuild here couldn't reproduce),
+          # so a tag must prove those binaries match its own launcher source
+          # AND its own version: build.rs bakes package.json's version into
+          # the Windows exe's VersionInfo, and `npm version` tags the bump
+          # commit itself — before build-rust-launcher has rebuilt — so a
+          # tree-only check let v6.20.1 ship an mStream.exe reporting 6.20.0.
+          # The four-line stamp (tree, version, exe-icon blob, tray-icon
+          # blob) is written by build-rust-launcher's commit job; a tag cut
+          # inside the rebuild window — or before the stamp ever landed —
+          # fails here instead of shipping a stale launcher green.
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            WANT_TREE=$(git rev-parse HEAD:rust-launcher)
+            # node, not jq: this leg runs on all three OSes and setup-node ran
+            # above; jq's presence on the Windows leg's git-bash is a runner-
+            # image detail not worth depending on.
+            WANT_VER=$(node -pe "require('./package.json').version")
+            if [ ! -f bin/rust-launcher/.source-tree ]; then
+              echo "::error::no launcher provenance stamp (bin/rust-launcher/.source-tree) — wait for build-rust-launcher's commit on master, then re-tag"
+              exit 1
+            fi
+            HAVE_TREE=$(sed -n '1p' bin/rust-launcher/.source-tree)
+            HAVE_VER=$(sed -n '2p' bin/rust-launcher/.source-tree)
+            if [ "$WANT_TREE" != "$HAVE_TREE" ]; then
+              echo "::error::committed launcher binaries were built from rust-launcher tree $HAVE_TREE but this tag's tree is $WANT_TREE — wait for build-rust-launcher's commit (or re-run it), then re-tag"
+              exit 1
+            fi
+            if [ "$WANT_VER" != "$HAVE_VER" ]; then
+              echo "::error::committed launcher binaries were built for version '${HAVE_VER:-<unstamped>}' but this tag is $WANT_VER — their VersionInfo would be wrong. Bump with \`npm version --no-git-tag-version\`, push, wait for build-rust-launcher's 'ci: update pre-built' commit, then tag THAT commit"
+              exit 1
+            fi
+            # Lines 3-4: the two icons the launcher embeds from build/ (exe
+            # icon via build.rs, tray icon via include_bytes!). Outside the
+            # rust-launcher/ tree, so a tree-only stamp let an icon change ship
+            # the old icon green.
+            WANT_ICO=$(git rev-parse HEAD:build/mstream-logo-cut.ico)
+            WANT_PNG=$(git rev-parse HEAD:build/icon.png)
+            HAVE_ICO=$(sed -n '3p' bin/rust-launcher/.source-tree)
+            HAVE_PNG=$(sed -n '4p' bin/rust-launcher/.source-tree)
+            if [ "$WANT_ICO" != "$HAVE_ICO" ] || [ "$WANT_PNG" != "$HAVE_PNG" ]; then
+              echo "::error::committed launcher binaries embed icons ${HAVE_ICO:-<unstamped>}/${HAVE_PNG:-<unstamped>} but this tag's build/ icons are $WANT_ICO/$WANT_PNG — wait for build-rust-launcher's commit (an icon change triggers it), then tag THAT commit"
+              exit 1
+            fi
+            # A tag ships the COMMITTED launcher (the linux one carries a glibc
+            # floor an in-job rebuild here cannot reproduce): a missing binary
+            # is a broken release, not a reason to build one on this runner.
+            if [ ! -f "bin/rust-launcher/$NAME" ]; then
+              echo "::error::no committed launcher bin/rust-launcher/$NAME for this tag — the in-job rebuild is for PRs only (it would ship this runner's glibc floor); dispatch build-rust-launcher, wait for its commit, then re-tag"
+              exit 1
+            fi
+            echo "launcher provenance ok: tree $WANT_TREE, version $WANT_VER, icons $WANT_ICO/$WANT_PNG"
+          fi
+
+          REBUILD=0
+          if [ ! -f "bin/rust-launcher/$NAME" ]; then
+            REBUILD=1; echo "no committed launcher"
+          fi
+          # A PR that touches rust-launcher/ must smoke ITS OWN launcher —
+          # the committed binary predates the PR by definition. Diff against
+          # the PR base; an undiffable base forces the rebuild (fail-safe:
+          # over-building costs minutes, a stale binary voids the smoke).
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "$REBUILD" = "0" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            if git fetch -q --depth=1 origin "$BASE" && CHANGED=$(git diff --name-only "$BASE" HEAD -- rust-launcher/); then
+              if [ -n "$CHANGED" ]; then
+                REBUILD=1; echo "PR modifies rust-launcher/ — building fresh (committed binary would be stale for this smoke)"
+              fi
+            else
+              REBUILD=1; echo "could not diff against PR base — building fresh to be safe"
+            fi
+          fi
+          if [ "$REBUILD" = "0" ]; then echo "committed launcher present: $NAME"; exit 0; fi
+
+          echo "building $NAME ($TARGET)"
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq libgtk-3-dev libayatana-appindicator3-dev
+          fi
+          rustup target add "$TARGET"
+          cargo build --release --locked --target "$TARGET" --manifest-path rust-launcher/Cargo.toml
+          SRC="rust-launcher/target/$TARGET/release/mstream-launcher"
+          if [ "${{ runner.os }}" = "Windows" ]; then SRC="$SRC.exe"; fi
+          mkdir -p bin/rust-launcher
+          cp "$SRC" "bin/rust-launcher/$NAME"
+          echo "built: bin/rust-launcher/$NAME"
+          # Tell the VersionInfo assert below that mStream.exe is THIS PR's
+          # own build: a version mismatch there can only mean build.rs is
+          # broken, so it must fail, not get the committed-launcher leniency.
+          echo "LAUNCHER_REBUILT=1" >> "$GITHUB_ENV"
+
+      # ── Sidecar provenance (tags) ─────────────────────────────────────────
+      # bin/rust-parser/* is CI-committed and
+      # staged verbatim into EVERY bundle. Like the launcher, a tag must prove
+      # they were built from THIS tag's source: their workflows write a stamp
+      # (the source tree hash, from the trigger sha) next to the binaries —
+      # rust-parser has two, one per workflow (glibc / musl legs), so the two
+      # never write the same path. A PR merged just before the version bump
+      # would otherwise ship stale scanners green — soon code-signed — and a
+      # hand-committed binary would pass unnoticed.
+      - name: Assert sidecar provenance (tags)
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          fail=0
+          check() {   # <stamp file> <source dir> <workflow that writes it>
+            want=$(git rev-parse "HEAD:$2")
+            if [ ! -f "$1" ]; then
+              echo "::error::no provenance stamp $1 — dispatch $3 (or push a $2/ change), wait for its 'ci: update pre-built' commit, then re-tag"
+              fail=1; return
+            fi
+            have=$(sed -n '1p' "$1")
+            if [ "$want" != "$have" ]; then
+              echo "::error::committed $2 binaries were built from tree ${have:-<unstamped>} but this tag's $2 tree is $want — wait for $3's commit (or re-run it), then re-tag"
+              fail=1; return
+            fi
+            echo "$2 provenance ok: $want ($1)"
+          }
+          check bin/rust-parser/.source-tree       rust-parser       build-rust-parser
+          check bin/rust-parser/.source-tree-musl  rust-parser       build-rust-parser-musl
+          # (mstream-player and the p2p sidecar need no stamp: the bundler
+          # verifies their fetched bytes against sha256 pins per build.)
+          [ "$fail" = 0 ]
+
       - name: Build + bundle (${{ matrix.key }})
         run: bun scripts/build-bun.mjs --target=${{ matrix.key }} --bundle
+
+      # ── Windows VersionInfo contract (win-x64) ──────────────────────────
+      # Every PE the zip ships must carry the same ProductName / version /
+      # company / copyright, read back through the Win32 version API — what
+      # Explorer, Task Manager, and (next) code-signing metadata restrictions
+      # see. Three sources feed it: Bun's --windows-* flags (server), the
+      # launcher's build.rs (baked at its CI build), and the bundler's
+      # resedit stamp (sidecars). Strict on tags AND whenever the launcher
+      # step above rebuilt mStream.exe from this very tree (LAUNCHER_REBUILT):
+      # a fresh build has no excuse. Only a PR that stages the COMMITTED
+      # launcher gets the leniency (package.json-derived fields may lag until
+      # build-rust-launcher recommits — see the script). Any PE the script
+      # doesn't know fails the build: no binary may ship blank — and later
+      # unsigned — by omission.
+      #
+      # mstream-player is stamped here but exercised by no other smoke
+      # (server-playback is opt-in), so prove the stamped exe still LOADS
+      # AND RUNS: start it and either see it serve /status, or see it fail
+      # its eager audio-device open. The runner has no sound device, so on
+      # CI serve mode exits with "could not initialize audio output" — that
+      # is Rust code executing past main(), i.e. the PE loader accepted the
+      # re-laid-out file, which is the only thing the stamp could have
+      # broken. Anything else (won't start, no output, a different failure)
+      # fails. rust-parser and the launcher run stamped/baked in the smoke
+      # steps below.
+      # The updater stages new versions by running the installer script
+      # embedded in its own bundle — a bundle that ships without one can
+      # never self-update, and nothing at runtime would say why. Assert it
+      # per leg, like the sidecar/launcher/iroh assets already are.
+      - name: Assert the embedded installer script shipped
+        shell: bash
+        run: |
+          D=$(ls -d dist/stage/mStream-*-${{ matrix.key }})
+          case "${{ matrix.key }}" in
+            win-x64) test -f "$D/install.ps1" || { echo "::error::install.ps1 missing from the bundle"; exit 1; } ;;
+            darwin-*) test -f "$D/mStream.app/Contents/Resources/install.sh" || { echo "::error::embedded install.sh missing (Contents/Resources)"; exit 1; } ;;
+            *) test -f "$D/install.sh" || { echo "::error::embedded install.sh missing"; exit 1; } ;;
+          esac
+          echo "OK: embedded installer present for ${{ matrix.key }}"
+
+      # Same story for the runtime-fetch pin manifests: the ffmpeg bootstrap
+      # reads bin/ffmpeg/manifest.json from the bundle at runtime, and a
+      # bundle without it downloads nothing, forever, with only a boot-time
+      # warning to say why (observed on the first post-pin bundle). Assert
+      # presence, valid JSON, and — for ffmpeg — a pin for this leg's own
+      # platform. The p2p-sidecar manifest backs its runtime-fetch fallback
+      # rung; presence + JSON is enough (musl legs ship manifest-musl.json).
+      - name: Assert the pin manifests shipped
+        shell: bash
+        run: |
+          D=$(ls -d dist/stage/mStream-*-${{ matrix.key }})
+          case "${{ matrix.key }}" in
+            darwin-*) B="$D/mStream.app/Contents/MacOS/bin" ;;
+            *)        B="$D/bin" ;;
+          esac
+          case "${{ matrix.key }}" in
+            *-musl) SC_MANIFEST="manifest-musl.json" ;;
+            *)      SC_MANIFEST="manifest.json" ;;
+          esac
+          case "${{ matrix.key }}" in
+            win-x64)      FKEY="win32-x64" ;;
+            linux-arm64*) FKEY="linux-arm64" ;;
+            linux-x64*)   FKEY="linux-x64" ;;
+            *)            FKEY="${{ matrix.key }}" ;;
+          esac
+          node -e "
+            const fs = require('fs');
+            const read = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
+            const fm = read(process.argv[1] + '/ffmpeg/manifest.json');
+            if (!fm.assets || !fm.assets[process.argv[2]]) {
+              console.error('::error::bin/ffmpeg/manifest.json in the bundle has no pin for ' + process.argv[2]);
+              process.exit(1);
+            }
+            read(process.argv[1] + '/p2p-sidecar/' + process.argv[3]);
+            // mstream-player: no musl build, so only glibc/darwin/win legs
+            // ship its manifest — and it must pin this leg's own binary.
+            if (process.argv[4] !== 'musl') {
+              const pm = read(process.argv[1] + '/mstream-player/manifest.json');
+              const pkey = 'mstream-player-' + process.argv[2] + (process.argv[2] === 'win32-x64' ? '.exe' : '');
+              if (!pm.assets || !pm.assets[pkey]) {
+                console.error('::error::bin/mstream-player/manifest.json in the bundle has no pin for ' + pkey);
+                process.exit(1);
+              }
+            }
+          " "$B" "$FKEY" "$SC_MANIFEST" "${{ contains(matrix.key, '-musl') && 'musl' || 'glibc' }}" || { echo "::error::pin manifest missing or invalid in the bundle"; exit 1; }
+          echo "OK: pin manifests present for ${{ matrix.key }} (ffmpeg key $FKEY, sidecar $SC_MANIFEST)"
+
+      - name: Assert Windows VersionInfo on every shipped PE (win-x64)
+        if: matrix.key == 'win-x64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
+          $D = (Get-Item dist/stage/mStream-*-win-x64).FullName
+          $strict = ('${{ github.ref_type }}' -eq 'tag') -or ($env:LAUNCHER_REBUILT -eq '1')
+          if ($env:LAUNCHER_REBUILT -eq '1') { Write-Host 'launcher was rebuilt from this tree -> strict mode' }
+          & ./scripts/check-win-versioninfo.ps1 -BundleDir $D -Strict:$strict
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $sa = Join-Path $D 'bin/mstream-player/mstream-player-win32-x64.exe'
+          $p = Start-Process -FilePath $sa -ArgumentList '--port','3391' -PassThru -WindowStyle Hidden -RedirectStandardOutput sa.out -RedirectStandardError sa.err
+          $ok = $false
+          for ($i = 0; $i -lt 20 -and -not $ok; $i++) {
+            Start-Sleep -Milliseconds 250
+            try { $ok = (Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:3391/status' -TimeoutSec 2).StatusCode -eq 200 } catch { $ok = $false }
+            if ($p.HasExited) { break }
+          }
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          if ($ok) {
+            Write-Host 'stamped mstream-player serves /status -> 200'
+          } else {
+            $err = (Get-Content sa.err -ErrorAction SilentlyContinue) -join "`n"
+            if ($p.HasExited -and $err -match 'could not initialize audio output') {
+              Write-Host 'stamped mstream-player executes (reached its audio-device open: no sound device on this runner, as expected)'
+            } else {
+              Write-Host "::error::stamped mstream-player neither served /status nor reached its audio-device open (exited=$($p.HasExited))"
+              Get-Content sa.out, sa.err -ErrorAction SilentlyContinue | Select-Object -Last 10
+              exit 1
+            }
+          }
+
+      # ── Developer ID signing + notarization (darwin legs only) ──────────
+      # Ported from mstream-terminal-player's release.yml, adapted from a
+      # bare Mach-O to a full .app bundle: sign inside-out (sidecar Mach-Os
+      # first, then mstream-server with the Bun JIT entitlements, then the
+      # bundle itself, which also signs the launcher main executable), then
+      # notarize and STAPLE — a bundle can carry its ticket offline, which a
+      # bare binary never could. Kills Gatekeeper's "damaged" dialog on
+      # browser-downloaded zips.
+      #
+      # Secrets-gated like the terminal player: absent secrets ship an
+      # unsigned build (fork PRs, dry runs), never a failed one. Signing
+      # runs on EVERY darwin build so the smoke below boots the signed,
+      # hardened-runtime binaries and would catch a missing entitlement in
+      # PR CI; the slow notarize+staple round-trip runs only on tag builds
+      # (or a dispatch with notarize=true, for proving the pipeline without
+      # cutting a release).
+      #
+      # Secrets (same names/values as mstream-terminal-player — repo-scoped,
+      # so they must also be added to THIS repo's Actions secrets):
+      #   MACOS_CERT_P12       base64 of the Developer ID Application .p12
+      #   MACOS_CERT_PASSWORD  the .p12 password
+      #   ASC_API_KEY          App Store Connect API private key (.p8 body)
+      #   ASC_KEY_ID           its key id
+      #   ASC_ISSUER_ID        issuer UUID (team keys only; empty for
+      #                        individual keys — notarytool forbids --issuer
+      #                        with those)
+      # ── Pristine installer payload (win-x64) ────────────────────────────
+      # The smoke steps below BOOT the staged bundle in place: they write
+      # boot logs and a smoke config into the stage dir, and each booted
+      # server's ffmpeg bootstrap downloads into <stage>/bin/ffmpeg
+      # (dataRoot == appRoot on a writable dir). The setup.exe must wrap the
+      # bytes the ZIP shipped — not that residue, whose exact contents vary
+      # with runner speed (up to a truncated mid-download ffmpeg). Snapshot
+      # now, after staging + the VersionInfo assert and before any smoke;
+      # the ISCC step compiles from this copy.
+      - name: Snapshot installer payload (win-x64)
+        if: matrix.key == 'win-x64'
+        shell: pwsh
+        run: |
+          $stage = (Get-Item dist/stage/mStream-*-win-x64).FullName
+          $snap = Join-Path $env:RUNNER_TEMP 'installer-stage'
+          Copy-Item $stage $snap -Recurse
+          Write-Host "snapshot: $snap ($((Get-ChildItem -Recurse $snap | Measure-Object).Count) entries)"
+
+      - name: Sign, notarize, staple (${{ matrix.key }})
+        if: startsWith(matrix.key, 'darwin')
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          ASC_API_KEY: ${{ secrets.ASC_API_KEY }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          FULL_NOTARIZE: ${{ github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.notarize) }}
+        run: |
+          set -euo pipefail
+          # The secrets context is not allowed in a step-level `if`, so the
+          # gate lives here — and it gates on the COHERENT secret set, not one
+          # sentinel value, with opposite postures per context:
+          #   * A build that must notarize (tag, or dispatch with
+          #     notarize=true) with ANY required secret missing fails LOUDLY:
+          #     a release silently shipping unsigned would resurrect the exact
+          #     Gatekeeper dialog this step exists to kill, with one log line
+          #     in a green job as the only witness. This also makes the
+          #     notarize=true proving dispatch mean something: it can no
+          #     longer vacuously succeed by skipping everything.
+          #   * A non-notarizing context (PR, fork, plain dispatch) with NO
+          #     cert ships unsigned — never a failed build.
+          #   * A HALF-configured cert (p12 without password) fails with the
+          #     secret's name in any context: it could only ever fail later
+          #     at `security import` with a message naming nothing.
+          # ASC_ISSUER_ID is deliberately not required: empty means an
+          # individual API key (see the notarytool call below).
+          if [ "$FULL_NOTARIZE" = "true" ]; then
+            missing=""
+            [ -n "${CERT_P12}" ]      || missing="$missing MACOS_CERT_P12"
+            [ -n "${CERT_PASSWORD}" ] || missing="$missing MACOS_CERT_PASSWORD"
+            [ -n "${ASC_API_KEY}" ]   || missing="$missing ASC_API_KEY"
+            [ -n "${ASC_KEY_ID}" ]    || missing="$missing ASC_KEY_ID"
+            if [ -n "$missing" ]; then
+              echo "::error::this build must notarize (tag/dispatch) but these repo secrets are missing:$missing — refusing to ship a release unsigned"
+              exit 1
+            fi
+          fi
+          if [ -z "${CERT_P12}" ]; then
+            echo "signing secrets absent — shipping unsigned"
+            exit 0
+          fi
+          if [ -z "${CERT_PASSWORD}" ]; then
+            echo "::error::MACOS_CERT_P12 is set but MACOS_CERT_PASSWORD is not — signing would die at 'security import' with an error naming no secret; add the password (or remove the cert secret to ship unsigned)"
+            exit 1
+          fi
+          D=$(ls -d dist/stage/mStream-*-${{ matrix.key }})
+          APP="$D/mStream.app"
+          [ -d "$APP" ] || { echo "::error::no .app staged at $APP"; exit 1; }
+
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 1200 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S "apple-tool:,apple:" \
+            -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain
+
+          identity=$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n 's/.*"\(Developer ID Application[^"]*\)".*/\1/p' | head -1)
+          [ -n "$identity" ] || { echo "::error::no Developer ID Application identity in the imported .p12"; exit 1; }
+
+          # Secure timestamps only when the result will be notarized (Apple
+          # requires them there). On PR builds they'd add a network round-trip
+          # to timestamp.apple.com per codesign call — a flake channel for
+          # throwaway signatures; the hardened-runtime smoke value is
+          # identical without. (Same bash-3.2-safe empty-array idiom as
+          # `issuer` below.)
+          ts=()
+          if [ "$FULL_NOTARIZE" = "true" ]; then ts=(--timestamp); fi
+
+          # Nested code first — every sidecar Mach-O under Contents/MacOS
+          # except the two signed by name below (the server with its
+          # entitlements, the launcher via the bundle seal). A find walk
+          # keyed on `file`, NOT a fixed-depth glob: the staged layout
+          # belongs to scripts/build-bun.mjs (marked sign-load-bearing
+          # there), and a sidecar nested one level deeper must not be
+          # silently skipped (unsigned nested code fails the bundle sign —
+          # or tag-day notarization — in the wrong place), nor a stray text
+          # file fed to codesign. Identifiers derive from the filenames,
+          # which notarization accepts.
+          while IFS= read -r f; do
+            case "$(file -b "$f")" in
+              Mach-O*) codesign --force ${ts[@]+"${ts[@]}"} --options runtime --sign "$identity" "$f" ;;
+            esac
+          done < <(find "$APP/Contents/MacOS" -type f ! -name mStream ! -name mstream-server)
+          # The Bun server: JavaScriptCore JITs under hardened runtime only
+          # with these entitlements (see build/mac-entitlements-server.plist).
+          codesign --force ${ts[@]+"${ts[@]}"} --options runtime \
+            --entitlements build/mac-entitlements-server.plist \
+            --sign "$identity" "$APP/Contents/MacOS/mstream-server"
+          # The bundle sign below re-signs the MAIN executable with NO
+          # entitlements — correct only while that executable is the
+          # launcher. In a launcher-less staging (CFBundleExecutable =
+          # mstream-server: the MSTREAM_ALLOW_MISSING_LAUNCHER escape hatch,
+          # or a future server-only darwin variant) it would silently STRIP
+          # the JIT entitlements just applied above and ship a server that
+          # dies at its first JIT allocation — invisibly, on the smoke-less
+          # darwin-x64 leg. Refuse loudly instead; teach this step per-face
+          # entitlement wiring if that variant ever becomes real.
+          face=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$APP/Contents/Info.plist")
+          if [ "$face" != "mStream" ]; then
+            echo "::error::bundle main executable is '$face', not the launcher — the entitlement-less bundle sign would strip its entitlements; this step only supports launcher-faced bundles"
+            exit 1
+          fi
+          # The bundle: signs the launcher main executable and seals the
+          # resource envelope (webapp/ included). Identifier comes from
+          # Info.plist (io.mstream.server).
+          codesign --force ${ts[@]+"${ts[@]}"} --options runtime --sign "$identity" "$APP"
+          # Verify the seal and every nested-code entry the signer recorded —
+          # deliberately NOT --deep. --deep's verification walk classifies
+          # every regular file under Contents/MacOS as a code object, and
+          # this bundle ships the webapp tree + sidecar dirs there (the
+          # server resolves both appRoot-relative, next to its own binary),
+          # so data files like webapp/**/index.html fail it as "code object
+          # is not signed at all" even though the outer seal covers them as
+          # hashed resources — observed on the first signed CI run, AFTER
+          # the sign itself succeeded. Every actual Mach-O is signed
+          # explicitly above; the honest end-to-end acceptance check is
+          # Gatekeeper's own spctl assessment after stapling, below.
+          codesign --verify --strict --verbose=2 "$APP"
+
+          # The signing key's job is done: everything from here on —
+          # notarytool (submits the already-signed app), stapler, spctl, the
+          # re-zip — reads the signature or talks to Apple; none of it needs
+          # the private key. Take the keychain out of the search list and
+          # delete it NOW, not at job end: the smoke steps that follow run the
+          # freshly built server plus every prod dependency on this same
+          # runner, and an unlocked, codesign-authorized Developer ID keychain
+          # sitting in the search list for that whole time is an exfiltration
+          # window (a validly signed Mach-O under our identity is the prize;
+          # Apple revoking the cert would Gatekeeper-fail every shipped
+          # release). Ephemeral runners make it a small window; there is no
+          # reason to leave it open at all. The `if: always()` step below
+          # covers a failure that exits this script before this line.
+          security list-keychains -d user -s login.keychain
+          security delete-keychain "$keychain"
+          echo "signing keychain removed"
+
+          if [ "$FULL_NOTARIZE" = "true" ]; then
+            echo "$ASC_API_KEY" > "$RUNNER_TEMP/asc.p8"
+            ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/notarize.zip"
+            # Team keys carry an issuer UUID; individual keys must not pass
+            # --issuer at all, says notarytool itself. Normalize both ids
+            # first — these are hand-pasted repo secrets, and a stray
+            # newline/space/quote from the paste otherwise surfaces as
+            # notarytool usage error rc=64 mid-run (observed: "'***' is
+            # invalid for '--issuer': must be a valid UUID") — then
+            # shape-check the issuer so a wrong-field paste fails NAMED.
+            ASC_KEY_ID=$(printf '%s' "$ASC_KEY_ID" | tr -d '[:space:]"')
+            ASC_ISSUER_ID=$(printf '%s' "$ASC_ISSUER_ID" | tr -d '[:space:]"')
+            if [ -n "$ASC_ISSUER_ID" ] && ! printf '%s' "$ASC_ISSUER_ID" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+              echo "::error::ASC_ISSUER_ID is set but is not a UUID — re-copy the Issuer ID from App Store Connect (Users and Access → Integrations) and reset the secret"
+              exit 1
+            fi
+            issuer=()
+            if [ -n "${ASC_ISSUER_ID}" ]; then
+              issuer=(--issuer "$ASC_ISSUER_ID")
+            fi
+            # ${issuer[@]+...}: macOS runners execute this step with /bin/bash
+            # 3.2 (even `shell: bash` resolves there), where expanding an
+            # EMPTY array via "${issuer[@]}" under `set -u` aborts with
+            # 'unbound variable' (fixed only in bash 4.4) — which would kill
+            # exactly the individual-key path the array exists to support.
+            # The +-form expands to nothing when the array is empty and to
+            # the quoted elements when it isn't, on every bash.
+            #
+            # Submission output is CAPTURED so its id survives for the
+            # failure path: on an Invalid verdict the per-file reasons live
+            # only in the notary log, fetched by id with the same .p8 —
+            # without this, a rejected release says 'status: Invalid' and
+            # nothing else, and the credential needed to ask why is already
+            # deleted. (Belt+suspenders on the Accepted grep: early
+            # notarytool builds exited 0 on Invalid.)
+            set +e
+            sub_out=$(xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+              --key "$RUNNER_TEMP/asc.p8" --key-id "$ASC_KEY_ID" \
+              ${issuer[@]+"${issuer[@]}"} --wait --timeout 20m 2>&1)
+            sub_rc=$?
+            set -e
+            echo "$sub_out"
+            sub_id=$(echo "$sub_out" | sed -n 's/^[[:space:]]*id: \([0-9a-f-]*\).*/\1/p' | head -1)
+            if [ "$sub_rc" -ne 0 ] || ! echo "$sub_out" | grep -q "status: Accepted"; then
+              if [ -n "$sub_id" ]; then
+                echo "::group::notarytool log $sub_id"
+                xcrun notarytool log "$sub_id" \
+                  --key "$RUNNER_TEMP/asc.p8" --key-id "$ASC_KEY_ID" \
+                  ${issuer[@]+"${issuer[@]}"} || true
+                echo "::endgroup::"
+              fi
+              rm -f "$RUNNER_TEMP/asc.p8"
+              echo "::error::notarization did not complete (submit rc=$sub_rc) — per-file reasons in the notary log above"
+              exit 1
+            fi
+            rm -f "$RUNNER_TEMP/asc.p8"
+            # Staple can transiently fail right after Accepted — the ticket's
+            # CDN propagation lags by seconds-to-minutes (the classic Error
+            # 65) — and one transient miss must not discard a completed
+            # 20-minute round-trip.
+            stapled=0
+            for attempt in 1 2 3; do
+              if xcrun stapler staple "$APP"; then stapled=1; break; fi
+              echo "stapler attempt $attempt failed — waiting for ticket propagation"
+              sleep $(( attempt * 20 ))
+            done
+            [ "$stapled" = "1" ] || { echo "::error::stapler failed after 3 attempts (ticket never became fetchable)"; exit 1; }
+            xcrun stapler validate "$APP"
+            # The verdict that actually matters to a user's double-click:
+            # Gatekeeper's own assessment of the signed, notarized, stapled
+            # bundle. Expected: "accepted ... source=Notarized Developer ID".
+            spctl --assess --type execute --verbose=2 "$APP"
+          else
+            echo "non-tag build: signed only (notarize+staple is tag/dispatch-gated)"
+          fi
+
+          # The bundler cut its zip BEFORE signing changed the bytes — recut
+          # it from the staged tree, same tool and shape as build-bun.mjs's
+          # unix branch (Info-ZIP, -y keeps symlinks, modes preserved).
+          B=$(basename "$D")
+          rm -f "dist/$B.zip"
+          (cd dist/stage && zip -qry "../$B.zip" "$B")
+          # Same ship gate as the bundler's own archive step: the recut IS
+          # the zip users download, and an archive that isn't a real zip
+          # must fail here, not ship (scripts/build-bun.mjs grew this check
+          # after a tar-in-zip's-clothing shipped once).
+          magic=$(head -c 4 "dist/$B.zip" | xxd -p)
+          [ "$magic" = "504b0304" ] || { echo "::error::recut dist/$B.zip is not a zip (magic: $magic)"; exit 1; }
+          echo "re-zipped dist/$B.zip with the signed bundle"
+
+      # Belt to the sign step's suspenders: if that script exits before its
+      # own keychain removal (a codesign or verify failure), the keychain
+      # must still not survive into the smoke steps / the rest of the job.
+      # Idempotent — a keychain already deleted above is simply not there.
+      - name: Remove signing keychain (always)
+        if: always() && startsWith(matrix.key, 'darwin')
+        run: |
+          security list-keychains -d user -s login.keychain 2>/dev/null || true
+          for kc in "$RUNNER_TEMP/signing.keychain-db" "$RUNNER_TEMP/pkgsign.keychain-db"; do
+            if [ -f "$kc" ]; then
+              security delete-keychain "$kc" && echo "$(basename "$kc") removed (cleanup step)"
+            fi
+          done
+          echo "keychain cleanup done"
+
+      # ── macOS installer (.pkg) ──────────────────────────────────────────
+      # Built AFTER sign/notarize/staple so the payload is the final .app
+      # (the staple ticket lives inside the bundle and rides along). Payload
+      # = mStream.app -> /Applications, wrapped in a distribution archive
+      # that gates OS (11.0, matching LSMinimumSystemVersion) and CPU
+      # (arm64-only pkg must refuse an Intel Mac; the x64 pkg allows arm64
+      # for Rosetta). Signing a pkg needs a "Developer ID INSTALLER"
+      # identity — a different certificate type from the Application cert
+      # the app step uses — via the optional MACOS_INSTALLER_CERT_P12/
+      # _PASSWORD secrets. Absent, the pkg ships UNSIGNED next to the
+      # (possibly notarized) zips with a loud warning: a missing pkg cert
+      # must never block a release. Present on a notarizing build, the pkg
+      # itself is notarized and stapled too (Gatekeeper assesses the PKG's
+      # signature, not just its payload's).
+      - name: Build macOS installer (.pkg)
+        if: startsWith(matrix.key, 'darwin')
+        env:
+          INSTALLER_CERT_P12: ${{ secrets.MACOS_INSTALLER_CERT_P12 }}
+          INSTALLER_CERT_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERT_PASSWORD }}
+          ASC_API_KEY: ${{ secrets.ASC_API_KEY }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          FULL_NOTARIZE: ${{ github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.notarize) }}
+          KEY: ${{ matrix.key }}
+        run: |
+          set -euo pipefail
+          VER=$(node -pe "require('./package.json').version")
+          D=$(ls -d dist/stage/mStream-*-"$KEY")
+          APP="$D/mStream.app"
+          [ -d "$APP" ] || { echo "::error::no .app staged at $APP"; exit 1; }
+          mkdir -p dist/installer pkgwork
+          PKG="dist/installer/mStream-$VER-$KEY.pkg"
+
+          # BundleIsRelocatable=false, explicitly: with the default (true),
+          # macOS installer lets Spotlight pick the install target - and when
+          # it has indexed the STAGED mStream.app sitting in this very
+          # workspace, "Upgrading at base path /" relocates the payload onto
+          # the stage copy instead of /Applications (bit the v6.21.1 tag build
+          # on the arm64 leg; a Spotlight-indexing race, so earlier runs
+          # passed). Users keep a fixed /Applications install path too.
+          # Needs the --root + --component-plist form (--component accepts no
+          # plist); ditto preserves the signed bundle bit-exactly.
+          rm -rf pkgwork/root && mkdir -p pkgwork/root
+          ditto "$APP" pkgwork/root/mStream.app
+          pkgbuild --analyze --root pkgwork/root pkgwork/component.plist
+          /usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" pkgwork/component.plist
+          pkgbuild --root pkgwork/root --component-plist pkgwork/component.plist --install-location /Applications --identifier io.mstream.server --version "$VER" pkgwork/component.pkg
+          case "$KEY" in
+            darwin-arm64) ARCHS="arm64" ;;
+            *)            ARCHS="x86_64,arm64" ;;   # x64 payload runs under Rosetta
+          esac
+          cat > pkgwork/distribution.xml <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <installer-gui-script minSpecVersion="2">
+            <title>mStream</title>
+            <options customize="never" require-scripts="false" hostArchitectures="$ARCHS"/>
+            <volume-check><allowed-os-versions><os-version min="11.0"/></allowed-os-versions></volume-check>
+            <domains enable_localSystem="true"/>
+            <choices-outline><line choice="default"><line choice="io.mstream.server"/></line></choices-outline>
+            <choice id="default"/>
+            <choice id="io.mstream.server" visible="false"><pkg-ref id="io.mstream.server"/></choice>
+            <pkg-ref id="io.mstream.server" version="$VER" onConclusion="none">component.pkg</pkg-ref>
+          </installer-gui-script>
+          EOF
+          productbuild --distribution pkgwork/distribution.xml \
+            --package-path pkgwork "pkgwork/unsigned.pkg"
+
+          if [ -n "${INSTALLER_CERT_P12}" ]; then
+            [ -n "${INSTALLER_CERT_PASSWORD}" ] || { echo "::error::MACOS_INSTALLER_CERT_P12 is set but MACOS_INSTALLER_CERT_PASSWORD is not"; exit 1; }
+            keychain="$RUNNER_TEMP/pkgsign.keychain-db"
+            keychain_password="$(uuidgen)"
+            security create-keychain -p "$keychain_password" "$keychain"
+            security set-keychain-settings -lut 1200 "$keychain"
+            security unlock-keychain -p "$keychain_password" "$keychain"
+            echo "$INSTALLER_CERT_P12" | base64 --decode > "$RUNNER_TEMP/pkgcert.p12"
+            security import "$RUNNER_TEMP/pkgcert.p12" -k "$keychain" \
+              -P "$INSTALLER_CERT_PASSWORD" -T /usr/bin/productsign
+            rm "$RUNNER_TEMP/pkgcert.p12"
+            security set-key-partition-list -S "apple-tool:,apple:" \
+              -s -k "$keychain_password" "$keychain" >/dev/null
+            security list-keychains -d user -s "$keychain" login.keychain
+            identity=$(security find-identity -v "$keychain" \
+              | sed -n 's/.*"\(Developer ID Installer[^"]*\)".*/\1/p' | head -1)
+            [ -n "$identity" ] || { echo "::error::no Developer ID Installer identity in MACOS_INSTALLER_CERT_P12 (an Application cert cannot sign a pkg)"; exit 1; }
+            productsign --sign "$identity" --keychain "$keychain" "pkgwork/unsigned.pkg" "$PKG"
+            # Key's job is done — same hygiene as the app step.
+            security list-keychains -d user -s login.keychain
+            security delete-keychain "$keychain"
+            pkgutil --check-signature "$PKG"
+
+            if [ "$FULL_NOTARIZE" = "true" ]; then
+              echo "$ASC_API_KEY" > "$RUNNER_TEMP/asc-pkg.p8"
+              ASC_KEY_ID=$(printf '%s' "$ASC_KEY_ID" | tr -d '[:space:]"')
+              ASC_ISSUER_ID=$(printf '%s' "$ASC_ISSUER_ID" | tr -d '[:space:]"')
+              issuer=()
+              if [ -n "${ASC_ISSUER_ID}" ]; then issuer=(--issuer "$ASC_ISSUER_ID"); fi
+              set +e
+              sub_out=$(xcrun notarytool submit "$PKG" \
+                --key "$RUNNER_TEMP/asc-pkg.p8" --key-id "$ASC_KEY_ID" \
+                ${issuer[@]+"${issuer[@]}"} --wait --timeout 20m 2>&1)
+              sub_rc=$?
+              set -e
+              echo "$sub_out"
+              sub_id=$(echo "$sub_out" | sed -n 's/^[[:space:]]*id: \([0-9a-f-]*\).*/\1/p' | head -1)
+              if [ "$sub_rc" -ne 0 ] || ! echo "$sub_out" | grep -q "status: Accepted"; then
+                if [ -n "$sub_id" ]; then
+                  echo "::group::notarytool log $sub_id"
+                  xcrun notarytool log "$sub_id" \
+                    --key "$RUNNER_TEMP/asc-pkg.p8" --key-id "$ASC_KEY_ID" \
+                    ${issuer[@]+"${issuer[@]}"} || true
+                  echo "::endgroup::"
+                fi
+                rm -f "$RUNNER_TEMP/asc-pkg.p8"
+                echo "::error::pkg notarization did not complete (rc=$sub_rc)"
+                exit 1
+              fi
+              rm -f "$RUNNER_TEMP/asc-pkg.p8"
+              stapled=0
+              for attempt in 1 2 3; do
+                if xcrun stapler staple "$PKG"; then stapled=1; break; fi
+                echo "stapler attempt $attempt failed — waiting for ticket propagation"
+                sleep $(( attempt * 20 ))
+              done
+              [ "$stapled" = "1" ] || { echo "::error::pkg stapler failed after 3 attempts"; exit 1; }
+              spctl --assess --type install --verbose=2 "$PKG"
+            fi
+          else
+            mv "pkgwork/unsigned.pkg" "$PKG"
+            if [ "$FULL_NOTARIZE" = "true" ]; then
+              echo "::warning::shipping an UNSIGNED pkg on a notarizing build — add MACOS_INSTALLER_CERT_P12/_PASSWORD (a Developer ID INSTALLER identity, distinct from the Application cert) to sign+notarize the installer itself; until then users need right-click Open / Open Anyway for the pkg (the zips are unaffected)"
+            else
+              echo "installer cert absent — unsigned pkg (PR/dev build)"
+            fi
+          fi
+
+          # Structure asserts on every leg: the distribution must carry the
+          # right version/identifier, and the payload must be our app.
+          rm -rf pkgwork/expanded
+          pkgutil --expand "$PKG" pkgwork/expanded
+          grep -q 'io.mstream.server' pkgwork/expanded/Distribution || { echo "::error::pkg Distribution lacks the identifier"; exit 1; }
+          grep -q "version=\"$VER\"" pkgwork/expanded/Distribution || { echo "::error::pkg Distribution version is not $VER"; exit 1; }
+          grep -q "hostArchitectures=\"$ARCHS\"" pkgwork/expanded/Distribution || { echo "::error::pkg hostArchitectures is not $ARCHS"; exit 1; }
+          ls -l "$PKG"
+
+      # The real proof, native leg only: install the pkg onto THIS runner
+      # with Apple's own installer, then run what it installed — including
+      # the webapp symlink surviving the payload round-trip, the exact
+      # symlink codesign forced into the bundle layout.
+      - name: Install-smoke the macOS pkg (darwin-arm64)
+        if: matrix.key == 'darwin-arm64'
+        run: |
+          set -euo pipefail
+          VER=$(node -pe "require('./package.json').version")
+          PKG="dist/installer/mStream-$VER-darwin-arm64.pkg"
+          sudo installer -pkg "$PKG" -target /
+          test -d /Applications/mStream.app || { echo "::error::pkg install did not produce /Applications/mStream.app"; exit 1; }
+          test -e /Applications/mStream.app/Contents/MacOS/webapp/index.html || { echo "::error::webapp symlink broken after pkg install"; exit 1; }
+          OUT=$(/Applications/mStream.app/Contents/MacOS/mstream-server -V)
+          echo "installed server -V -> $OUT"
+          echo "$OUT" | grep -qF "$VER" || { echo "::error::installed server reports the wrong version"; exit 1; }
+          printf '{"port":3557,"address":"127.0.0.1"}\n' > "$HOME/pkg-smoke.json"
+          /Applications/mStream.app/Contents/MacOS/mstream-server -j "$HOME/pkg-smoke.json" > "$HOME/pkg-boot.log" 2>&1 &
+          SRV=$!
+          UP=0
+          for i in $(seq 1 30); do
+            sleep 1
+            if curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:3557/api/v1/ping"; then UP=1; break; fi
+          done
+          kill "$SRV" 2>/dev/null || true
+          wait "$SRV" 2>/dev/null || true
+          [ "$UP" = "1" ] || { echo "::error::pkg-installed server never served"; tail -30 "$HOME/pkg-boot.log"; exit 1; }
+          echo "pkg-installed server served 200 on :3557"
+          sudo rm -rf /Applications/mStream.app
+          sudo pkgutil --forget io.mstream.server
+          echo "PKG INSTALL SMOKE OK"
+
+      # darwin-x64 is the one shipped artifact whose binaries never execute
+      # in CI (smoke: false — it's cross-compiled), which after signing means
+      # a hardened-runtime + entitlements problem specific to x64 would ship
+      # notarized and green. The arm64 runner has Rosetta 2: one worker
+      # self-dispatch boots the x64 Bun binary far enough that JavaScriptCore
+      # must JIT — the class of failure `codesign --verify` cannot see. Runs
+      # on unsigned builds too (no secrets): still proves the x64 Bun blob
+      # executes, at ~2s cost. (iroh-selftest would be wrong here — darwin-x64
+      # ships without an iroh .node, an upstream prebuilt gap.)
+      - name: Smoke x64 binary under Rosetta (darwin-x64)
+        if: matrix.key == 'darwin-x64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          D=$(ls -d dist/stage/mStream-*-darwin-x64)
+          BIN="$D/mStream.app/Contents/MacOS/mstream-server"
+          OUT=$("$BIN" --mstream-worker=scanner '{}' 2>&1) || true
+          echo "$OUT" | grep -q dbPath || { echo "::error::x64 mstream-server did not run under Rosetta (hardened-runtime/entitlement or Bun-blob problem)"; echo "$OUT" | head -20; exit 1; }
+          echo "OK: x64 binary executes under Rosetta (JIT path exercised)"
 
       - name: Smoke test (self-dispatch + boot + serve + scan)
         if: matrix.smoke
@@ -80,7 +1197,10 @@ jobs:
         run: |
           set +e   # exit codes are checked explicitly; don't abort on a probe miss
           D=$(ls -d dist/stage/mStream-*-${{ matrix.key }})
-          if [ -d "$D/mStream.app" ]; then BIN="$D/mStream.app/Contents/MacOS/mStream"; elif [ -f "$D/mStream.exe" ]; then BIN="$D/mStream.exe"; else BIN="$D/mStream-${{ matrix.key }}"; fi
+          # The SERVER is mstream-server in every bundle (1c rename); the
+          # user-facing mStream.exe / .app executable is the tray launcher,
+          # which has its own smoke step below.
+          if [ -d "$D/mStream.app" ]; then BIN="$D/mStream.app/Contents/MacOS/mstream-server"; elif [ -f "$D/mstream-server.exe" ]; then BIN="$D/mstream-server.exe"; else BIN="$D/mstream-server"; fi
           RUN=$(dirname "$BIN")
           echo "smoke binary: $BIN"
 
@@ -89,44 +1209,562 @@ jobs:
           echo "$OUT" | grep -q dbPath || { echo "FAIL: worker self-dispatch"; echo "$OUT"; exit 1; }
           echo "ok: worker self-dispatch"
 
-          # (2) default-path boot (no -j): config.setup must create
-          # appRoot/save/conf and NOT die with the fresh-bundle ENOENT — regression
-          # guard for the bare/default (double-click) invocation. Port-independent:
-          # only assert the default config was created without a config error (the
-          # next step proves it actually serves).
+          # (1b) the baked-in p2p-sidecar: staged from the pinned release
+          # assets (sha-verified at bundle time) and actually EXECUTABLE on
+          # this leg — --print-id is the sidecar's own identity self-test.
+          # Bundle installs' discovery P2P depends on exactly this file (the
+          # resolver's appRoot rung); on darwin this also proves the SIGNED
+          # copy still runs (the sign walk covers it as a generic Mach-O).
+          SC=$(ls "$RUN"/bin/p2p-sidecar/p2p-sidecar-* 2>/dev/null | head -1)
+          [ -n "$SC" ] || { echo "FAIL: no p2p-sidecar staged in the bundle (bin/p2p-sidecar empty)"; exit 1; }
+          SCOUT=$("$SC" --print-id --data-dir "$RUN/sc-selftest" 2>/dev/null)
+          echo "$SCOUT" | grep -Eq '^[0-9a-f]{64}$' || { echo "FAIL: staged p2p-sidecar --print-id produced no/invalid output"; echo "$SCOUT"; exit 1; }
+          rm -rf "$RUN/sc-selftest"
+          echo "ok: baked-in p2p-sidecar executes ($(basename "$SC"))"
+
+          # (2) default-path boot (no -j) — the double-click invocation. A fresh
+          # standalone install is the DESKTOP profile: the config resolves to the
+          # per-OS user data home and is generated with Quick Connect on
+          # (src/util/boot-config.js). Port-independent: only assert the config
+          # landed where it should without a setup error (the next step proves
+          # the binary actually serves).
+          case "${{ matrix.key }}" in
+            win-*)    DATAHOME="$LOCALAPPDATA/mStream" ;;
+            darwin-*) DATAHOME="$HOME/Library/Application Support/mStream" ;;
+            *)        DATAHOME="${XDG_DATA_HOME:-$HOME/.local/share}/mstream" ;;
+          esac
+          rm -rf "$DATAHOME"
           "$BIN" > "$RUN/default-boot.log" 2>&1 &
           DEF=$!
           sleep 7
           kill "$DEF" 2>/dev/null
+          wait "$DEF" 2>/dev/null   # reap BEFORE the rm below: on Windows a dying process still holds its db files open for a beat, and rm -rf answers "Device or resource busy"
           if grep -qiE "Failed to validate config|ENOENT" "$RUN/default-boot.log"; then echo "FAIL: default (no -j) boot — config setup error"; cat "$RUN/default-boot.log"; exit 1; fi
-          test -f "$RUN/save/conf/default.json" || { echo "FAIL: default config not created at save/conf/default.json"; tail -25 "$RUN/default-boot.log"; exit 1; }
+          CFG="$DATAHOME/conf/default.json"
+          test -f "$CFG" || { echo "FAIL: default config not created at $CFG"; tail -25 "$RUN/default-boot.log"; exit 1; }
+          grep -q '"shareCodePublic": true' "$CFG" || { echo "FAIL: desktop-profile config lacks the Quick Connect defaults"; cat "$CFG"; exit 1; }
+          test -f "$RUN/save/conf/default.json" && { echo "FAIL: desktop profile also wrote a next-to-binary config"; exit 1; }
+          rm -rf "$DATAHOME"
+          echo "ok: default boot used the user data home (Quick Connect on)"
+
+          # (2b) --portable keeps the old next-to-binary layout and still guards
+          # the fresh-bundle save/conf ENOENT regression; the Quick Connect
+          # opt-out flag must be accepted alongside it (it's a no-op here — only
+          # the desktop profile generates a Quick Connect config).
+          "$BIN" --portable --quick-connect-off-by-default > "$RUN/portable-boot.log" 2>&1 &
+          DEF=$!
+          sleep 7
+          kill "$DEF" 2>/dev/null
+          wait "$DEF" 2>/dev/null   # same reap-before-rm rule as above (save/ holds the db)
+          if grep -qiE "Failed to validate config|ENOENT|unknown option" "$RUN/portable-boot.log"; then echo "FAIL: --portable boot — config setup or option error"; cat "$RUN/portable-boot.log"; exit 1; fi
+          test -f "$RUN/save/conf/default.json" || { echo "FAIL: --portable did not create save/conf/default.json"; tail -25 "$RUN/portable-boot.log"; exit 1; }
           rm -rf "$RUN/save"
-          echo "ok: default boot created save/conf (no ENOENT)"
+          echo "ok: --portable boot stayed next to the binary (no ENOENT)"
 
           # (3) boot + serve + scan. The repo's test fixtures are generated by the
-          # test suite (not present in this build job), so make a tiny library here:
-          # a 1s tagged mp3 via the runner's ffmpeg, or an empty dir if it's absent.
+          # test suite (not present in this build job), so make a tiny library
+          # here: a 1s WAV via the runner's python (stdlib wave — every runner
+          # image ships python; wav is in the default supportedAudioFiles).
+          # This file is LOAD-BEARING: the end-of-smoke asserts require the
+          # RUST scanner to have processed >= 1 file, because a 0-file walk
+          # passes the old "Scan complete" grep identically on the JS fallback
+          # — which is exactly the regression class the scan assert exists to
+          # catch (this used to be `ffmpeg ... || echo unavailable`, and since
+          # no runner has ffmpeg in PATH, every leg silently scanned an empty
+          # library). No fixture -> fail the smoke, never degrade.
           WS=$(printf '%s' "$GITHUB_WORKSPACE" | tr '\134' '/')   # backslash -> slash for valid JSON on Windows
           MUSIC="$WS/smoke-music"
           mkdir -p "$MUSIC"
-          ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=1" -metadata title=Smoke -metadata artist=CI "$MUSIC/smoke.mp3" -y || echo "ffmpeg unavailable; scanning an empty library"
-          printf '{"port":3399,"folders":{"music":{"root":"%s"}}}\n' "$MUSIC" > "$RUN/smoke-config.json"
+          # Probe each candidate with an actual import: on Windows, PATH can
+          # resolve python3 to the WindowsApps STORE STUB, which prints
+          # "Python was not found" and writes nothing (bit the local dry run
+          # of this very step). `py` covers Windows boxes with only the
+          # launcher registered.
+          PY=""
+          for c in python3 python py; do
+            if command -v "$c" >/dev/null 2>&1 && "$c" -c "import wave" >/dev/null 2>&1; then PY="$c"; break; fi
+          done
+          [ -n "$PY" ] || { echo "FAIL: no working python on this runner — cannot generate the scan fixture"; exit 1; }
+          "$PY" - "$MUSIC/smoke.wav" <<'PYEOF'
+          import math, struct, sys, wave
+          w = wave.open(sys.argv[1], 'wb')
+          w.setnchannels(1); w.setsampwidth(2); w.setframerate(8000)
+          w.writeframes(b''.join(struct.pack('<h', int(12000 * math.sin(2 * math.pi * 440 * t / 8000))) for t in range(8000)))
+          w.close()
+          PYEOF
+          test -s "$MUSIC/smoke.wav" || { echo "FAIL: fixture wav was not written (python: $PY)"; exit 1; }
+          # address is pinned to 127.0.0.1 ON PURPOSE: step (5) reboots via
+          # POST /config/address {"address":"127.0.0.1"}, and that must be a
+          # SAME-bind reboot (keep-socket path). Unset, the server binds [::]
+          # and the same POST becomes a bind CHANGE — which recycles the
+          # listener by design (#833), leaving a real ~40 ms refused window
+          # that the second concurrent trigger sometimes lands in (000 on
+          # darwin-arm64, run 32170210445). That was the "listener down for a
+          # beat" #832 retried around, not the pre-#833 socket drop.
+          printf '{"port":3399,"address":"127.0.0.1","folders":{"music":{"root":"%s"}}}\n' "$MUSIC" > "$RUN/smoke-config.json"
           "$BIN" -j "$RUN/smoke-config.json" > "$RUN/boot.log" 2>&1 &
           SRV=$!
           UP=0
           for i in $(seq 1 60); do
             sleep 1
-            if curl -sf -o /dev/null "http://127.0.0.1:3399/api/v1/ping"; then UP=1; break; fi
+            if curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:3399/api/v1/ping"; then UP=1; break; fi
           done
           sleep 3   # let the boot scan finish
-          CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:3399/api/v1/ping" 2>/dev/null)
+          CODE=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:3399/api/v1/ping" 2>/dev/null)
           echo "HTTP up=$UP after ~${i}s ; /api/v1/ping -> ${CODE:-000}"
           grep -iE "scan started|scan complete" "$RUN/boot.log"
+
+          # (4) soft reboot must survive under the BUN runtime. Node's test
+          # suite can't catch this class: reboot()'s delayed sweep once hit
+          # the NEW server, and Bun's closeAllConnections (unlike Node's)
+          # stops the listener outright — the binary kept running with no
+          # port. Trigger a reboot-requiring config change, require the
+          # server back up, then require it STILL up after the ~1s sweep.
+          # Fail closed: assert the TRIGGER worked (a 400 from a renamed key or
+          # an auth wall would otherwise leave the server up and pass this step
+          # having rebooted nothing), and require a SECOND "Access mStream
+          # locally" line as positive proof a re-serve actually happened.
+          #
+          # The trigger POSTs below are plain, single-shot curls ON PURPOSE:
+          # a connection-level failure (curl code 000) is a real finding, not
+          # noise. Once (#832) they retried 000s, because a trigger racing a
+          # reboot window got connection-refused. Since #833 a SAME-bind
+          # reboot never gives the socket up — a request landing in the window
+          # gets an honest 503, never a dead connection — so a 000 here would
+          # mean that guarantee regressed, which is precisely what steps
+          # (4)/(5) exist to catch. A retry would re-fire after the dust
+          # settled and turn that regression back into a green run. Both
+          # triggers are therefore same-bind by construction: trust-proxy
+          # doesn't touch the bind, and the smoke config above pins address to
+          # the very value step (5) posts. (A bind-CHANGING save recycles the
+          # listener on purpose and does have a refused window; that path is
+          # not what these steps assert.)
+
+          REBOOT_OK=0
+          BINDCHANGE_OK=0
+          if [ "$CODE" = "200" ]; then
+            BOOTS_BEFORE=$(grep -c "Access mStream locally" "$RUN/boot.log")
+            TRIG=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST -H 'Content-Type: application/json' -d '{"trustProxy":true}' "http://127.0.0.1:3399/api/v1/admin/config/trust-proxy")
+            if [ "$TRIG" != "200" ]; then
+              echo "FAIL: reboot trigger POST returned ${TRIG:-000}, not 200 — the smoke would have passed without rebooting anything"
+              cat "$RUN/boot.log"; kill "$SRV" 2>/dev/null; exit 1
+            fi
+            for i in $(seq 1 20); do
+              sleep 1
+              if curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:3399/api/v1/ping"; then REBOOT_OK=1; break; fi
+            done
+            sleep 3   # outlive the close-grace sweep, which used to kill the new listener
+            curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:3399/api/v1/ping" || REBOOT_OK=0
+            BOOTS_AFTER=$(grep -c "Access mStream locally" "$RUN/boot.log")
+            if [ "$BOOTS_AFTER" -le "$BOOTS_BEFORE" ]; then
+              echo "FAIL: no re-serve observed (boot lines ${BOOTS_BEFORE} -> ${BOOTS_AFTER}) — the reboot never happened"
+              REBOOT_OK=0
+            fi
+            # A same-bind reboot must KEEP the listening socket, never
+            # close()+listen() it. On Windows a live child (here: the ffmpeg
+            # download's PowerShell extractor, alive at this point on a fast
+            # runner) holds an inherited handle to the old listen socket under
+            # Bun <= 1.3.14 (oven-sh/bun#36936), so a relisten sits in
+            # EADDRINUSE until that child exits — this exact step used to die
+            # of it intermittently. Positive proof, not just survival.
+            if ! grep -q "keeping the listening socket" "$RUN/boot.log"; then
+              echo "FAIL: the same-bind reboot did not keep the listening socket (see boot.log)"
+              REBOOT_OK=0
+            fi
+            if grep -q "retrying listen" "$RUN/boot.log"; then
+              echo "FAIL: the same-bind reboot relistened (retrying listen seen) — the socket should never have been released"
+              REBOOT_OK=0
+            fi
+
+            # (5) overlapping reboots must not kill the process. Two rapid admin
+            # saves used to start two serveIt()s racing for the port; the loser
+            # exhausted the relisten budget and process.exit()ed the healthy
+            # winner. /config/address is the right trigger: unlike trust-proxy
+            # and most others it has NO unchanged-value short-circuit, so both
+            # POSTs really do reboot (with a no-op second POST this test passes
+            # against the bug). The posted address EQUALS the smoke config's
+            # bind, so this is the keep-socket path: the reboot log line must
+            # read "bind unchanged", not "recycling the listener".
+            # Capture each POST's status. Previously these were `curl -s` with
+            # no -f and their exit codes discarded by `wait`, so if the endpoint
+            # ever 400s or moves (a renamed Joi key, a moved route) NO reboot
+            # fired, the untouched server answered every probe, and the step
+            # printed "survived two overlapping reboots" — the rebootInFlight
+            # coalescing could have been deleted outright and this stayed green.
+            # The pair stays CONCURRENT (the overlap is the point). Each arm
+            # is a single shot: the second POST may land inside the first
+            # reboot's window and get a 503 from the kept socket — accepted
+            # below as the legitimate interleaving it is — but it must never
+            # get a dead connection (000); that would be the listener being
+            # dropped again, and this step is where that shows.
+            CONCURRENT_BOOTS_BEFORE=$(grep -c "Access mStream locally" "$RUN/boot.log")
+            curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST -H 'Content-Type: application/json' -d '{"address":"127.0.0.1"}' "http://127.0.0.1:3399/api/v1/admin/config/address" > "$RUN/post1.code" &
+            C1=$!
+            curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST -H 'Content-Type: application/json' -d '{"address":"127.0.0.1"}' "http://127.0.0.1:3399/api/v1/admin/config/address" > "$RUN/post2.code" &
+            C2=$!
+            wait $C1 $C2
+            CONCURRENT_OK=0
+            for i in $(seq 1 25); do
+              sleep 1
+              if curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:3399/api/v1/ping"; then CONCURRENT_OK=1; break; fi
+            done
+            # Must outlive the window in which a losing sibling used to
+            # process.exit() (its 5 s relisten budget — since replaced by an
+            # open-ended, backed-off retry, but a shorter wait would still pass
+            # against a regression of the coalescing itself). Note this step
+            # CHANGES the bind (address), so it exercises the recycle path: a
+            # relisten here — and, on Windows/Bun <= 1.3.14, a few EADDRINUSE
+            # retries while a child still holds the old socket — is expected.
+            sleep 10
+            curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:3399/api/v1/ping" || CONCURRENT_OK=0
+            kill -0 "$SRV" 2>/dev/null || CONCURRENT_OK=0
+            # Fail closed on the TRIGGERS, not just on survival: the requests
+            # must have been accepted, and the server must actually have come
+            # back up again afterwards. Without these, "nothing happened" is
+            # indistinguishable from "handled two overlapping reboots". At
+            # least one POST must be a 200 (it triggered a reboot); the other
+            # is a 200 (sequential or coalesced) OR a 503 — the reboot window's
+            # own answer, meaning it arrived while the first reboot was already
+            # tearing down (the listener stays bound and says "restarting"
+            # instead of refusing the connection). Anything else — a 400 from a
+            # renamed key, a 404 from a moved route, 000 — is a real failure.
+            POST1=$(cat "$RUN/post1.code" 2>/dev/null)
+            POST2=$(cat "$RUN/post2.code" 2>/dev/null)
+            CONCURRENT_BOOTS_AFTER=$(grep -c "Access mStream locally" "$RUN/boot.log")
+            case "$POST1/$POST2" in
+              200/200|200/503|503/200) ;;
+              *)
+                echo "FAIL: reboot triggers were not accepted (HTTP ${POST1:-000} / ${POST2:-000}) — this step would otherwise pass having rebooted NOTHING"
+                CONCURRENT_OK=0 ;;
+            esac
+            if [ "$CONCURRENT_BOOTS_AFTER" -le "$CONCURRENT_BOOTS_BEFORE" ]; then
+              echo "FAIL: no additional boot after the overlapping reboots (before=$CONCURRENT_BOOTS_BEFORE after=$CONCURRENT_BOOTS_AFTER) — the server never actually restarted"
+              CONCURRENT_OK=0
+            fi
+            # Positive evidence that the SECOND request hit the coalescing guard
+            # rather than being silently lost. Advisory: the interleaving is
+            # timing-dependent, so a miss is reported, not fatal.
+            grep -q "Reboot already in progress" "$RUN/boot.log" \
+              && echo "ok: the duplicate reboot request was coalesced" \
+              || echo "note: no coalescing line — the two reboots did not overlap on this runner (HTTP $POST1 / $POST2)"
+            # The 000-is-a-regression rule above only holds if this reboot
+            # kept the socket. Enforce it: if the address save recycled the
+            # listener, the smoke config's address and the posted one have
+            # drifted apart, and a 000 here would be the by-design refused
+            # window, not a finding — fail loudly instead of guessing.
+            # (Step (6) below recycles ON PURPOSE — this grep runs before it.)
+            if grep -q "recycling the listener" "$RUN/boot.log"; then
+              echo "FAIL: the step-(5) address save recycled the listener — the posted address must equal the smoke config's bind (same-bind = keep-socket) for the 000 rule to mean anything"
+              CONCURRENT_OK=0
+            fi
+
+            # (6) a bind-CHANGING save must recycle the listener and come back
+            # on the new bind. Steps (4)/(5) are same-bind by construction, so
+            # since #837 the recycle path — close the old listener, patient
+            # relisten on the new bind (#833's other half, the one with the
+            # by-design refused window) — was smoked NOWHERE on the Bun
+            # runtime. Change the port (3399 -> 3398): deterministic on every
+            # runner (no IPv6 assumptions, a fresh port can't sit in
+            # EADDRINUSE behind an inherited handle). The POST itself must be
+            # a 200 — the server is quiescent here, steps (4)/(5) proved it up
+            # — and the new bind must answer within the patience window.
+            BINDCHANGE_OK=0
+            BIND_BOOTS_BEFORE=$(grep -c "Access mStream locally" "$RUN/boot.log")
+            TRIG6=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST -H 'Content-Type: application/json' -d '{"port":3398}' "http://127.0.0.1:3399/api/v1/admin/config/port")
+            if [ "$TRIG6" != "200" ]; then
+              echo "FAIL: bind-change trigger POST returned ${TRIG6:-000}, not 200 — the recycle path was never exercised"
+            else
+              for i in $(seq 1 25); do
+                sleep 1
+                if curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:3398/api/v1/ping"; then BINDCHANGE_OK=1; break; fi
+              done
+              [ "$BINDCHANGE_OK" = "1" ] || echo "FAIL: server never answered on the new bind (:3398) after the port change"
+              # Positive proof it took the RECYCLE path, not a keep + confusion:
+              if ! grep -q "recycling the listener" "$RUN/boot.log"; then
+                echo "FAIL: no 'recycling the listener' line — the bind change did not recycle (or logging regressed)"
+                BINDCHANGE_OK=0
+              fi
+              BIND_BOOTS_AFTER=$(grep -c "Access mStream locally" "$RUN/boot.log")
+              if [ "$BIND_BOOTS_AFTER" -le "$BIND_BOOTS_BEFORE" ]; then
+                echo "FAIL: no re-serve after the bind change (boot lines $BIND_BOOTS_BEFORE -> $BIND_BOOTS_AFTER)"
+                BINDCHANGE_OK=0
+              fi
+              # The OLD bind must be gone. Refused or timed out both pass —
+              # under Bun <= 1.3.14 on Windows an inherited handle can leave
+              # the old socket accepting-but-unanswered (oven-sh/bun#36936);
+              # only a live HTTP 200 means two servers, which is the failure.
+              OLD6=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:3399/api/v1/ping" 2>/dev/null)
+              if [ "$OLD6" = "200" ]; then
+                echo "FAIL: the old bind (:3399) still serves after the port change — the listener was never recycled"
+                BINDCHANGE_OK=0
+              fi
+            fi
+          fi
           kill "$SRV" 2>/dev/null
+          wait "$SRV" 2>/dev/null   # reap + let boot.log's final lines land before the asserts read it
 
           if [ "$CODE" != "200" ]; then echo "FAIL: server did not serve 200"; echo "--- boot.log ---"; cat "$RUN/boot.log"; exit 1; fi
-          grep -q "Scan complete" "$RUN/boot.log" || { echo "FAIL: scan did not complete"; echo "--- boot.log ---"; cat "$RUN/boot.log"; exit 1; }
-          echo "SMOKE OK: $BIN booted, served 200, and completed a scan"
+          # The scan asserts prove the RUST scanner ran on real audio — each
+          # rules out a distinct silent degrade that "Scan complete" alone
+          # passed on for months (every leg scanned an empty library, and the
+          # committed rust-parser could have been broken on any OS with the JS
+          # fallback quietly covering for it):
+          #   - "(Rust)" line: the engine that ran is the one we ship;
+          #   - fallback/DOA/capability markers: it did not limp there;
+          #   - ">= 1 files processed": it parsed the fixture, not a 0-file walk.
+          grep -qF "File scan started (Rust)" "$RUN/boot.log" || { echo "FAIL: no 'File scan started (Rust)' — the shipped Rust scanner never ran"; echo "--- boot.log ---"; cat "$RUN/boot.log"; exit 1; }
+          if grep -qE "JS fallback|died on arrival|refusing it to protect track identities|retrying with the portable static-musl" "$RUN/boot.log"; then
+            echo "FAIL: the scan degraded (fallback/DOA/capability-refusal marker in boot.log) — the Rust scanner is broken in this bundle"
+            echo "--- boot.log ---"; cat "$RUN/boot.log"; exit 1
+          fi
+          grep -qE "Scan complete: [1-9][0-9]* files processed" "$RUN/boot.log" || { echo "FAIL: scan processed 0 files — the fixture wav was not parsed"; echo "--- boot.log ---"; cat "$RUN/boot.log"; exit 1; }
+          if [ "$REBOOT_OK" != "1" ]; then echo "FAIL: server did not survive a soft reboot (admin config change)"; echo "--- boot.log ---"; cat "$RUN/boot.log"; exit 1; fi
+          if [ "$CONCURRENT_OK" != "1" ]; then echo "FAIL: server did not survive two overlapping reboots"; echo "--- boot.log ---"; cat "$RUN/boot.log"; exit 1; fi
+          if [ "$BINDCHANGE_OK" != "1" ]; then echo "FAIL: the bind-change reboot did not recycle onto the new bind"; echo "--- boot.log ---"; cat "$RUN/boot.log"; exit 1; fi
+          echo "SMOKE OK: $BIN booted, served 200, Rust-scanned the fixture, and survived a soft reboot, overlapping reboots, and a bind change"
+
+      # The staged mstream-player (server audio) must EXECUTE on this leg —
+      # staged from its pinned release, sha-verified at bundle time, and
+      # --version is its one-shot self-test (no audio device needed, which
+      # the runner doesn't have; the engine opens audio only in serve
+      # mode). On darwin this runs the SIGNED copy. A separate step, not
+      # part of the big smoke above: that step's run block is a single
+      # GitHub expression, and it sits near the 21000-char expression cap.
+      - name: Smoke test staged mstream-player (--version)
+        if: matrix.smoke
+        shell: bash
+        run: |
+          D=$(ls -d dist/stage/mStream-*-${{ matrix.key }})
+          case "${{ matrix.key }}" in
+            darwin-*) B="$D/mStream.app/Contents/MacOS/bin" ;;
+            *)        B="$D/bin" ;;
+          esac
+          PL=$(ls "$B"/mstream-player/mstream-player-* 2>/dev/null | head -1)
+          [ -n "$PL" ] || { echo "::error::no mstream-player staged in the bundle (bin/mstream-player empty)"; exit 1; }
+          OUT=$("$PL" --version 2>/dev/null)
+          echo "$OUT" | grep -Eq '^mstream-player [0-9]+\.[0-9]+\.[0-9]+' || { echo "::error::staged mstream-player --version produced no/invalid output"; echo "$OUT"; exit 1; }
+          echo "OK: staged mstream-player executes ($(basename "$PL"))"
+
+      - name: Smoke test desktop launcher (spawn + supervise + no-orphan)
+        # The launcher IS the bundle's double-click face now. Prove the
+        # integrated shape on each native leg: launcher finds its
+        # mstream-server sibling, spawns it --supervised, the server serves,
+        # and a hard-killed launcher takes the server down through the
+        # supervision pipe (the no-orphan property the whole design rests on).
+        # Tray construction is environment-dependent on runners (no
+        # StatusNotifier host on linux, CI sessions vary) — the launcher
+        # degrades gracefully and logs it, so this smoke asserts lifecycle,
+        # not pixels. Linux runs under xvfb so gtk init succeeds at all.
+        if: matrix.smoke
+        shell: bash
+        run: |
+          set +e
+          D=$(ls -d dist/stage/mStream-*-${{ matrix.key }})
+          case "${{ matrix.key }}" in
+            win-*)    LAUNCHER="$D/mStream.exe" ;;
+            darwin-*) LAUNCHER="$D/mStream.app/Contents/MacOS/mStream" ;;
+            *)        LAUNCHER="$D/mstream-desktop" ;;
+          esac
+          [ -f "$LAUNCHER" ] || { echo "FAIL: launcher not staged at $LAUNCHER"; ls -la "$D"; exit 1; }
+
+          # Isolated per-user dirs so this can't touch the earlier boots' state.
+          LH="$RUNNER_TEMP/launcher-home"
+          rm -rf "$LH"; mkdir -p "$LH"
+          export MSTREAM_LAUNCHER_SKIP_AUTOSTART=1
+          case "${{ matrix.key }}" in
+            win-*)    export LOCALAPPDATA="$LH"; DH="$LH/mStream" ;;
+            darwin-*) export HOME="$LH"; DH="$LH/Library/Application Support/mStream" ;;
+            *)        export HOME="$LH"; DH="$LH/.local/share/mstream" ;;
+          esac
+
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo apt-get install -y -qq xvfb > /dev/null 2>&1
+            xvfb-run -a "$LAUNCHER" --tray --no-open > "$LH/launcher-run.log" 2>&1 &
+          else
+            "$LAUNCHER" --tray --no-open > "$LH/launcher-run.log" 2>&1 &
+          fi
+          WRAP=$!
+
+          UP=0
+          for i in $(seq 1 45); do
+            sleep 1
+            if curl -sf --max-time 3 -o /dev/null "http://127.0.0.1:3000/api/v1/ping"; then UP=1; break; fi
+          done
+          if [ "$UP" != "1" ]; then
+            echo "FAIL: launcher-managed server never served on 3000"
+            cat "$LH/launcher-run.log" 2>/dev/null; cat "$DH/logs/launcher.log" 2>/dev/null; cat "$DH/logs/server-console.log" 2>/dev/null | tail -20
+            exit 1
+          fi
+          echo "ok: launcher spawned mstream-server; serving on 3000 (~${i}s)"
+
+          # The health event must land in the launcher's own log (settle loop —
+          # the prober ticks at 500ms behind the port opening).
+          HUP=0
+          for i in $(seq 1 20); do
+            grep -q "server is up" "$DH/logs/launcher.log" 2>/dev/null && { HUP=1; break; }
+            sleep 0.5
+          done
+          [ "$HUP" = "1" ] || { echo "FAIL: no 'server is up' in launcher.log"; cat "$DH/logs/launcher.log"; exit 1; }
+          grep -i "tray unavailable" "$DH/logs/launcher.log"             && echo "note: tray degraded gracefully on this runner"             || echo "note: tray constructed"
+
+          # Hard-kill the launcher — never the server — and require the server
+          # to follow it down via supervision-stdin EOF.
+          # pgrep -x (exact process name), never -f: a cmdline pattern matches
+          # the xvfb-run wrapper — whose kill -9 does NOT propagate — and can
+          # even match the polling shell itself (that footgun killed the local
+          # Docker smoke's own script mid-run).
+          case "${{ matrix.key }}" in
+            win-*)    LPID=$WRAP ;;
+            darwin-*) LPID=$(pgrep -x mStream | head -1); LPID=${LPID:-$WRAP} ;;
+            *)        LPID=$(pgrep -x mstream-desktop | head -1); LPID=${LPID:-$WRAP} ;;
+          esac
+          kill -9 "$LPID" 2>/dev/null
+          DOWN=0
+          for i in $(seq 1 12); do
+            sleep 1
+            curl -sf --max-time 2 -o /dev/null "http://127.0.0.1:3000/api/v1/ping" || { DOWN=1; break; }
+          done
+          if [ "$DOWN" != "1" ]; then
+            echo "FAIL: server still serving after the launcher was hard-killed — ORPHAN"
+            pkill -f mstream-server 2>/dev/null
+            exit 1
+          fi
+          echo "SMOKE OK: launcher spawn, health, and no-orphan supervision all behave"
+
+      # Two gaps the review found unexercised anywhere on Windows/Linux: the
+      # lifecycle smoke above sets MSTREAM_LAUNCHER_SKIP_AUTOSTART=1 (so
+      # default-on autostart never actually writes), and nothing ever proved
+      # the terminal face's "same output, same exit code" promise under
+      # redirection. This step does both against the staged bundle.
+      - name: Smoke test autostart artifacts + terminal-face redirection
+        if: matrix.key == 'win-x64' || matrix.key == 'linux-x64'
+        shell: bash
+        run: |
+          set -e
+          D=$(ls -d dist/stage/mStream-*-${{ matrix.key }})
+          case "${{ matrix.key }}" in
+            win-*) LAUNCHER="$D/mStream.exe" ;;
+            *)     LAUNCHER="$D/mstream-desktop" ;;
+          esac
+
+          # ── Terminal-face redirection: `-j` with no value is a
+          # deterministic server-side usage error (text + exit 1). Capturing
+          # it through a bash pipe proves the passthrough hands the child OUR
+          # redirected handles (on Windows, pre-G2-fix it rebound CONOUT$ —
+          # the capture came back empty and the text splashed the console).
+          # Windows engages the terminal face via AttachConsole, which the
+          # runner's hidden console satisfies even under full redirection.
+          # Unix keys the face off isatty — a CI step with EVERYTHING piped
+          # has no tty at all and correctly takes the GUI path instead — so
+          # the linux probe runs under a pty (`script`), the same shape as a
+          # real terminal user redirecting stdout.
+          set +e
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            OUT=$("$LAUNCHER" -j 2>&1); RC=$?
+          else
+            OUT=$(script -qec "\"$LAUNCHER\" -j" /dev/null 2>&1); RC=$?   # -e mirrors the child's exit code
+            OUT=$(printf '%s' "$OUT" | tr -d '\r')
+          fi
+          set -e
+          echo "passthrough said: '$OUT' (rc=$RC)"
+          echo "$OUT" | grep -q "argument missing" || { echo "FAIL: server's error text did not come back through the redirection"; exit 1; }
+          [ "$RC" = "1" ] || { echo "FAIL: exit code not mirrored (got $RC)"; exit 1; }
+          echo "OK: terminal face honors redirected stdio and mirrors exit codes"
+
+          # ── Autostart artifacts: enable FOR REAL (no skip var here) and
+          # assert the artifact the OS will actually consume at login —
+          # quoted exe path + --autostarted — then disable and assert gone.
+          case "${{ matrix.key }}" in
+            win-*)
+              "$LAUNCHER" --autostart=enable
+              VAL=$(MSYS_NO_PATHCONV=1 reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Run' /v mStream | tr -d '\r')
+              echo "$VAL"
+              echo "$VAL" | grep -qE '"[A-Za-z]:[^"]*mStream\.exe" --autostarted' \
+                || { echo "FAIL: Run value is not a quoted path + --autostarted"; exit 1; }
+              [ "$("$LAUNCHER" --autostart=status)" = "enabled" ] || { echo "FAIL: status after enable"; exit 1; }
+              "$LAUNCHER" --autostart=disable
+              if MSYS_NO_PATHCONV=1 reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Run' /v mStream 2>/dev/null; then
+                echo "FAIL: Run value still present after disable"; exit 1
+              fi
+              ;;
+            *)
+              # Bare HOME with no ~/.config: enable must create the directory
+              # auto-launch actually writes to (the Docker-smoke ENOENT class).
+              AH="$RUNNER_TEMP/autostart-home"; rm -rf "$AH"; mkdir -p "$AH"
+              HOME="$AH" "$LAUNCHER" --autostart=enable
+              F="$AH/.config/autostart/mStream.desktop"
+              [ -f "$F" ] || { echo "FAIL: no .desktop at $F"; ls -laR "$AH"; exit 1; }
+              grep '^Exec=' "$F"
+              grep -qE '^Exec="/[^"]*mstream-desktop" --autostarted' "$F" \
+                || { echo "FAIL: Exec line is not a quoted path + --autostarted"; exit 1; }
+              [ "$(HOME="$AH" "$LAUNCHER" --autostart=status)" = "enabled" ] || { echo "FAIL: status after enable"; exit 1; }
+              HOME="$AH" "$LAUNCHER" --autostart=disable
+              [ ! -f "$F" ] || { echo "FAIL: .desktop still present after disable"; exit 1; }
+              ;;
+          esac
+          echo "OK: autostart artifact written the way the OS consumes it; disable removes it"
+
+      - name: Smoke test iroh native binding
+        # Proves the standalone binary can dlopen the bundled @number0/iroh .node
+        # (bin/iroh/, staged by build-bun.mjs) via NAPI_RS_NATIVE_LIBRARY_PATH —
+        # remote access silently degrades if it can't, so assert it loudly. Only
+        # the native (non-cross) targets can run here, same as the boot smoke.
+        if: matrix.smoke
+        shell: bash
+        run: |
+          set -e
+          D=$(ls -d dist/stage/mStream-*-${{ matrix.key }})
+          if [ -d "$D/mStream.app" ]; then BIN="$D/mStream.app/Contents/MacOS/mstream-server"; elif [ -f "$D/mstream-server.exe" ]; then BIN="$D/mstream-server.exe"; else BIN="$D/mstream-server"; fi
+          echo "iroh smoke binary: $BIN"
+          OUT=$("$BIN" --mstream-worker=iroh-selftest '{}' 2>&1) || { echo "$OUT"; echo "FAIL: iroh self-test exited non-zero"; exit 1; }
+          echo "$OUT"
+          echo "$OUT" | grep -q IROH_OK || { echo "FAIL: iroh native binding did not load in the standalone binary"; exit 1; }
+          echo "OK: iroh native binding loaded from the bundled .node"
+
+      # ── Windows installer (Inno Setup) ──────────────────────────────────
+      # Compiled from the PRISTINE payload snapshot taken before the smokes
+      # (see "Snapshot installer payload" above): the smoked stage dir
+      # accretes logs and an in-flight ffmpeg download the installer must
+      # never ship. Still compiled last so a failed smoke means no installer
+      # artifact at all. ISCC ships on the windows-latest image; per-user
+      # install to {localappdata}\Programs\mStream (same location
+      # install.ps1 uses); design notes live in build/windows-installer.iss.
+      # When SignPath lands, PE signing slots in before the snapshot and
+      # setup.exe signing after this step.
+      - name: Build Windows installer (win-x64)
+        if: matrix.key == 'win-x64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { Write-Host '::error::Inno Setup 6 not found on this runner'; exit 1 }
+          $ver = node -pe "require('./package.json').version"
+          $ver4 = node --input-type=module -e "import {windowsVersion} from './scripts/win-versioninfo.mjs'; import {readFileSync} from 'node:fs'; console.log(windowsVersion(JSON.parse(readFileSync('package.json','utf8')).version))"
+          $stage = Join-Path $env:RUNNER_TEMP 'installer-stage'
+          if (-not (Test-Path $stage)) { Write-Host '::error::pristine payload snapshot missing - was the snapshot step reordered?'; exit 1 }
+          # Belt for future reordering: smoke residue in the SNAPSHOT means
+          # it was taken too late, and the installer must not ship. bin\ffmpeg
+          # itself is legitimate now (the pin manifest ships there), so the
+          # sentinel is the smoke's DOWNLOADED binaries, not the directory.
+          foreach ($bad in 'boot.log','default-boot.log','portable-boot.log','smoke-config.json','post1.code','post2.code','bin\ffmpeg\ffmpeg.exe','bin\ffmpeg\ffprobe.exe') {
+            if (Test-Path (Join-Path $stage $bad)) { Write-Host "::error::smoke residue '$bad' inside the installer payload snapshot"; exit 1 }
+          }
+          $ffx = Get-ChildItem (Join-Path $stage 'bin\ffmpeg') -File | Where-Object { $_.Name -ne 'manifest.json' }
+          if ($ffx) { Write-Host "::error::unexpected files beside the manifest in bin\ffmpeg: $($ffx.Name -join ', ')"; exit 1 }
+          $out = Join-Path $PWD 'dist/installer'
+          & $iscc "/DAppVersion=$ver" "/DAppVersion4=$ver4" "/DStageDir=$stage" "/O$out" 'build/windows-installer.iss'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $setup = Get-Item (Join-Path $out "mStream-$ver-win-x64-setup.exe")
+          Write-Host "installer: $($setup.Name) ($([math]::Round($setup.Length/1MB,1)) MB)"
+          # The installer exe carries the same 4-part VersionInfo contract as
+          # every shipped PE (Win32 truth, like check-win-versioninfo.ps1).
+          # Inno space-pads the VersionInfo string fields to a fixed width —
+          # trim before comparing.
+          $vi = $setup.VersionInfo
+          $fv = "$($vi.FileVersion)".Trim(); $pn = "$($vi.ProductName)".Trim()
+          Write-Host "VersionInfo: FileVersion='$fv' Product='$pn' Company='$("$($vi.CompanyName)".Trim())'"
+          if ($fv -ne $ver4) { Write-Host "::error::installer FileVersion '$fv' is not '$ver4'"; exit 1 }
+          if ($pn -ne 'mStream') { Write-Host "::error::installer ProductName '$pn' is not 'mStream'"; exit 1 }
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@v4
@@ -135,9 +1773,256 @@ jobs:
           path: dist/mStream-*-${{ matrix.key }}.zip
           if-no-files-found: error
 
+      - name: Upload installer artifact (win-x64)
+        if: matrix.key == 'win-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mStream-win-x64-installer
+          path: dist/installer/mStream-*-win-x64-setup.exe
+          if-no-files-found: error
+
+      - name: Upload installer artifact (darwin)
+        if: startsWith(matrix.key, 'darwin')
+        uses: actions/upload-artifact@v4
+        with:
+          name: mStream-${{ matrix.key }}-installer
+          path: dist/installer/mStream-*-${{ matrix.key }}.pkg
+          if-no-files-found: error
+
+  # ── Linux native packages (P3.4b) ─────────────────────────────────────────
+  # deb + rpm for the glibc bundles, built with pinned nfpm from the exact
+  # zips the build job produced (musl targets use apk-based distros — no
+  # deb/rpm for them). amd64 is the full desktop package: /opt/mstream tree,
+  # /usr/bin symlinks for both faces, a system .desktop entry + hicolor icon.
+  # arm64 bundles are server-only BY DESIGN (no launcher), so their packages
+  # are too. Server hard-deps stay minimal (the server is pure glibc — the
+  # bare-Debian-11 dep audit); the desktop/audio libraries ride Recommends,
+  # so a headless `--no-install-recommends` install never drags GTK in.
+  # The amd64 deb is installed and BOOTED on this runner; the rpm proves
+  # itself in a Fedora container; arm64 can't exec here, so its packages get
+  # content asserts.
+  linux-packages:
+    name: Linux deb/rpm packages
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download linux-x64 bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: mStream-linux-x64
+          path: zips
+      - name: Download linux-arm64 bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: mStream-linux-arm64
+          path: zips
+
+      - name: Install nfpm (pinned)
+        run: |
+          set -euo pipefail
+          # Pinned + hashed like every other fetched build tool in this repo
+          # (see the sidecar workflows' cross pin). Bump version and sha256
+          # together.
+          curl -fsSL -o nfpm.tar.gz "https://github.com/goreleaser/nfpm/releases/download/v2.47.0/nfpm_2.47.0_Linux_x86_64.tar.gz"
+          echo "0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783  nfpm.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar xzf nfpm.tar.gz -C "$HOME/.local/bin" nfpm
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build deb + rpm packages
+        run: |
+          set -euo pipefail
+          VER=$(node -pe "require('./package.json').version")
+          mkdir -p pkg dist/packages
+          for key in linux-x64 linux-arm64; do
+            unzip -q "zips/mStream-$VER-$key.zip" -d "pkg/$key"
+            tree=$(ls -d "pkg/$key"/mStream-*)
+            # Belt over the zip's unix attrs: the spawn paths need +x.
+            chmod +x "$tree/mstream-server" 2>/dev/null || true
+            chmod +x "$tree/mstream-desktop" 2>/dev/null || true
+            chmod +x "$tree"/bin/rust-parser/* "$tree"/bin/mstream-player/* 2>/dev/null || true
+            mv "$tree" "pkg/tree-$key"
+          done
+          test -x pkg/tree-linux-x64/mstream-desktop || { echo "::error::linux-x64 bundle has no launcher — the desktop package would be a lie"; exit 1; }
+
+          cat > pkg/mstream.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=mStream
+          Comment=Personal music streaming server
+          Exec=/opt/mstream/mstream-desktop
+          TryExec=/opt/mstream/mstream-desktop
+          Icon=mstream
+          Terminal=false
+          Categories=AudioVideo;Audio;Player;
+          EOF
+          cat > pkg/postinstall.sh <<'EOF'
+          #!/bin/sh
+          update-desktop-database -q /usr/share/applications 2>/dev/null || true
+          gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
+          exit 0
+          EOF
+          cp pkg/postinstall.sh pkg/postremove.sh
+
+          # amd64: full desktop package.
+          cat > pkg/nfpm-amd64.yaml <<EOF
+          name: mstream
+          arch: amd64
+          platform: linux
+          version: "$VER"
+          maintainer: "Paul Sori <paul@mstream.io>"
+          description: |
+            Personal music streaming server with a desktop tray launcher.
+            Stream your music collection to any browser or mobile device.
+          homepage: https://mstream.io
+          license: GPL-3.0
+          contents:
+            - src: ./pkg/tree-linux-x64
+              dst: /opt/mstream
+              type: tree
+            - src: /opt/mstream/mstream-server
+              dst: /usr/bin/mstream-server
+              type: symlink
+            - src: /opt/mstream/mstream-desktop
+              dst: /usr/bin/mstream-desktop
+              type: symlink
+            - src: ./pkg/mstream.desktop
+              dst: /usr/share/applications/mstream.desktop
+            - src: ./pkg/tree-linux-x64/mStream.png
+              dst: /usr/share/icons/hicolor/512x512/apps/mstream.png
+          scripts:
+            postinstall: ./pkg/postinstall.sh
+            postremove: ./pkg/postremove.sh
+          # xz over nfpm's gzip default: ~25-30% smaller on this binary-heavy
+          # payload (measured against the released bundles), and xz is the
+          # compatibility-safe strong choice (dpkg since 2012, rpm since 4.7 /
+          # EL6 — zstd would exclude EL7 and older dpkg).
+          deb:
+            compression: xz
+          rpm:
+            compression: xz
+          overrides:
+            deb:
+              depends: [libc6]
+              recommends: [libgtk-3-0, libayatana-appindicator3-1, libasound2]
+            rpm:
+              depends: [glibc]
+              recommends: [gtk3, libayatana-appindicator-gtk3, alsa-lib]
+          EOF
+
+          # arm64: server-only (the bundle ships no launcher by design).
+          cat > pkg/nfpm-arm64.yaml <<EOF
+          name: mstream
+          arch: arm64
+          platform: linux
+          version: "$VER"
+          maintainer: "Paul Sori <paul@mstream.io>"
+          description: |
+            Personal music streaming server (headless).
+            Stream your music collection to any browser or mobile device.
+          homepage: https://mstream.io
+          license: GPL-3.0
+          contents:
+            - src: ./pkg/tree-linux-arm64
+              dst: /opt/mstream
+              type: tree
+            - src: /opt/mstream/mstream-server
+              dst: /usr/bin/mstream-server
+              type: symlink
+          deb:
+            compression: xz
+          rpm:
+            compression: xz
+          overrides:
+            deb:
+              depends: [libc6]
+              recommends: [libasound2]
+            rpm:
+              depends: [glibc]
+              recommends: [alsa-lib]
+          EOF
+
+          for a in amd64 arm64; do
+            nfpm pkg --config "pkg/nfpm-$a.yaml" --packager deb --target dist/packages/
+            nfpm pkg --config "pkg/nfpm-$a.yaml" --packager rpm --target dist/packages/
+          done
+          ls -l dist/packages/
+
+      - name: Smoke the amd64 deb on this runner (install, boot, remove)
+        run: |
+          set -euo pipefail
+          VER=$(node -pe "require('./package.json').version")
+          sudo apt-get install -y ./dist/packages/mstream_"$VER"_amd64.deb desktop-file-utils
+          test -x /opt/mstream/mstream-server
+          test -x /opt/mstream/mstream-desktop
+          test -L /usr/bin/mstream-server
+          desktop-file-validate /usr/share/applications/mstream.desktop
+          V_OUT=$(/usr/bin/mstream-server -V)
+          echo "mstream-server -V -> $V_OUT"
+          echo "$V_OUT" | grep -qF "$VER" || { echo "::error::installed server reports the wrong version"; exit 1; }
+          # Boot through the /usr/bin symlink and serve — the package layout
+          # must actually run, not just exist.
+          printf '{"port":3555,"address":"127.0.0.1"}\n' > /tmp/pkg-smoke.json
+          /usr/bin/mstream-server -j /tmp/pkg-smoke.json > /tmp/pkg-boot.log 2>&1 &
+          SRV=$!
+          UP=0
+          for i in $(seq 1 30); do
+            sleep 1
+            if curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:3555/api/v1/ping"; then UP=1; break; fi
+          done
+          kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null || true
+          [ "$UP" = "1" ] || { echo "::error::installed server never served /api/v1/ping"; tail -30 /tmp/pkg-boot.log; exit 1; }
+          echo "installed server served 200 on :3555"
+          sudo apt-get remove -y mstream
+          [ ! -e /opt/mstream ] || { echo "::error::/opt/mstream survived apt remove"; exit 1; }
+          echo "deb install/boot/remove: OK"
+
+      - name: Smoke the x86_64 rpm in a Fedora container
+        run: |
+          set -euo pipefail
+          VER=$(node -pe "require('./package.json').version")
+          docker run --rm -v "$PWD/dist/packages:/pkg:ro" fedora:41 bash -c "
+            set -e
+            dnf install -y -q /pkg/mstream-$VER-1.x86_64.rpm
+            test -x /opt/mstream/mstream-server
+            out=\$(/usr/bin/mstream-server -V)
+            echo \"mstream-server -V -> \$out\"
+            echo \"\$out\" | grep -qF '$VER'
+            rpm -e mstream
+            [ ! -e /opt/mstream ]
+            echo 'rpm install/exec/remove: OK'
+          "
+
+      - name: Content-assert the arm64 packages (cannot exec on x64)
+        run: |
+          set -euo pipefail
+          VER=$(node -pe "require('./package.json').version")
+          deb="dist/packages/mstream_${VER}_arm64.deb"
+          # List once into a file: `dpkg-deb -c | grep -q` under pipefail
+          # SIGPIPEs dpkg-deb on the first match and fails the pipeline
+          # BECAUSE it matched.
+          dpkg-deb -c "$deb" > arm64-contents.txt
+          grep -q './opt/mstream/mstream-server' arm64-contents.txt || { echo "::error::arm64 deb lacks the server"; exit 1; }
+          if grep -q 'mstream-desktop' arm64-contents.txt; then echo "::error::arm64 deb unexpectedly ships a launcher"; exit 1; fi
+          rpm=$(ls dist/packages/mstream-"$VER"-*.aarch64.rpm)
+          docker run --rm -v "$PWD/dist/packages:/pkg:ro" fedora:41 bash -c "rpm -qlp /pkg/$(basename "$rpm") > /tmp/l && grep -q '/opt/mstream/mstream-server' /tmp/l"
+          echo "arm64 package contents: OK"
+
+      - name: Upload packages artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mStream-linux-packages
+          path: dist/packages/*
+          if-no-files-found: error
+
   release:
     name: Attach bundles to release
-    needs: build
+    # linux-packages too: its deb/rpm artifacts ride the same merged
+    # download below — without the dependency a tag's attach step races the
+    # packaging job and globs at nothing.
+    needs: [build, linux-packages]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -149,6 +2034,25 @@ jobs:
           path: bundles
           merge-multiple: true
 
+      # manifest.json: the release's own inventory (scripts/release-manifest.sh
+      # — the SAME script the PR-time `installer-contract` job below runs, so
+      # the generator and the installers' parser cannot drift apart). It
+      # refuses unless every zip is exactly mStream-<tag-version>-<key>.zip:
+      # a lagging or prerelease package.json would otherwise ship bundles no
+      # installer can name.
+      - name: Check out (for scripts/release-manifest.sh)
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: scripts/release-manifest.sh
+          sparse-checkout-cone-mode: false
+          path: src
+
+      - name: Generate sha256 manifest
+        shell: bash
+        run: |
+          sh src/scripts/release-manifest.sh "${GITHUB_REF_NAME#v}" bundles
+          cat bundles/manifest.json
+
       - name: Attach bundles to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -158,8 +2062,31 @@ jobs:
         # can be reviewed and PUBLISHED manually (publishing is what fires the
         # downstream npm-publish / deploy-demo jobs), idempotent on same-tag
         # re-runs, then upload the bundles. A genuine create failure fails the job.
+        #
+        # Never touch a PUBLISHED release: a re-run of the tag workflow (Re-run
+        # all jobs, or a dispatch on the tag) would --clobber the zips and the
+        # manifest piecemeal — builds aren't byte-reproducible (fresh
+        # notarization ticket, zip mtimes), so for the ~5s window users mid-
+        # `curl | sh` get a sha256 mismatch, and if a leg failed the release is
+        # left half-new. Publishing is the point of no return; a genuine
+        # re-ship of a published version is a new patch tag.
         run: |
           if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$REPO" --title "$TAG" --generate-notes --draft
           fi
-          gh release upload "$TAG" bundles/*.zip --clobber --repo "$REPO"
+          if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft)" != "true" ]; then
+            echo "::error::release $TAG is already PUBLISHED - refusing to overwrite its assets. Ship a new patch version instead."
+            exit 1
+          fi
+          # The Windows setup.exe and the Linux deb/rpm packages ride the
+          # same artifact download into bundles/. manifest.json lists the
+          # zips (what the install scripts and the updater's managed staging
+          # consume) PLUS the setup.exe/.pkg installers — the in-app updater
+          # verifies those hashes before offering/launching them on Inno and
+          # pkg installs. deb/rpm stay unlisted: their integrity story is the
+          # package manager's.
+          gh release upload "$TAG" bundles/*.zip bundles/manifest.json \
+            bundles/mStream-*-win-x64-setup.exe \
+            bundles/mstream_*.deb bundles/mstream-*.rpm \
+            bundles/mStream-*-darwin-*.pkg \
+            --clobber --repo "$REPO"

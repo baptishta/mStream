@@ -1,0 +1,207 @@
+name: Test
+
+on:
+  # The heavy 9-job matrix runs only when a PR is labelled `full-ci` — i.e. once
+  # you mark it ready to merge — not on every push. (Merge queue would be the
+  # native "before merge" trigger, but it's org-only and this repo is on a
+  # personal account.) Require the "tests passed" check in branch protection so
+  # a PR can't merge until it's been labelled `full-ci` and the run is green.
+  pull_request:
+    types: [labeled]
+  # Manual escape hatch — run on demand from the Actions tab or
+  # `gh workflow run test.yml --ref <branch>`.
+  workflow_dispatch:
+
+# Re-labelling the same PR cancels its prior in-flight run (each PR has its own
+# ref); runs for different PRs never cancel each other.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }} · ${{ matrix.shard }}/3)
+    # Only on the `full-ci` label or a manual dispatch — never plain PR pushes.
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'full-ci'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # Don't let one OS failing cancel the others — we want the full matrix.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Split the suite across 3 shards per OS — node --test partitions the
+        # files, so the ~32 server-booting tests run in parallel across jobs.
+        shard: [1, 2, 3]
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      # Bun runtime, for the supervision suite's bun legs — the shipped
+      # standalone binaries are Bun builds, so the lost-supervision behavior
+      # (test/integration/supervision-shutdown.test.mjs) is asserted on that
+      # runtime too. Those legs skip wherever bun is absent.
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      # ffmpeg sources differ per OS: version-pinned, checksum-verified static
+      # builds fetched from GitHub-CDN mirrors on Linux (BtbN) and Windows
+      # (gyan.dev); Homebrew on macOS (arm64 runner — handled separately
+      # below).
+
+      # Deterministic for the same reason as the Windows leg below — the apt
+      # install this replaced hung on a stalled Ubuntu-mirror fetch until the
+      # 30-minute job timeout killed the shard (PR #779, run 30360260306:
+      # 22+ min inside apt-get while the sibling shards' installs took ~20 s).
+      # Same shape as Windows: pinned tag + sha256, curl retries, fail-loud
+      # libvorbis assert (the suite encodes .ogg fixtures). Bump: BtbN prunes
+      # daily autobuild-* tags after ~2 weeks but keeps each month-end tag
+      # long-term (~2 years observed) — pick a MONTH-END tag and a versioned
+      # (ffmpeg-nX.Y.Z-…) linux64-gpl asset from it, then update the sha256
+      # (compute locally: sha256sum on the downloaded tar).
+      - name: Install ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          tag='autobuild-2026-06-30-13-34'
+          build='ffmpeg-n8.1.2-21-gce3c09c101-linux64-gpl-8.1'
+          sha256='0ba73bbd93472c7622f6dec26d334c5e62e64d858d072490b2844320970456cd'
+          curl -fsSL --retry 3 --retry-delay 5 -o "$build.tar.xz" \
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/$tag/$build.tar.xz"
+          echo "$sha256  $build.tar.xz" | sha256sum -c - \
+            || { echo "::error::ffmpeg download checksum mismatch"; exit 1; }
+          tar -xf "$build.tar.xz"
+          mkdir -p bin/ffmpeg
+          cp "$build/bin/ffmpeg"  bin/ffmpeg/ffmpeg
+          cp "$build/bin/ffprobe" bin/ffmpeg/ffprobe
+          chmod +x bin/ffmpeg/ffmpeg bin/ffmpeg/ffprobe
+          bin/ffmpeg/ffmpeg -hide_banner -encoders | grep -qi libvorbis \
+            || { echo "::error::Linux ffmpeg is missing the libvorbis encoder"; exit 1; }
+          rm -rf "$build.tar.xz" "$build"
+
+      # Deterministic on purpose: the setup-ffmpeg action this replaced
+      # resolved "latest release" through a remote lookup on EVERY run, and
+      # one flake of that lookup ("Cannot get latest release") killed all
+      # three Windows shards before a single test ran (PR #777). A pinned
+      # tag + sha256 has exactly one failure mode — the download itself —
+      # which curl retries and a checksum guards. The full build bundles
+      # libvorbis (the suite encodes .ogg fixtures); asserted below like the
+      # macOS leg. Bump: pick a tag from GyanD/codexffmpeg releases, update
+      # the sha256 (compute locally: sha256sum on the downloaded zip), and
+      # keep the libvorbis assert green.
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tag = '8.1.2'
+          $sha256 = 'b8cdefab5f50590a076c27c2b56b0294a0e6154faded28ba1ba05ebc4f801f57'
+          $zip = "ffmpeg-$tag-full_build.zip"
+          curl.exe -fsSL --retry 3 --retry-delay 5 -o $zip `
+            "https://github.com/GyanD/codexffmpeg/releases/download/$tag/$zip"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::ffmpeg download failed (curl exit $LASTEXITCODE)"
+            exit 1
+          }
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $sha256) {
+            Write-Host "::error::ffmpeg download checksum mismatch (got $actual, want $sha256)"
+            exit 1
+          }
+          tar -xf $zip
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::ffmpeg archive extraction failed"
+            exit 1
+          }
+          New-Item -ItemType Directory -Force bin/ffmpeg | Out-Null
+          Copy-Item "ffmpeg-$tag-full_build/bin/ffmpeg.exe"  bin/ffmpeg/ffmpeg.exe
+          Copy-Item "ffmpeg-$tag-full_build/bin/ffprobe.exe" bin/ffmpeg/ffprobe.exe
+          $enc = & bin/ffmpeg/ffmpeg.exe -hide_banner -encoders
+          if (-not ($enc | Select-String -Quiet libvorbis)) {
+            Write-Host "::error::Windows ffmpeg is missing the libvorbis encoder"
+            exit 1
+          }
+          Remove-Item $zip, "ffmpeg-$tag-full_build" -Recurse -Force
+
+      # Homebrew-core ffmpeg (8.x) dropped libvorbis, but the suite encodes
+      # .ogg fixtures with it. The homebrew-ffmpeg tap ships a full-codec build
+      # (with libvorbis) and provides bottles, so this stays fast.
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        timeout-minutes: 15
+        run: brew install homebrew-ffmpeg/ffmpeg/ffmpeg
+
+      # The fixture generator (and the server's transcoder) look for ffmpeg at
+      # bin/ffmpeg/ — the bundled binary is gitignored, so it isn't in the
+      # checkout. The Linux and Windows steps above install straight into
+      # bin/ffmpeg/; macOS stages Homebrew's ffmpeg here. Use Homebrew's build
+      # explicitly — the runner's preinstalled ffmpeg (which `command -v` may
+      # resolve first) lacks libvorbis, and the suite generates .ogg fixtures.
+      # Fail loudly if the codec is missing.
+      - name: Stage ffmpeg into bin/ffmpeg/ (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p bin/ffmpeg
+          ff="$(brew --prefix)/bin"
+          "$ff/ffmpeg" -hide_banner -encoders | grep -qi libvorbis \
+            || { echo "::error::macOS ffmpeg is missing the libvorbis encoder"; exit 1; }
+          cp "$ff/ffmpeg"  bin/ffmpeg/ffmpeg
+          cp "$ff/ffprobe" bin/ffmpeg/ffprobe
+          chmod +x bin/ffmpeg/ffmpeg bin/ffmpeg/ffprobe
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Build rust-parser FROM THIS PR'S SOURCE. The committed bin/ binaries
+      # are rebuilt by CI only AFTER a merge to master, so on a PR that
+      # changes the Rust scanner they are one generation stale — and the
+      # capability-probed suites (sampled hashes, hash-generation migration)
+      # would silently SKIP their Rust halves, leaving the JS↔Rust hash
+      # parity contract unverified at the exact moment it's being changed.
+      # The test helper prefers rust-parser/target/release over bin/, so
+      # this build puts the PR's own scanner under test on every OS.
+      # rust-cache keys off Cargo.lock; warm runs restore in seconds.
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-parser
+
+      - name: Build rust-parser from source
+        working-directory: rust-parser
+        run: cargo build --release
+
+      # Build the fixture library once (normally npm's `pretest`), then run this
+      # shard. The freshly built rust-parser above drives the scanner-parity
+      # tests on every OS; the committed bin/ binaries remain the fallback for
+      # local runs without a toolchain.
+      - name: Build fixtures
+        run: npm run pretest
+
+      - name: Run tests (shard ${{ matrix.shard }}/3)
+        run: node --test --test-reporter=spec --test-shard=${{ matrix.shard }}/3 "test/**/*.test.mjs"
+
+  # One stable check to require in branch protection / the merge queue — green
+  # only when every matrix leg passed. Lets you require a single name instead of
+  # all 9, which change whenever the OS or shard list does.
+  tests-passed:
+    name: tests passed
+    # Mirror the gate so this check only exists when the matrix ran; always()
+    # makes it still report (and fail) if a shard failed.
+    if: always() && (github.event_name == 'workflow_dispatch' || github.event.label.name == 'full-ci')
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on the matrix result
+        run: |
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "::error::test matrix did not pass (result: ${{ needs.test.result }})"
+            exit 1
+          fi
+          echo "all shards green"

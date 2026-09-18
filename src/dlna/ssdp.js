@@ -32,9 +32,23 @@ let joinedInterfaces = [];
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-export function getLocalIp() {
-  const addr = config.program.address;
-  if (addr && addr !== '::' && addr !== '0.0.0.0') { return addr; }
+// Resolving the outbound address means enumerating every network adapter,
+// and `os.networkInterfaces()` is not cheap — ~13 ms per call on Windows.
+// That mattered enormously, because getBaseUrl() is called once per DIDL
+// element: trackItem() builds a media URL for every track and
+// containerArtXml() an art URL for every container. A single unauthenticated
+// SOAP `Search` for '*' (10,000 items) therefore spent over two minutes of
+// event loop inside this one syscall.
+//
+// The answer only changes when the host's networking does (DHCP renew, VPN
+// up/down, adapter swap), so a short TTL keeps the self-healing behaviour —
+// a stale media URL survives at most LOCAL_IP_TTL_MS — while collapsing a
+// per-item syscall into at most one per response.
+const LOCAL_IP_TTL_MS = 5000;
+let localIpCache = null;
+let localIpCachedAt = 0;
+
+function resolveLocalIp() {
   const ifaces = os.networkInterfaces();
   for (const name of Object.keys(ifaces)) {
     for (const iface of ifaces[name]) {
@@ -42,6 +56,25 @@ export function getLocalIp() {
     }
   }
   return '127.0.0.1';
+}
+
+export function getLocalIp() {
+  const addr = config.program.address;
+  // An explicitly configured address needs no lookup and no cache — it can
+  // only change on a config reload, which reloads this value anyway.
+  if (addr && addr !== '::' && addr !== '0.0.0.0') { return addr; }
+  const now = Date.now();
+  if (localIpCache !== null && now - localIpCachedAt < LOCAL_IP_TTL_MS) { return localIpCache; }
+  localIpCache = resolveLocalIp();
+  localIpCachedAt = now;
+  return localIpCache;
+}
+
+// Test hook: drop the memo so a suite can observe an adapter change without
+// waiting out the TTL.
+export function invalidateLocalIpCache() {
+  localIpCache = null;
+  localIpCachedAt = 0;
 }
 
 export function getBaseUrl() {
@@ -220,9 +253,13 @@ function handleSearch(msgStr, rinfo) {
   const pairs = matches[st];
   if (!pairs) { return; }
 
-  // Honor MX: delay responses by a random 0..MX seconds, then stagger by 50ms each
+  // Honor MX: delay responses by a random 0..MX seconds, then stagger by 50ms each.
+  // Clamp to the UPnP-recommended ceiling of 5s. Without an upper bound a client
+  // (the UDP source address is trivially spoofable) could send `MX: 999999` and
+  // make us hold response buffers + pending timers for hours — a cheap memory DoS,
+  // and a large value also widens the SSDP reflection/amplification window.
   const mxMatch = msgStr.match(/^MX:\s*(\d+)/im);
-  const mx = Math.max(1, parseInt(mxMatch ? mxMatch[1] : '1', 10));
+  const mx = Math.min(5, Math.max(1, parseInt(mxMatch ? mxMatch[1] : '1', 10)));
   let delay = Math.floor(Math.random() * mx * 1000);
   for (const [respSt, respUsn] of pairs) {
     const msg = searchResponseMsg(respSt, respUsn);
@@ -318,12 +355,17 @@ export function stop() {
   const ifaces = ifaceSnapshot.length > 1 ? ifaceSnapshot : [null];
   let remaining = messages.length * ifaces.length;
 
+  // Same reasoning as mdns.js's stop(): announce the stop synchronously below,
+  // and keep the deferred socket close at debug. Emitted from here, the
+  // 'Stopped' line lands after a reboot's fresh 'Started' and reads as a
+  // torn-down advertiser.
   function closeWhenDone() {
     if (--remaining === 0) {
-      try { sock.close(); } catch (_) {}
-      winston.info('[dlna-ssdp] Stopped');
+      try { sock.close(); } catch (_) { /* already closed */ }
+      winston.debug('[dlna-ssdp] old socket closed');
     }
   }
+  winston.info('[dlna-ssdp] Stopped');
 
   // Mirror sendMessages()'s interface fan-out for the byebye batch so
   // renderers on every interface see us leave — otherwise stale entries

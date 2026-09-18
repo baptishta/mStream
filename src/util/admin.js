@@ -12,27 +12,74 @@ import * as vpathAccessCache from '../torrent/vpath-access-cache.js';
 import * as managedTorrents from '../torrent/managed-torrents.js';
 import { sweepVpathsForActiveClient } from '../torrent/vpath-sweep.js';
 import winston from 'winston';
-// syncthing import disabled — federation feature is being rebuilt
-// around the local-backup story (see src/server.js). Restore this
-// import when re-enabling enableFederation() below.
-// import * as syncthing from '../state/syncthing.js';
 import * as dlnaSsdp from '../dlna/ssdp.js';
 import * as dlnaServer from '../dlna/dlna-server.js';
 import * as subsonicServer from '../subsonic/subsonic-server.js';
 import { getDirname } from './esm-helpers.js';
 import { launchWorker } from './worker-process.js';
 import { invalidateWhitelistCache } from './admin-network.js';
+import { updateJsonAtomic, completedWrites } from './atomic-json.js';
 
 const __dirname = getDirname(import.meta.url);
 
 // ── Config file helpers (for server-level settings) ─────────────────────────
 
+// Every setting editor below is a read-modify-write: loadFile -> mutate ->
+// saveFile. Two of them in flight together (two admin tabs, two quick saves,
+// the smoke's concurrent POSTs) used to be last-writer-wins on disk — both
+// loaded the same document, and the second save silently threw away the
+// first's change (a trustProxy flip lost under a maxRequestSize save, both
+// answered 200). And the writes were plain fs.writeFile, so the soft reboot's
+// config re-read, now microseconds after the save that triggered it, could
+// see a truncated file and exit the process.
+//
+// So: loadFile remembers the document it handed out (a deep snapshot, keyed by
+// the returned object), and saveFile writes through util/atomic-json.js —
+// atomic (temp + rename: no reader ever sees a partial document), serialized
+// per file, and MERGING when another write landed in between: only the paths
+// the caller actually changed since its load are applied onto the file's
+// current content, so concurrent saves of different settings both survive
+// (same path: the later save wins, as before). Callers need no change.
+const loaded = new WeakMap();   // returned object -> { file, base (deep clone), writes }
+
 export async function loadFile(file) {
-  return JSON.parse(await fs.readFile(file, 'utf-8'));
+  const doc = JSON.parse(await fs.readFile(file, 'utf-8'));
+  if (doc && typeof doc === 'object') {
+    loaded.set(doc, { file: path.resolve(file), base: structuredClone(doc), writes: completedWrites(file) });
+  }
+  return doc;
 }
 
 export function saveFile(saveData, file) {
-  return fs.writeFile(file, JSON.stringify(saveData, null, 2), 'utf8');
+  const origin = (saveData && typeof saveData === 'object') ? loaded.get(saveData) : undefined;
+  return updateJsonAtomic(file, (current) => {
+    // No snapshot (not from loadFile), a different file, nothing landed since
+    // the load, or nothing to merge onto: write the caller's document as is.
+    if (!origin || origin.file !== path.resolve(file) || completedWrites(file) === origin.writes || !current || typeof current !== 'object') {
+      return saveData;
+    }
+    return mergeChanges(current, origin.base, saveData);
+  });
+}
+
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+// Apply to `current` every path where `mine` differs from `base` (what this
+// caller loaded); paths the caller didn't touch keep `current`'s value.
+function mergeChanges(current, base, mine) {
+  const out = { ...current };
+  for (const key of new Set([...Object.keys(base || {}), ...Object.keys(mine || {})])) {
+    const inMine = Object.prototype.hasOwnProperty.call(mine, key);
+    const inBase = Object.prototype.hasOwnProperty.call(base || {}, key);
+    if (!inMine && inBase) { delete out[key]; continue; }          // caller deleted it
+    if (!inMine) { continue; }
+    if (isPlainObject(mine[key]) && isPlainObject(base?.[key]) && isPlainObject(out[key])) {
+      out[key] = mergeChanges(out[key], base[key], mine[key]);      // descend: sibling sub-keys survive
+    } else if (!inBase || JSON.stringify(mine[key]) !== JSON.stringify(base[key])) {
+      out[key] = mine[key];                                         // caller changed (or added) it
+    }
+  }
+  return out;
 }
 
 // ── Directory / Library management (now in SQLite) ──────────────────────────
@@ -110,13 +157,65 @@ export async function setLibraryFollowSymlinks(vpath, followSymlinks) {
   db.invalidateCache();
 }
 
+// Delete a library's rows: tracks first in bounded chunks, then the
+// libraries row. The single cascading DELETE used to remove 20k+ track
+// rows (each firing the FTS5 sync triggers) in ONE statement — 5.7 s of
+// synchronous main-thread work holding the writer lock past other
+// writers' 5 s busy_timeout (2026-07 audit H2). Chunking bounds each lock
+// hold AND each event-loop block to one chunk; the yield between chunks
+// lets queued handlers (and other writers) interleave. Total work is
+// unchanged — the FTS triggers still fire per row.
+//
+// Mid-delete visibility: a browser hitting this library sees it shrink
+// for a few seconds instead of vanishing atomically. Acceptable for an
+// admin-initiated delete that reboots the server at the end anyway; a
+// crash mid-way leaves a partial library the re-run (or next scan)
+// handles like any other library.
+//
+// Exported separately from removeDirectory (which also cancels backups
+// and reboots the server) so the delete mechanics are testable on a bare
+// DB.
+export async function deleteLibraryRows(d, libraryId) {
+  const deleteChunk = d.prepare(
+    'DELETE FROM tracks WHERE id IN (SELECT id FROM tracks WHERE library_id = ? LIMIT 500)');
+  for (;;) {
+    const { changes } = deleteChunk.run(libraryId);
+    if (changes === 0) { break; }
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  // CASCADE handles what's left: user_libraries, cue_points (indexed by
+  // V63), backup_destinations + their backup_history, and the SET NULL
+  // sweep over play_events.library_id (also indexed by V63 — this was a
+  // full ever-growing-table scan before).
+  d.prepare('DELETE FROM libraries WHERE id = ?').run(libraryId);
+}
+
 export async function removeDirectory(vpath) {
   const library = db.getLibraryByName(vpath);
   if (!library) { throw new Error(`'${vpath}' not found`); }
 
+  // Cancel this library's backups BEFORE the cascade below destroys
+  // their backup_destinations rows. Without this, an in-flight backup
+  // worker became a phantom: it kept mirroring for hours, held the
+  // strictly-serial queue slot (blocking the rescan an admin typically
+  // runs right after re-adding a library), and was fully invisible —
+  // the status endpoint reports idle once the destination row is gone
+  // and the worker's history updates land on a cascade-deleted row.
+  // Same failure mode the destination-DELETE route guards against;
+  // this is the second path to it.
+  try {
+    for (const dest of db.getBackupDestinationsByLibrary(library.id, { enabledOnly: false })) {
+      const killed = dbQueue.cancelBackupsForDestination(dest.id);
+      if (killed) {
+        winston.info(`Backup: library '${vpath}' deleted with a run in flight for destination #${dest.id} — worker killed`);
+      }
+    }
+  } catch (err) {
+    winston.error(`Backup: failed to cancel backups for deleted library '${vpath}'`, { stack: err });
+  }
+
   const d = db.getDB();
-  // CASCADE will delete tracks and user_libraries entries
-  d.prepare('DELETE FROM libraries WHERE id = ?').run(library.id);
+  await deleteLibraryRows(d, library.id);
 
   // Clean up orphan albums / artists / genres left over after the
   // tracks cascade. Chunked + commits per chunk so the multi-second
@@ -256,6 +355,23 @@ export async function setSubsonicPassword(username, plaintext) {
     const encrypted = encryptSubsonicPassword(plaintext);
     d.prepare('UPDATE users SET subsonic_password_encrypted = ? WHERE id = ?').run(encrypted, user.id);
   }
+  db.invalidateCache();
+}
+
+// Set a user's stored Last.fm credentials — the V1 lastfm_user/lastfm_password
+// columns that live directly on the users row. Same lookup-then-UPDATE shape as
+// editUserPassword, and the same storage write the self-service /lastfm/connect
+// endpoint (velvet-stubs.js) uses. Registering the creds with the in-process
+// Scribble session map (warmScrobbleUser) is the route handler's job — that
+// singleton lives in the api layer, so util/ stays out of it.
+export async function setUserLastFM(username, lastfmUser, lastfmPassword) {
+  const user = db.getUserByUsername(username);
+  if (!user) { throw new Error(`'${username}' does not exist`); }
+
+  db.getDB().prepare(
+    'UPDATE users SET lastfm_user = ?, lastfm_password = ? WHERE id = ?'
+  ).run(lastfmUser, lastfmPassword, user.id);
+
   db.invalidateCache();
 }
 
@@ -414,19 +530,249 @@ export async function editGenerateWaveforms(val) {
   config.program.scanOptions.generateWaveforms = val;
 }
 
-// stratum-dsp BPM + musical-key detection toggle. Mirrors the
+// essentia BPM + musical-key analysis toggle. Mirrors the
 // generateWaveforms pattern above: persist to config.json on disk
 // so the new value survives restart, then mutate config.program
-// in-memory so the *next* scan-task spawn (task-queue.js builds
-// jsonLoad fresh each scan, see :461) picks up the change without
-// waiting for a process restart. Rust-only feature — the JS
-// fallback scanner accepts the field but doesn't run analysis.
+// in-memory so the post-scan audio-analysis pass (gated on this flag
+// in task-queue.js) and its run-time re-check pick up the change
+// without waiting for a process restart. The api route enqueues an
+// immediate pass when this flips on.
 export async function editAnalyzeBpm(val) {
   const loadConfig = await loadFile(config.configFile);
   if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
   loadConfig.scanOptions.analyzeBpm = val;
   await saveFile(loadConfig, config.configFile);
   config.program.scanOptions.analyzeBpm = val;
+}
+
+// Dot-entry ignore toggles (scanOptions.ignoreDotFiles/ignoreDotFolders,
+// default false). Same live pattern: task-queue reads config.program
+// when it builds each scan's jsonLoad, so a flip takes effect on the
+// next scan with no reboot — and the sweep's convergence rule then
+// removes (or a rescan re-adds) the affected rows.
+export async function editIgnoreDotFiles(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
+  loadConfig.scanOptions.ignoreDotFiles = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.scanOptions.ignoreDotFiles = val;
+}
+
+export async function editIgnoreDotFolders(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
+  loadConfig.scanOptions.ignoreDotFolders = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.scanOptions.ignoreDotFolders = val;
+}
+
+// Filesystem-watcher toggle. Persist + in-memory like the others; the
+// API route starts/stops the watchers through dbQueue so the flip is
+// live (no reboot). watcherWait stays config-file-only for now and is
+// read when the watchers (re)start.
+export async function editWatcherEnabled(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
+  loadConfig.scanOptions.watcherEnabled = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.scanOptions.watcherEnabled = val;
+}
+
+// Tracks analysed per essentia pass. Same live-update pattern as
+// editAutoAlbumArtPerRun — the worker reads it fresh when task-queue builds
+// the pass's jsonLoad, so a change takes effect on the next pass with no reboot.
+export async function editAnalyzeBpmPerRun(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
+  loadConfig.scanOptions.analyzeBpmPerRun = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.scanOptions.analyzeBpmPerRun = val;
+}
+
+// BPM estimation method ('multifeature' | 'degara') for the analysis pass.
+// Same live-update pattern as editAnalyzeBpmPerRun — task-queue reads it when
+// it builds the pass's jsonLoad, so it applies on the next pass, no reboot.
+export async function editAnalyzeBpmMethod(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
+  loadConfig.scanOptions.analyzeBpmMethod = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.scanOptions.analyzeBpmMethod = val;
+}
+
+// Mid-track analysis window in seconds (0 = whole file) for the analysis
+// pass. Same live-update pattern as editAnalyzeBpmPerRun.
+export async function editAnalyzeBpmWindowSec(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
+  loadConfig.scanOptions.analyzeBpmWindowSec = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.scanOptions.analyzeBpmWindowSec = val;
+}
+
+// Toggle the AcoustID identification pass (fingerprint → MusicBrainz
+// recording MBID for tag-less tracks). Same live-update pattern as
+// editAnalyzeBpm; the api route enqueues an immediate pass when this
+// flips on.
+export async function editAnalyzeAcoustid(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
+  loadConfig.scanOptions.analyzeAcoustid = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.scanOptions.analyzeAcoustid = val;
+}
+
+// Tracks identified per AcoustID pass — live like editAnalyzeBpmPerRun.
+export async function editAcoustidPerRun(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
+  loadConfig.scanOptions.acoustidPerRun = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.scanOptions.acoustidPerRun = val;
+}
+
+// Music-discovery data collection toggle (the separate discovery.db —
+// src/db/discovery-db.js). Same live-update pattern as editAnalyzeBpm:
+// persist to config.json, then mutate config.program in-memory so no reboot
+// is needed. The api route initializes the discovery DB when this flips on;
+// flipping it off stops future collection but keeps the existing data
+// (deleting {dbDirectory}/discovery.db is the operator's explicit purge).
+export async function editCollectDiscoveryData(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
+  loadConfig.scanOptions.collectDiscoveryData = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.scanOptions.collectDiscoveryData = val;
+}
+
+// Tracks embedded per discovery pass. Same live-update pattern as
+// editAnalyzeBpmPerRun — task-queue reads it fresh when it builds the
+// pass's jsonLoad, so a change takes effect on the next pass, no reboot.
+export async function editDiscoveryPerRun(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
+  loadConfig.scanOptions.discoveryPerRun = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.scanOptions.discoveryPerRun = val;
+}
+
+// Which embedding engine the discovery pass runs (a key into the registry
+// in src/db/discovery-features-lib.js — the route Joi-validates against
+// it). Live: the next pass picks it up and starts re-embedding rows pinned
+// to the previous model, migrating the dataset in place.
+export async function editDiscoveryModel(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
+  loadConfig.scanOptions.discoveryModel = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.scanOptions.discoveryModel = val;
+}
+
+// The blurb our signed catalog announcements carry (discoveryP2p
+// .serverDescription). Live: the api route re-announces after saving, so
+// peers hear the new text within one gossip hop instead of on next reboot.
+export async function editDiscoveryServerDescription(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.discoveryP2p) { loadConfig.discoveryP2p = {}; }
+  loadConfig.discoveryP2p.serverDescription = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.discoveryP2p.serverDescription = val;
+}
+
+// The display name in our signed catalog announcements. Same live +
+// re-announce contract as the description above.
+export async function editDiscoveryServerName(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.discoveryP2p) { loadConfig.discoveryP2p = {}; }
+  loadConfig.discoveryP2p.serverName = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.discoveryP2p.serverName = val;
+}
+
+// Cap (MB) on how much disk fetched peer snapshots may use. Live: the
+// auto-fetch reconciler and the manual fetch route both read it fresh per
+// fetch, so a change applies to the very next download. Lowering it below
+// current usage blocks new fetches but evicts nothing — the operator
+// removes snapshots explicitly from the Discovery page.
+export async function editMaxPeerDbStorageMb(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.discoveryP2p) { loadConfig.discoveryP2p = {}; }
+  loadConfig.discoveryP2p.maxPeerDbStorageMb = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.discoveryP2p.maxPeerDbStorageMb = val;
+}
+
+export async function editAutoFetchCount(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.discoveryP2p) { loadConfig.discoveryP2p = {}; }
+  loadConfig.discoveryP2p.autoFetchCount = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.discoveryP2p.autoFetchCount = val;
+}
+
+export async function editRotationDays(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.discoveryP2p) { loadConfig.discoveryP2p = {}; }
+  loadConfig.discoveryP2p.rotationDays = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.discoveryP2p.rotationDays = val;
+}
+
+// Append a bootstrap peer (deduplicated) so a friend joined through the
+// UI survives restarts — the join RPC itself is session-only.
+export async function editAddBootstrapPeer(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.discoveryP2p) { loadConfig.discoveryP2p = {}; }
+  const list = loadConfig.discoveryP2p.bootstrapPeers || [];
+  if (!list.includes(val)) { list.push(val); }
+  loadConfig.discoveryP2p.bootstrapPeers = list;
+  await saveFile(loadConfig, config.configFile);
+  config.program.discoveryP2p.bootstrapPeers = list;
+}
+
+// The abuse lever, runtime edition. Live everywhere it matters: record()
+// checks the list per announcement, fetch/holds paths per call, and the
+// hourly prune drops any lingering entry — no restart, no stack bounce.
+export async function editAddBlockedPeer(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.discoveryP2p) { loadConfig.discoveryP2p = {}; }
+  const list = loadConfig.discoveryP2p.blockedPeers || [];
+  if (!list.includes(val)) { list.push(val); }
+  loadConfig.discoveryP2p.blockedPeers = list;
+  await saveFile(loadConfig, config.configFile);
+  config.program.discoveryP2p.blockedPeers = list;
+}
+
+export async function editRemoveBlockedPeer(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.discoveryP2p) { loadConfig.discoveryP2p = {}; }
+  const list = (loadConfig.discoveryP2p.blockedPeers || []).filter((p) => p !== val);
+  loadConfig.discoveryP2p.blockedPeers = list;
+  await saveFile(loadConfig, config.configFile);
+  config.program.discoveryP2p.blockedPeers = list;
+}
+
+// Days a silent catalog peer is kept before the hourly prune pass forgets
+// it (0 = keep forever). Live: pruneStalePeers reads the config fresh on
+// every pass, so the next pass honors the new value — no restart.
+export async function editPeerRetentionDays(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.discoveryP2p) { loadConfig.discoveryP2p = {}; }
+  loadConfig.discoveryP2p.peerRetentionDays = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.discoveryP2p.peerRetentionDays = val;
+}
+
+// The p2p master switch. Persisting the flag is all this does — the api
+// route owns starting/stopping the runtime stack (and rolls this back if
+// the stack fails to come up), so the config file never claims a state the
+// process didn't reach.
+export async function editDiscoveryP2pEnabled(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.discoveryP2p) { loadConfig.discoveryP2p = {}; }
+  loadConfig.discoveryP2p.enabled = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.discoveryP2p.enabled = val;
 }
 
 export async function editAutoAlbumArt(val) {
@@ -485,6 +831,36 @@ export async function editAlbumArtServices(val) {
   config.program.scanOptions.albumArtServices = val;
 }
 
+// Lyrics backfill knobs live under config.lyrics (not scanOptions).
+// Both are LIVE — the backfill worker reads them fresh per pass, so no
+// reboot is needed.
+export async function editLyricsBackfill(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.lyrics) { loadConfig.lyrics = {}; }
+  loadConfig.lyrics.backfill = val;
+  await saveFile(loadConfig, config.configFile);
+  if (!config.program.lyrics) { config.program.lyrics = {}; }
+  config.program.lyrics.backfill = val;
+}
+
+export async function editLyricsProviders(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.lyrics) { loadConfig.lyrics = {}; }
+  loadConfig.lyrics.providers = val;
+  await saveFile(loadConfig, config.configFile);
+  if (!config.program.lyrics) { config.program.lyrics = {}; }
+  config.program.lyrics.providers = val;
+}
+
+export async function editLyricsWriteSidecar(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.lyrics) { loadConfig.lyrics = {}; }
+  loadConfig.lyrics.writeSidecar = val;
+  await saveFile(loadConfig, config.configFile);
+  if (!config.program.lyrics) { config.program.lyrics = {}; }
+  config.program.lyrics.writeSidecar = val;
+}
+
 export async function editWriteLogs(val) {
   const loadConfig = await loadFile(config.configFile);
   loadConfig.writeLogs = val;
@@ -532,6 +908,32 @@ export async function editAutoUpdate(val) {
   await saveFile(loadConfig, config.configFile);
   config.program.transcode.autoUpdate = val;
 }
+
+// Release auto-update settings (util/update-check.js). Same live-effect
+// contract as editAutoUpdate above: the checker reads config.program.updates
+// at each firing, so no reboot is needed. Written through updateJsonAtomic —
+// the read and the write are ONE serialized step, so a settings POST racing
+// any other config save can't resurrect the document it read before that
+// save landed (the plain load-then-save shape loses that race).
+async function editUpdatesField(field, val) {
+  await updateJsonAtomic(config.configFile, (doc) => {
+    // updateJsonAtomic hands us null for ANY read failure — absent file,
+    // but also a transiently locked or momentarily unparsable one. The
+    // config file always exists on a booted server, so null here means
+    // "could not read it": throwing 500s the settings POST and leaves the
+    // file intact, instead of replacing the operator's whole config with
+    // just an updates block.
+    if (doc === null) { throw new Error('config file unreadable - not overwriting it'); }
+    if (!doc.updates) { doc.updates = {}; }
+    doc.updates[field] = val;
+    return doc;
+  });
+  config.program.updates[field] = val;
+}
+
+export function editUpdatesCheck(val) { return editUpdatesField('check', val); }
+export function editUpdatesMode(val) { return editUpdatesField('mode', val); }
+export function editUpdatesSkipVersion(val) { return editUpdatesField('skipVersion', val); }
 
 // Set the SQLite synchronous mode for the main DB connection (FULL | NORMAL).
 // Persisted to config and applied to the live connection immediately —
@@ -597,7 +999,7 @@ export async function editAdminAccess({ mode, whitelist }) {
   config.program.adminAccess.mode = mode;
   if (whitelist !== undefined) { config.program.adminAccess.whitelist = whitelist; }
   // Keep the derived legacy flag in lockstep — every reader of lockAdmin
-  // (auth.js, server.js, admin.js, federation.js) depends on this.
+  // (auth.js, server.js, admin.js) depends on this.
   config.program.lockAdmin = (mode === 'none');
   // The whitelist BlockList is cached in admin-network.js; rebuild it.
   invalidateWhitelistCache();
@@ -719,18 +1121,6 @@ export async function enableSubsonic(mode, port) {
   if (mode === 'separate-port') { subsonicServer.start(); }
 }
 
-// Federation toggle disabled — see the syncthing import above.
-// Re-enable along with the syncthing import + the API endpoint in
-// src/api/admin.js when federation comes back.
-// export async function enableFederation(val) {
-//   const loadConfig = await loadFile(config.configFile);
-//   if (!loadConfig.federation) { loadConfig.federation = {}; }
-//   loadConfig.federation.enabled = val;
-//   await saveFile(loadConfig, config.configFile);
-//   config.program.federation.enabled = val;
-//   syncthing.setup();
-// }
-
 export async function removeSSL() {
   const loadConfig = await loadFile(config.configFile);
   delete loadConfig.ssl;
@@ -741,7 +1131,16 @@ export async function removeSSL() {
 
 function testSSL(jsonLoad) {
   return new Promise((resolve, reject) => {
-    launchWorker('ssl-test', path.join(__dirname, './ssl-test.js'), JSON.stringify(jsonLoad)).on('close', (code) => {
+    const worker = launchWorker('ssl-test', path.join(__dirname, './ssl-test.js'), JSON.stringify(jsonLoad));
+    // A spawn that fails asynchronously (EMFILE/ENOMEM/exec policy) emits
+    // 'error' and never 'close'. Unhandled, that's an EventEmitter throw
+    // that takes the whole server down — and this promise would hang
+    // regardless. Every task-queue worker guards this; these sites didn't.
+    worker.on('error', (err) => {
+      winston.error(`SSL test worker failed to start: ${err.message}`);
+      reject('SSL Failure');
+    });
+    worker.on('close', (code) => {
       if (code !== 0) { return reject('SSL Failure'); }
       resolve();
     });

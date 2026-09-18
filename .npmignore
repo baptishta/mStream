@@ -1,0 +1,113 @@
+# npm pack exclusions. This file exists for ONE divergence from .gitignore:
+# the CI-committed tray-launcher binaries (bin/rust-launcher/*) must ship in
+# the release bundles but NOT in the npm tarball — nothing in the npm code
+# path (cli-boot-wrapper.js, src/**) ever spawns them, and the four of them
+# add ~20MB to every `npm i mstream`. npm only consults .gitignore when no
+# .npmignore exists, so everything below must stay a mirror of .gitignore
+# (minus the launcher negations); if you change one file, change the other.
+# The rust-parser negations are load-bearing: the npm server DOES spawn
+# it at runtime. (mstream-player and the p2p sidecar are fetched on first
+# use instead — only their pin manifests ship.)
+
+node_modules/*
+# build-bun.yml installs the VersionInfo stamper (resedit) here on the win-x64 leg
+scripts/node_modules/
+webapp/node_modules/*
+
+image-cache/*
+!image-cache/README.md
+
+save/sync/*
+!save/sync/README.md
+
+save/logs/*
+!save/logs/README.md
+
+save/conf/*
+!save/conf/README.md
+
+save/sync-cdn/*
+!save/sync-cdn/README.md
+
+bin/ffmpeg/*
+!bin/ffmpeg/README.md
+
+bin/rust-parser/*
+!bin/rust-parser/README.md
+!bin/rust-parser/rust-parser-*
+!bin/rust-parser/.source-tree
+!bin/rust-parser/.source-tree-musl
+
+# The whole launcher directory stays out of the tarball (binaries AND the
+# CI provenance stamp) — release bundles get them via scripts/build-bun.mjs.
+bin/rust-launcher/
+
+# mstream-player binaries are fetched on first use from the player repo's
+# release assets, sha256-pinned by the committed manifest — only the pins
+# and the README ship in the tarball.
+bin/mstream-player/*
+!bin/mstream-player/README.md
+!bin/mstream-player/manifest.json
+
+# p2p-sidecar binaries are fetched on first use from the sidecar repo's
+# release assets, sha256-pinned by the committed manifests below — they must
+# never ride the npm tarball again (they were 179 MB of its 284 MB unpacked,
+# for a default-off feature). The manifests DO ship: they're what the fetch
+# verifies against.
+bin/p2p-sidecar/*
+!bin/p2p-sidecar/README.md
+!bin/p2p-sidecar/manifest.json
+!bin/p2p-sidecar/manifest-musl.json
+
+save/*.json
+
+.DS_Store
+.vscode/*
+
+*.log
+*.db
+*.db-wal
+*.db-shm
+.migrated-from-loki
+.instance-nonce
+frp/*.ini
+
+dist/*
+webapp/dist/*
+
+bun.lock
+
+.env
+
+rust-parser/target/
+rust-launcher/target/
+# Nested sidecar-repo clone (dev loop) — never ships in the tarball.
+# Anchored: unanchored it would also swallow bin/p2p-sidecar/'s manifests
+# (same pitfall as .gitignore — see there).
+/p2p-sidecar/
+/mstream-terminal-player/
+
+save/waveforms/*
+!save/waveforms/README.md
+
+waveform-cache/*
+!waveform-cache/README.md
+
+test/fixtures/music/
+
+save/library-*/
+save/db-*-smoke/
+save/image-cache-*-smoke/
+save/waveform-cache-*-smoke/
+save/logs-*-smoke/
+save/image-cache-smoke/
+save/waveform-cache-smoke/
+
+.claude/*
+
+/TODO.md
+
+docs/api.html
+model-cache/
+
+.*.bun-build

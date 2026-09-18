@@ -3,22 +3,82 @@ import path from 'path';
 import crypto from 'crypto';
 import Joi from 'joi';
 import winston from 'winston';
-import { appRoot } from '../util/esm-helpers.js';
+import { appRoot, dataRoot } from '../util/esm-helpers.js';
 import { getTransCodecs, getTransBitrates } from '../api/transcode.js';
 import { CLIENT_TYPE, ENABLED_FOR } from '../torrent/constants.js';
+import { EMBEDDING_MODELS, DEFAULT_EMBEDDING_MODEL, RETIRED_EMBEDDING_MODELS }
+  from '../db/discovery-features-lib.js';
+
+// Writable state hangs off dataRoot, not appRoot: they are the same directory
+// unless the app itself is read-only (a translocated/quarantined macOS .app —
+// see resolveDataRoot in util/esm-helpers.js). Shipped assets below (ffmpeg,
+// rpn, webapp) stay on appRoot, which is where they actually ship.
+const DEFAULT_DB_DIRECTORY = path.join(dataRoot, 'save/db');
+
+/**
+ * Default for storage.modelCacheDirectory when the config doesn't set it:
+ * a SIBLING of the (resolved or default) dbDirectory. The previous default,
+ * appRoot/model-cache, broke every container image whose config template
+ * points storage at a writable mount but predates this key — the app dir is
+ * root-owned there (e.g. linuxserver.io's /app/mstream under PUID), so the
+ * first embed run died with EACCES. dbDirectory is writable by construction
+ * (the server can't boot otherwise), and container templates keep all
+ * storage dirs siblings under one mount (/config/db, /config/album-art,
+ * ...), so its parent is the right home: /config/db → /config/model-cache.
+ * There is deliberately NO migration from the old default: the cache holds
+ * only sha256-pinned re-downloadable weights (~18 MB EffNet) — embeddings
+ * live in discovery.db, keyed by model, so nothing is rebuilt. The next
+ * pass re-fetches into the derived location; a leftover appRoot/model-cache
+ * is unused and safe to delete.
+ * Exported for tests.
+ */
+export function deriveModelCacheDirectory(dbDirectory) {
+  return path.join(path.dirname(dbDirectory || DEFAULT_DB_DIRECTORY), 'model-cache');
+}
 
 const storageJoi = Joi.object({
-  albumArtDirectory: Joi.string().default(path.join(appRoot, 'image-cache')),
-  dbDirectory: Joi.string().default(path.join(appRoot, 'save/db')),
-  logsDirectory: Joi.string().default(path.join(appRoot, 'save/logs')),
-  syncConfigDirectory:  Joi.string().default(path.join(appRoot, 'save/sync')),
-  waveformCacheDirectory: Joi.string().default(path.join(appRoot, 'waveform-cache')),
+  albumArtDirectory: Joi.string().default(path.join(dataRoot, 'image-cache')),
+  dbDirectory: Joi.string().default(DEFAULT_DB_DIRECTORY),
+  logsDirectory: Joi.string().default(path.join(dataRoot, 'save/logs')),
+  waveformCacheDirectory: Joi.string().default(path.join(dataRoot, 'waveform-cache')),
+  // Where ML model weights download/cache (currently just the discovery
+  // embedding model, ~18 MB EffNet). Deliberately OUTSIDE node_modules: the
+  // ML runtimes default to a cache in there, and every update/reinstall
+  // would silently re-download. Defaults next to dbDirectory (see
+  // deriveModelCacheDirectory above).
+  modelCacheDirectory: Joi.string().default((parent) => deriveModelCacheDirectory(parent && parent.dbDirectory)),
 });
 
 const scanOptions = Joi.object({
   skipImg: Joi.boolean().default(false),
   scanInterval: Joi.number().min(0).default(24),
   bootScanDelay: Joi.number().default(3),
+  // Skip dot-hidden entries during the scan walk: ignoreDotFiles covers
+  // files (.hidden.mp3), ignoreDotFolders covers directories
+  // (.hiddenalbum/). "Dot-hidden" means a SINGLE leading dot — names
+  // starting with '..' ('..WeirdAlbum') are ordinary names that stay
+  // indexed. Separate from these flags, both scanners ALWAYS prune a
+  // hardcoded NAS-recycle/system-dir blocklist ($RECYCLE.BIN, #recycle,
+  // @Recycle, #snapshot, .git, System Volume Information, ...) — see
+  // src/db/scan-ignore.js. The stale sweep applies the same predicate,
+  // so flipping a flag converges already-indexed rows out of (or a
+  // rescan brings them back into) the index on the next scan.
+  // Default OFF: an upgrade must not silently delete dot-named tracks
+  // users already have indexed — opting in is an admin toggle
+  // (/api/v1/admin/db/params/ignore-dot-*).
+  ignoreDotFiles: Joi.boolean().default(false),
+  ignoreDotFolders: Joi.boolean().default(false),
+  // Filesystem watcher: near-instant targeted scans when library files
+  // change (src/util/library-watcher.js). Default OFF (opt-in): change
+  // events don't fire on most CIFS/NFS mounts, so the scanInterval loop
+  // stays the delivery mechanism there — the watcher is an accelerator
+  // for local disks, never a replacement. watcherWait is the debounce in
+  // seconds: events coalesce until the library has been quiet that long
+  // (a torrent writing 200 files becomes one subtree scan), tripled
+  // while a scan is already running. Applied when the watcher (re)starts
+  // — boot, reboot, or the admin toggle.
+  watcherEnabled: Joi.boolean().default(false),
+  watcherWait: Joi.number().integer().min(1).max(600).default(10),
   compressImage: Joi.boolean().default(true),
   // Tracks scanned per SQLite COMMIT — also gates how often the scanner
   // emits progress updates. Lower = more responsive UI + shorter
@@ -62,14 +122,93 @@ const scanOptions = Joi.object({
   // has no Opus decoder) — a few hundred ms of latency the first
   // time each track's waveform is requested.
   generateWaveforms: Joi.boolean().default(true),
-  // DEPRECATED — accepted but currently a no-op. Scan-time BPM/key
-  // ANALYSIS (stratum-dsp) was removed along with scan-time decode;
-  // analysis returns as the separate essentia enrichment scanner.
-  // Tag-sourced BPM/key (TBPM / TKEY etc.) is always read during the
-  // scan regardless of this flag, and existing analysis-derived rows
-  // keep their values. The flag is still sent to scanners so a stale
-  // prebuilt rust binary (pre-split) honours it until CI rebuilds.
-  analyzeBpm: Joi.boolean().default(false),
+  // Run the post-scan essentia BPM/key analysis pass (src/db/audio-analysis-
+  // backfill.mjs): decode each tag-less track via ffmpeg and estimate tempo +
+  // musical key, filling tracks.bpm / musical_key (bpm_source='essentia') for
+  // the Auto-DJ continuity/harmonic-mixing waterfall. Tag-sourced BPM/key
+  // (TBPM / TKEY etc.) is read during the scan regardless of this flag and is
+  // never overwritten by the pass. The flag is also still sent to the scanners
+  // so a stale prebuilt rust binary (pre-split) honours its own no-op handling
+  // until CI rebuilds.
+  //
+  // Default ON so Auto-DJ's harmonic/tempo mixing works out of the box. The
+  // pass is CPU-heavy (a full decode + analysis per track) but self-bounds:
+  // analyzeBpmPerRun tracks per batch, a wall-clock budget, and it re-enqueues
+  // while a backlog remains, yielding the task slot between batches. ⚠ It pulls
+  // in essentia.js (AGPL-3.0) — already a bundled dependency, but this makes it
+  // run by default; set false to skip the pass entirely (e.g. on very weak
+  // hardware or to avoid exercising the AGPL code path).
+  analyzeBpm: Joi.boolean().default(true),
+  // Tracks analysed per pass. Each holds the serial task slot while it decodes
+  // + analyses (seconds per track), so the worker also caps wall-clock at its
+  // runBudget and re-enqueues while a backlog remains — this just bounds one
+  // batch. Mirrors autoAlbumArtPerRun.
+  analyzeBpmPerRun: Joi.number().integer().min(1).max(10000).default(200),
+  // BPM estimation method (RhythmExtractor2013). 'multifeature' (default) is
+  // the committee estimator: most accurate and the only method that emits the
+  // confidence the pass gates on — but ~6× the CPU of 'degara'. 'degara' is
+  // the fast mode for large libraries / weak hardware; it has no confidence
+  // output, so every in-range estimate is written.
+  analyzeBpmMethod: Joi.string().valid('multifeature', 'degara').default('multifeature'),
+  // Seconds of audio analysed per track, decoded from the MIDDLE of the file
+  // (BPM and key both run on this window). Published tempo/key benchmarks use
+  // 30 s excerpts, so the 60 s default is a 2× margin — and a mid-track window
+  // skips intros/outros. 0 = whole-file mode (the head, up to the worker's
+  // 600 s cap): the pre-window behaviour, several times slower.
+  analyzeBpmWindowSec: Joi.alternatives().try(
+    Joi.number().integer().min(30).max(600),
+    Joi.number().valid(0),
+  ).default(60),
+  // AcoustID identification: fingerprint tracks with no MusicBrainz
+  // recording MBID (rust-parser --fingerprint, chromaprint) and resolve
+  // them via api.acoustid.org into tracks.mbz_recording_id / acoustid_id
+  // (mbz_id_source='acoustid'; tag-sourced ids are never overwritten).
+  // Default OFF: opt-in by design — it sends acoustic fingerprints of the
+  // library to an external service.
+  analyzeAcoustid: Joi.boolean().default(false),
+  // Tracks identified per pass. Network-bound (one rate-limited API request
+  // each, ~3/s); the worker also caps wall-clock at its runBudget and
+  // re-enqueues while a backlog remains.
+  acoustidPerRun: Joi.number().integer().min(1).max(10000).default(200),
+  // The AcoustID application key. Client app keys are not secrets (the
+  // Picard convention) — the mStream project key ships as the default;
+  // forks register their own at acoustid.org/new-application.
+  acoustidApiKey: Joi.string().allow('').default('BOJOtheMHU'),
+  // Lookup endpoint — overridable so tests can stub the service. Not an
+  // admin surface.
+  acoustidApiUrl: Joi.string().uri().default('https://api.acoustid.org/v2/lookup'),
+  // Collect per-track music-discovery data (audio embeddings + external IDs
+  // + filter metadata) into the SEPARATE discovery.db (src/db/discovery-db.js)
+  // — deliberately isolated from mstream.db so the dataset stays a single
+  // shareable/deletable file (see discovery-export.js). Gates DB creation,
+  // the admin export surface, the LOCAL similarity APIs (/api/v1/discovery/
+  // local/*, the Discover panel, Auto-DJ sonic mode), and the post-scan
+  // embedding worker (discovery-backfill.mjs) that fills the DB once a scan
+  // finishes.
+  //
+  // Default ON. This is LOCAL analysis only — nothing leaves the machine;
+  // PUBLISHING a snapshot to the discovery network is a separate opt-in
+  // (discoveryP2p.enabled, still default OFF), so a fresh install gets the
+  // local recommendation features without ever exposing its library. The
+  // pass is CPU-heavy but bounded (discoveryPerRun tracks per batch,
+  // re-enqueued while a backlog remains) and downloads its model weights
+  // once (~18 MB EffNet). Where the ML runtime is unavailable (onnxruntime
+  // missing, or a musl system without a working glibc compat layer) the
+  // worker degrades once, loudly, and stops. Set false to skip discovery
+  // collection entirely.
+  collectDiscoveryData: Joi.boolean().default(true),
+  // Which embedding engine the discovery pass runs — a key into the model
+  // registry in src/db/discovery-features-lib.js. Deliberately swappable:
+  // rows are pinned per-model and the worker re-embeds rows whose pin
+  // differs, so changing this migrates the dataset in place over the next
+  // passes. Real models download their weights on first use (into
+  // storage.modelCacheDirectory).
+  discoveryModel: Joi.string().valid(...Object.keys(EMBEDDING_MODELS)).default(DEFAULT_EMBEDDING_MODEL),
+  // Tracks embedded per pass. Each decode+inference takes seconds and holds
+  // the serial task slot, so the worker also caps wall-clock at its
+  // runBudget and re-enqueues while a backlog remains — this just bounds
+  // one batch. Mirrors analyzeBpmPerRun.
+  discoveryPerRun: Joi.number().integer().min(1).max(10000).default(50),
   autoAlbumArt: Joi.boolean().default(true),
   // What the post-scan album-art downloader targets. 'missing' (default):
   // only albums with no cover at all — the fill-in-the-blanks pass.
@@ -152,8 +291,8 @@ const compressionOptions = Joi.object({
 //                 405 on the admin API, /admin page disabled, public-mode
 //                 write perms demoted. config.program.lockAdmin is DERIVED
 //                 from this value in setup() so every existing reader of
-//                 lockAdmin (auth.js, server.js, admin.js, federation.js)
-//                 keeps working unchanged.
+//                 lockAdmin (auth.js, server.js, admin.js) keeps working
+//                 unchanged.
 //   'localhost' — reachable only from loopback IPs (127.0.0.0/8 + ::1).
 //   'whitelist' — reachable only from IPs/CIDRs in `whitelist`.
 // `whitelist` accepts single IPs ('127.0.0.1') or CIDRs ('192.168.0.0/16');
@@ -180,15 +319,43 @@ const adminAccessOptions = Joi.object({
 });
 
 const transcodeOptions = Joi.object({
-  ffmpegDirectory: Joi.string().default(path.join(appRoot, 'bin/ffmpeg')),
+  // dataRoot, not appRoot: nothing ships ffmpeg inside the bundle — this is the
+  // directory mStream DOWNLOADS into and auto-updates, so it has to be
+  // writable. Must stay in step with BUNDLED_FFMPEG_DIR in
+  // util/ffmpeg-bootstrap.js, which compares against it to tell "the install we
+  // manage" from "a custom directory the user pointed us at".
+  ffmpegDirectory: Joi.string().default(path.join(dataRoot, 'bin/ffmpeg')),
   defaultCodec: Joi.string().valid(...getTransCodecs()).default('opus'),
   defaultBitrate: Joi.string().valid(...getTransBitrates()).default('96k'),
-  // Auto-update the managed ffmpeg build (BtbN on Linux/Windows, martin-riedl
-  // on macOS) on a weekly check. Default on so codec/security fixes land
-  // without operator action. Set false to pin the current binary — useful when
-  // a rolling upstream build regresses, or for air-gapped / reproducible
+  // Refresh the managed ffmpeg build when the committed pins change
+  // (bin/ffmpeg/manifest.json — the check is local, no upstream polling).
+  // Default on so codec/security fixes shipped as manifest bumps land without
+  // operator action. Set false to freeze the current binary even across pin
+  // changes — useful when a build regresses, or for air-gapped / reproducible
   // installs. No effect when running off system ffmpeg (managed by the OS).
   autoUpdate: Joi.boolean().default(true)
+});
+
+const updatesOptions = Joi.object({
+  // Daily poll of the release feed (manifest.json on the latest GitHub
+  // release; MSTREAM_RELEASE_BASE overrides it, exactly as for the install
+  // scripts). false = never phone home - the admin "Check now" button still
+  // works, it is only the schedule that stops.
+  check: Joi.boolean().default(true),
+  // notify: report only, download nothing until a human clicks.
+  // stage (default): background-download the new version - managed installs
+  //   stage it behind $ROOT/current, Windows setup.exe installs download the
+  //   verified installer - but applying still takes a restart or a click.
+  // auto: additionally apply when the server is idle (no busy connections,
+  //   no scan): under the tray launcher by asking it to restart into the
+  //   staged version; headless by exiting 0, which expects a process
+  //   supervisor (systemd/pm2) configured to start mStream again.
+  mode: Joi.string().valid('notify', 'stage', 'auto').default('stage'),
+  // Hold one version back: report it, never stage or apply it. The
+  // companion of a manual rollback (docs/install.md) — without it the next
+  // daily check would silently re-stage the very release the operator just
+  // backed out of. Cleared (set '') to resume normal updates.
+  skipVersion: Joi.string().pattern(/^\d+\.\d+\.\d+$/).allow('').default(''),
 });
 
 const rpnOptions = Joi.object({
@@ -210,12 +377,6 @@ const discogsOptions = Joi.object({
   allowArtUpdate: Joi.boolean().default(false),
   apiKey: Joi.string().allow('').default(''),
   apiSecret: Joi.string().allow('').default(''),
-});
-
-const federationOptions = Joi.object({
-  enabled: Joi.boolean().default(false),
-  folder: Joi.string().optional(),
-  federateUsersMode: Joi.boolean().default(false),
 });
 
 // Iroh P2P remote-access tunnel. When enabled, mStream binds an Iroh endpoint
@@ -247,17 +408,144 @@ const irohOptions = Joi.object({
   shareCodePublic: Joi.boolean().default(false),
 });
 
+// Federation: ticket-paired read-only library sharing between mStream servers
+// over a dedicated iroh endpoint (ALPN mstream/federation/1). A THIRD iroh
+// persona, independent of the `iroh` tunnel above and the discovery sidecar —
+// its own secretKey, so the three EndpointIds stay unlinkable and each feature
+// toggles on its own. No discovery/gossip: pairing is ticket-swap only.
+//   secretKey  — base64 of 32 random bytes; the federation endpoint's identity.
+//                Auto-generated once and persisted (same precedent as the
+//                iroh block). Losing it changes the EndpointId and breaks
+//                every previously-issued federation ticket.
+//   serverName — display name embedded in minted tickets so the friend's
+//                add-peer UI can label this server; '' falls back to
+//                os.hostname() at mint time.
+// Default bandwidth limits for newly minted federation keys (0 = unlimited).
+// These only PRE-FILL the mint dialog — the actual limits live per key in
+// federation_keys, so editing these never changes an already-minted key.
+// Defaults are sized for "a friend streaming music": 8 Mbps is comfortable
+// FLAC + seeking headroom, 2 GB/day and 3 concurrent streams are hostile to
+// bulk mirroring without getting in the way of listening.
+const federationLimitsOptions = Joi.object({
+  streamKbps: Joi.number().integer().min(0).max(10000000).default(8000),
+  dailyMb: Joi.number().integer().min(0).max(100000000).default(2048),
+  maxStreams: Joi.number().integer().min(0).max(1000).default(3),
+});
+
+const federationOptions = Joi.object({
+  enabled: Joi.boolean().default(false),
+  secretKey: Joi.string().optional(),
+  serverName: Joi.string().max(64).allow('').default(''),
+  limits: federationLimitsOptions.default(federationLimitsOptions.validate({}).value),
+});
+
+// The music-discovery P2P layer (p2p-sidecar: iroh-blobs snapshot sharing
+// now, the gossip catalog next phase). Distinct from `iroh` above — that's
+// the remote-access tunnel with its own keypair; the sidecar keeps a
+// separate identity at {dbDirectory}/discovery-p2p/identity.key so the two
+// personas stay unlinkable. Default OFF: sharing a discovery snapshot
+// publishes library metadata to whoever holds the ticket, so it's opt-in
+// (and useless anyway until collectDiscoveryData has built a dataset).
+const discoveryP2pOptions = Joi.object({
+  enabled: Joi.boolean().default(false),
+  // Catalog-topic bootstrap: endpoint tickets (from a friend's status route —
+  // dialable with zero external discovery) and/or bare endpoint ids (resolved
+  // via n0 DNS). Empty = this server waits to BE bootstrapped (it still joins
+  // the topic so peers holding OUR ticket can find the mesh through us).
+  bootstrapPeers: Joi.array().items(Joi.string().min(16).max(4096)).default([]),
+  // Display name carried in our signed catalog announcements. Pipe is
+  // reserved as the announcement signing-string separator.
+  serverName: Joi.string().max(64).pattern(/^[^|]*$/).default('mStream'),
+  // Operator-written blurb carried alongside the name so users browsing the
+  // catalog can tell which DB is worth downloading. 180-char abuse cap; no
+  // pipe (signing separator) or control chars — the sidecar enforces the
+  // same rules and would refuse to announce otherwise.
+  serverDescription: Joi.string().allow('').max(180).pattern(/^[^|\p{Cc}]*$/u).default(''),
+  // Auto-fetch: keep a local shelf of the most useful catalog peers'
+  // snapshots (model-compatible first, then online, then biggest) and
+  // refresh a copy when its announced monotonic snapshotSeq moves ahead.
+  // On by default WITHIN the opt-in feature: downloading metadata-only
+  // snapshots is the product working. The count is admin-editable live
+  // (POST /api/v1/admin/discovery/p2p/auto-fetch-count); the storage cap
+  // below still applies — the shelf stops at whichever limit hits first.
+  autoFetch: Joi.boolean().default(true),
+  autoFetchCount: Joi.number().integer().min(0).max(50).default(6),
+  maxPeerDbStorageMb: Joi.number().integer().min(10).max(100000).default(500),
+  // Sidecar memory watchdog: when the p2p-sidecar's resident set exceeds
+  // this many MB, the mesh-health watch kills it and lets crash recovery
+  // replay the stack — a planned ~6s blip with a loud log line, instead of
+  // the container's OOM killer choosing a victim hours later (the #880
+  // outage: a leaking sidecar quietly out-grew the entire server on a
+  // ~102-hour fuse). A healthy sidecar sits at 20–30MB, so the default is
+  // ~10x headroom. 0 disables the watchdog (rotationDays' 0=off
+  // convention). Deliberately no minimum above that: tests force a breach
+  // by setting it to 1, and an operator picking a too-small ceiling gets a
+  // visible restart-per-watch-tick, not a silent failure.
+  sidecarMaxRssMb: Joi.number().integer().min(0).max(100000).default(256),
+  // Rotation: once a full shelf's snapshot has been held this many days,
+  // the hourly pass may SWAP it (never just drop it) for a catalog peer we
+  // don't hold yet, so network suggestions cycle instead of freezing on
+  // the first peers ever heard. 0 = off. Pinned entries (admin manual
+  // downloads, or the per-peer Pin action) are never rotated. Live-editable
+  // (POST /api/v1/admin/discovery/p2p/rotation).
+  rotationDays: Joi.number().integer().min(0).max(3650).default(7),
+  // Auto-forget: drop a catalog entry once the peer hasn't been heard from in
+  // this many days (0 = keep forever). Peers whose snapshot is on the local
+  // shelf are exempt — forgetting them would orphan the downloaded file
+  // invisibly. See discovery-catalog.pruneStalePeers for the guardrails.
+  peerRetentionDays: Joi.number().integer().min(0).max(3650).default(30),
+  // Endpoint ids whose announcements are ignored and whose snapshots are
+  // never fetched — the v1 spam/abuse lever.
+  blockedPeers: Joi.array().items(Joi.string().hex().length(64)).default([]),
+  // Community seed nodes: well-known always-on mesh members whose tickets
+  // ship with mStream (baked defaults + the remote list below), so a fresh
+  // server joins the PUBLIC discovery network with zero manual peer
+  // exchange — the Bitcoin DNS-seeds model. Default ON because discoveryP2p
+  // itself is the opt-in: enabling the feature means joining the network.
+  // Off = only your own bootstrapPeers are used (friend-to-friend mode).
+  useCommunitySeeds: Joi.boolean().default(true),
+  // Where the updatable seed list lives (rotating seeds = a commit to the
+  // mStream repo, no release needed). Fetched at most ~daily, cached at
+  // {dbDirectory}/discovery-p2p/seeds-cache.json, and every failure falls
+  // back cache → baked defaults — boot never depends on this URL.
+  seedListUrl: Joi.string().uri().default(
+    'https://raw.githubusercontent.com/IrosTheBeggar/mStream/master/seeds/discovery-seeds.json'),
+});
+
 const dlnaOptions = Joi.object({
   mode: Joi.string().valid('disabled', 'same-port', 'separate-port').default('disabled'),
   name: Joi.string().default('mStream Music'),
   uuid: Joi.string().optional(),
   port: Joi.number().integer().min(1).max(65535).default(3011),
   browse: Joi.string().valid('flat', 'dirs', 'artist', 'album', 'genre').default('dirs'),
+  // The DLNA control surface is unauthenticated, but the smart containers
+  // (Recently Played / Most Played / Favorites) and Playlists aggregate data
+  // across ALL user accounts. Default true preserves the single-user/family
+  // behaviour; set false on multi-user servers to hide those per-user surfaces
+  // so anyone on the network can't read everyone's history, ratings, and lists.
+  shareUserData: Joi.boolean().default(true),
 });
 
 const subsonicOptions = Joi.object({
   mode: Joi.string().valid('disabled', 'same-port', 'separate-port').default('disabled'),
   port: Joi.number().integer().min(1).max(65535).default(3012),
+});
+
+// LAN service discovery. Advertises the API as a `_mstream._tcp` mDNS/DNS-SD
+// service so zero-config clients (the portable mStream player) can find the
+// server without typing an IP. Advertise-only: it exposes metadata, not the
+// library, and touches no routes or auth.
+//   name       — friendly instance name shown to clients. Empty => os.hostname().
+//   instanceId — stable id (dedupe across IP changes, device-registry later).
+//                Auto-generated + persisted on first boot, like dlna.uuid.
+const mdnsOptions = Joi.object({
+  enabled: Joi.boolean().default(true),
+  name: Joi.string().allow('').default(''),
+  instanceId: Joi.string().optional(),
+});
+
+const discoveryOptions = Joi.object({
+  mdns: mdnsOptions.default(mdnsOptions.validate({}).value),
 });
 
 // Torrent client integration. v1 supports exactly two states for
@@ -327,36 +615,30 @@ const torrentOptions = Joi.object({
   deluge:       delugeCredsOptions.default(delugeCredsOptions.validate({}).value),
 });
 
-// External lyrics lookup via LRCLib (https://lrclib.net). Opt-in
-// because it sends `{artist, title, duration}` for every cache-miss
-// track over the public internet — operators who run mStream for
-// privacy reasons want that off by default. When `lrclib=false` the
-// cache table stays empty; handlers serve only embedded + sidecar
-// lyrics (Phase 2 behaviour).
+// Lyrics config. Two historically-distinct paths share this block:
 //
-// TTLs are how long a cached row is considered fresh. After the TTL
-// elapses, the next request re-enqueues a fetch (the stale row
-// continues to be served in the meantime so we never regress from
-// "had lyrics" to "empty" on a single network blip).
-//   cacheTtlHitsMs   — successful fetches. 7 days: LRCLib corrections
-//                      eventually propagate; long enough to be quiet.
-//   cacheTtlMissesMs — "no lyrics found" responses. 1 day: new tracks
-//                      get indexed on LRCLib over weeks, so a same-
-//                      day re-check isn't useful.
-//   cacheTtlErrorsMs — network/timeout/5xx. 1 hour: transient failures
-//                      shouldn't burn a full day of no-retry.
-//   concurrency      — in-flight fetches cap. LRCLib is generous but
-//                      a fresh-scan burst shouldn't spam them.
+//   * Reactive LRCLib cache (DEPRECATED) — the original on-demand
+//     fallback that fetched lyrics the first time a client asked for a
+//     lyric-less track. Removed in favour of the proactive backfill
+//     below; the `lrclib`, `concurrency`, and `fetchTimeoutMs` keys are
+//     now INERT — kept only so existing config files still validate.
+//   * Proactive backfill (active) — `backfill` + `providers`, a
+//     post-scan pass that fills lyric-less tracks before anyone asks.
+//
+// The `lyrics_cache` table the reactive path created lives on as the
+// backfill worker's cooldown/dedup ledger, so the `cacheTtl*Ms` keys
+// are STILL live: they gate how long a cached row is treated as fresh
+// by the read-only serving fallback (lyrics-cache.js#getCached).
+//   cacheTtlHitsMs   — cached 'hit' freshness window (7 days default).
+//   cacheTtlMissesMs — cached 'miss' freshness window (1 day default).
+//   cacheTtlErrorsMs — cached 'error' freshness window (1 hour default).
 const lyricsOptions = Joi.object({
-  lrclib:           Joi.boolean().default(false),
+  lrclib:           Joi.boolean().default(false),   // DEPRECATED/inert — reactive fetch removed; no auto-map to `backfill` (setup() warns instead)
   cacheTtlHitsMs:   Joi.number().integer().min(0).default(7 * 24 * 60 * 60 * 1000),
   cacheTtlMissesMs: Joi.number().integer().min(0).default(    24 * 60 * 60 * 1000),
   cacheTtlErrorsMs: Joi.number().integer().min(0).default(         60 * 60 * 1000),
-  concurrency:      Joi.number().integer().min(1).max(16).default(2),
-  // Per-call fetch timeout in ms. Read fresh on each fetch so admins
-  // can tune without restarting. Raise if you're on a satellite
-  // connection; lower if you want LRCLib failures to surface faster.
-  fetchTimeoutMs:   Joi.number().integer().min(500).max(60000).default(8000),
+  concurrency:      Joi.number().integer().min(1).max(16).default(2),   // DEPRECATED/inert
+  fetchTimeoutMs:   Joi.number().integer().min(500).max(60000).default(8000),   // DEPRECATED/inert
   // When true, successful LRCLib fetches ALSO write a sibling
   // `<basename>.lrc` (or `.txt` for plain-only hits) next to the
   // audio file. Default off: the SQLite cache already serves lyrics
@@ -370,6 +652,23 @@ const lyricsOptions = Joi.object({
   // at which point the cache entry becomes redundant (still free to
   // serve either side).
   writeSidecar:     Joi.boolean().default(false),
+
+  // ── Proactive backfill (separate from the reactive `lrclib` cache) ──
+  // Master switch for the post-scan lyrics backfill pass that fills
+  // lyric-less tracks before anyone asks. Off by default. `providers`
+  // is the ordered list of sources to try (first usable hit wins):
+  // LRCLib is the clean, no-auth default; NetEase and Kugou are
+  // unofficial/reverse-engineered third-party APIs (better CJK/Asian
+  // coverage) and are opt-in — leave them out unless you want them.
+  backfill:  Joi.boolean().default(false),
+  providers: Joi.array()
+    .items(Joi.string().valid('lrclib', 'netease', 'kugou'))
+    .min(1).default(['lrclib']),
+  // Max tracks attempted per backfill pass before the worker yields the serial
+  // task slot (the queue re-enqueues while it keeps hitting the cap). Mirrors
+  // autoAlbumArtPerRun; read by runLyricsTask in task-queue.js. Without this
+  // key the nested-object value was stripped by validation → locked at 100.
+  backfillMaxPerRun: Joi.number().integer().min(1).max(10000).default(100),
 });
 
 const schema = Joi.object({
@@ -415,6 +714,7 @@ const schema = Joi.object({
   webAppDirectory: Joi.string().default(path.join(appRoot, 'webapp')),
   rpn: rpnOptions.default(rpnOptions.validate({}).value),
   transcode: transcodeOptions.default(transcodeOptions.validate({}).value),
+  updates: updatesOptions.default(updatesOptions.validate({}).value),
   lyrics: lyricsOptions.default(lyricsOptions.validate({}).value),
   secret: Joi.string().optional(),
   // Separate secret used to derive the AES-256-GCM key for the
@@ -465,10 +765,12 @@ const schema = Joi.object({
     key: Joi.string().allow('').optional(),
     cert: Joi.string().allow('').optional()
   }).optional(),
-  federation: federationOptions.default(federationOptions.validate({}).value),
   iroh: irohOptions.default(irohOptions.validate({}).value),
+  federation: federationOptions.default(federationOptions.validate({}).value),
+  discoveryP2p: discoveryP2pOptions.default(discoveryP2pOptions.validate({}).value),
   dlna: dlnaOptions.default(dlnaOptions.validate({}).value),
   subsonic: subsonicOptions.default(subsonicOptions.validate({}).value),
+  discovery: discoveryOptions.default(discoveryOptions.validate({}).value),
   torrent: torrentOptions.default(torrentOptions.validate({}).value),
   autoBootServerAudio: Joi.boolean().default(false),
   rustPlayerPort: Joi.number().integer().min(1).max(65535).default(3333),
@@ -545,6 +847,16 @@ export async function setup(configFileArg) {
     await fs.writeFile(configFileArg, JSON.stringify(programData, null, 2), 'utf8');
   }
 
+  // Federation endpoint identity — same generate-and-persist pattern as the
+  // iroh tunnel above, and deliberately a DIFFERENT key so the tunnel and
+  // federation EndpointIds stay unlinkable personas.
+  if (!programData.federation) { programData.federation = {}; }
+  if (!programData.federation.secretKey) {
+    winston.info('Config file missing federation secret. Generating and saving');
+    programData.federation.secretKey = await asyncRandom(32);
+    await fs.writeFile(configFileArg, JSON.stringify(programData, null, 2), 'utf8');
+  }
+
   // Back-compat migration for the lockAdmin -> adminAccess rename. A config
   // file that predates adminAccess and had lockAdmin=true meant "admin
   // disabled", which is now adminAccess.mode='none'. Coerce + persist before
@@ -558,11 +870,47 @@ export async function setup(configFileArg) {
     await fs.writeFile(configFileArg, JSON.stringify(programData, null, 2), 'utf8');
   }
 
+  // The reactive `lyrics.lrclib` switch was removed (replaced by the proactive
+  // `lyrics.backfill` pass). An operator who had reactive lyrics ON (lrclib=true)
+  // but never set the new `backfill` key would otherwise silently lose all lyrics
+  // fetching on upgrade. We deliberately do NOT auto-enable backfill: it runs a
+  // background pass that queries EXTERNAL providers, so turning it on is an
+  // explicit opt-in (matches the feature's default-off design + the plan's
+  // deferral of an auto-mapping). Instead, warn once — the notice stops as soon
+  // as the operator sets `lyrics.backfill` either way. Read the RAW programData
+  // (pre-Joi-defaults) so `undefined` reliably means "never set".
+  if (programData.lyrics && programData.lyrics.lrclib === true
+      && programData.lyrics.backfill === undefined) {
+    winston.warn('[config] lyrics.lrclib no longer does anything — the reactive '
+      + 'LRCLib fetch was removed. To keep fetching lyrics, set lyrics.backfill=true '
+      + '(a post-scan pass that queries external providers); set lyrics.backfill=false '
+      + 'to silence this notice.');
+  }
+
+  // A retired embedding-model id in the config would fail Joi's .valid()
+  // enum and THROW — i.e. an upgrade that silently bricks the server for
+  // anyone who ever tried that model and left the line in. Coerce to the
+  // default and persist, same generate-and-persist shape as the lockAdmin
+  // migration above, so the fix is sticky and the warning appears once.
+  // Vectors already stored under the retired pin are NOT deleted: every row
+  // carries its own (model_id, model_version), so the discovery worker
+  // re-embeds them against the new model on its next pass, exactly as it
+  // does for any deliberate model swap.
+  const retiredModel = programData.scanOptions && programData.scanOptions.discoveryModel;
+  if (retiredModel && Object.hasOwn(RETIRED_EMBEDDING_MODELS, retiredModel)) {
+    winston.warn(`[config] scanOptions.discoveryModel='${retiredModel}' is no longer available — `
+      + `${RETIRED_EMBEDDING_MODELS[retiredModel]}. Falling back to '${DEFAULT_EMBEDDING_MODEL}' `
+      + 'and saving; tracks embedded with the old model will be re-embedded on the next '
+      + 'discovery pass.');
+    programData.scanOptions.discoveryModel = DEFAULT_EMBEDDING_MODEL;
+    await fs.writeFile(configFileArg, JSON.stringify(programData, null, 2), 'utf8');
+  }
+
   program = await schema.validateAsync(programData, { allowUnknown: true });
 
   // Derive the legacy lockAdmin flag from adminAccess.mode. Every existing
   // reader of config.program.lockAdmin (auth.js, server.js page guards,
-  // admin.js guard, federation.js) keeps behaving correctly off this value;
+  // admin.js guard) keeps behaving correctly off this value;
   // only mode='none' fully disables the admin surface, the other three modes
   // are application-level IP gates layered on top via util/admin-network.js.
   program.lockAdmin = (program.adminAccess.mode === 'none');
@@ -616,11 +964,39 @@ export async function setup(configFileArg) {
     program.storage.dbDirectory,
     program.storage.albumArtDirectory,
     program.storage.logsDirectory,
-    program.storage.syncConfigDirectory,
     program.storage.waveformCacheDirectory,
     program.transcode.ffmpegDirectory,
   ]) {
     if (dir) { await fs.mkdir(dir, { recursive: true }); }
+  }
+
+  // The model cache is created best-effort, OUTSIDE the fatal loop above: a
+  // server that can't write model weights must still boot and stream music
+  // (the discovery pass degrades on its own). But surface the problem NOW,
+  // at boot, with the key that fixes it — otherwise the first symptom is a
+  // bare EACCES from the embedding worker, mid-pass, hours later.
+  try {
+    if (program.storage.modelCacheDirectory) {
+      await fs.mkdir(program.storage.modelCacheDirectory, { recursive: true });
+    }
+  } catch (err) {
+    winston.warn(
+      `[config] storage.modelCacheDirectory '${program.storage.modelCacheDirectory}' is not creatable `
+      + `(${err.code || err.message}). The discovery-embedding pass cannot download model weights until `
+      + `it points at a writable path (on Docker, somewhere under your writable config mount, `
+      + `e.g. '/config/model-cache').`);
+  }
+
+  // Persist a stable mDNS instance id so discovery clients can dedupe the
+  // server across IP/interface changes and restarts. Same generate-and-persist
+  // pattern as dlna.uuid above.
+  if (!program.discovery.mdns.instanceId) {
+    program.discovery.mdns.instanceId = crypto.randomUUID();
+    const rawConfig = JSON.parse(await fs.readFile(configFileArg, 'utf8'));
+    if (!rawConfig.discovery) { rawConfig.discovery = {}; }
+    if (!rawConfig.discovery.mdns) { rawConfig.discovery.mdns = {}; }
+    rawConfig.discovery.mdns.instanceId = program.discovery.mdns.instanceId;
+    await fs.writeFile(configFileArg, JSON.stringify(rawConfig, null, 2), 'utf8');
   }
 }
 

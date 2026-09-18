@@ -140,7 +140,9 @@ function runWorker(config) {
     p.stdout.on('data', d => { stdout += d.toString(); });
     p.stderr.on('data', d => { stderr += d.toString(); });
     const timer = setTimeout(() => { p.kill('SIGKILL'); }, 60_000);
-    p.on('exit', (code) => {
+    // 'close' (not 'exit') so the worker's stdout is fully drained before we
+    // parse its event lines — 'exit' can fire with the pipe still buffered.
+    p.on('close', (code) => {
       clearTimeout(timer);
       const events = stdout.split('\n').map(l => l.trim()).filter(l => l.startsWith('{'))
         .map(l => { try { return JSON.parse(l); } catch (_e) { return null; } }).filter(Boolean);
@@ -294,6 +296,16 @@ describe('downloader worker (mock services)', () => {
     const r2 = await runWorker(baseConfig(env));
     assert.equal(r2.complete.attempted, 0, 'cooldown must exclude the album');
     assert.equal(mock.log.length, requestsAfterFirst, 'no further service requests');
+
+    // Backdate the recorded attempt by a second so the cooldown-0 rerun is
+    // unambiguously eligible. Eligibility is `last_attempt_at < now - cooldown`
+    // (strict, second-granularity), so when r1 and r3 land in the same
+    // wall-clock second the album is briefly still "on cooldown" — a flake that
+    // surfaced under CI load. Backdating expresses the test's intent ("a moment
+    // has passed") deterministically.
+    const back = new DatabaseSync(env.dbPath);
+    try { back.prepare('UPDATE album_art_lookups SET last_attempt_at = last_attempt_at - 1').run(); }
+    finally { back.close(); }
 
     // Cooldown 0 → eligible again, attempts increments.
     const r3 = await runWorker(baseConfig(env, { notFoundCooldownSec: 0 }));
@@ -470,7 +482,7 @@ describe('downloader worker (mock services)', () => {
       });
       let out = '';
       p.stdout.on('data', d => { out += d.toString(); });
-      p.on('exit', code => resolve({ code, out }));
+      p.on('close', code => resolve({ code, out }));
       p.on('error', reject);
     });
     assert.equal(r.code, 0);

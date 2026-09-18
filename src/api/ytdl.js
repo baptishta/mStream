@@ -11,7 +11,7 @@ import * as db from '../db/manager.js';
 import WebError from '../util/web-error.js';
 import { ffmpegBin } from '../util/ffmpeg-bootstrap.js';
 import { parseFile } from 'music-metadata';
-import { Jimp } from 'jimp';
+import { generateThumbnails } from '../util/image-thumbs.js';
 import mime from 'mime-types';
 import crypto from 'crypto';
 import fs from 'fs/promises';
@@ -348,8 +348,13 @@ export function setup(mstream) {
 
         // Compute both whole-file and audio-region hashes. The scanner uses
         // the same helper so ytdl-inserted rows are identity-compatible with
-        // scanned rows.
-        const { fileHash: hash, audioHash } = await (await import('../db/audio-hash.js')).computeHashes(downloadedFile);
+        // scanned rows — which since V60 includes stamping hash_v with the
+        // helper's HASH_GENERATION: a row left at the column default (1)
+        // would re-arm the boot convergence epoch (a full re-key pass of
+        // the stale-generation rows) after every download.
+        const audioHashLib = await import('../db/audio-hash.js');
+        const { fileHash: hash, audioHash } = await audioHashLib.computeHashes(downloadedFile);
+        const hashV = audioHashLib.HASH_GENERATION;
 
         // Build DB record matching the scanner schema
         // User-submitted metadata overrides take priority over parsed file metadata
@@ -398,11 +403,12 @@ export function setup(mstream) {
               isNewFile = true;
             }
 
-            // Create compressed versions for thumbnails
+            // Create compressed versions for thumbnails. Off the event loop
+            // + pixel-count guarded (util/image-thumbs.js): embedded covers
+            // come from downloaded media, so their dimensions are not ours to
+            // trust, and a pure-JS decode here stalls every other request.
             if (isNewFile && config.program.scanOptions.compressImage) {
-              const img = await Jimp.fromBuffer(picData);
-              await img.scaleToFit({ w: 256, h: 256 }).write(path.join(aaDir, 'zl-' + data.aaFile));
-              await img.scaleToFit({ w: 92, h: 92 }).write(path.join(aaDir, 'zs-' + data.aaFile));
+              await generateThumbnails(picData, aaFilePath, aaDir, data.aaFile);
             }
           } catch (err) {
             winston.error('yt-dlp: failed to extract album art', { stack: err });
@@ -423,12 +429,12 @@ export function setup(mstream) {
           d.prepare(
             `INSERT OR REPLACE INTO tracks (filepath, library_id, title, artist_id, album_id, track_number,
              disc_number, year, format, file_hash, audio_hash, album_art_file, replaygain_track_db,
-             modified, scan_id, source)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+             modified, scan_id, source, hash_v)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).run(
             data.filepath, lib.id, data.title || null, artistId, albumId,
             data.track, data.disk, data.year, data.format, data.hash, data.audioHash || null,
-            data.aaFile, data.replaygainTrackDb, data.modified, data.sID, 'ytdl'
+            data.aaFile, data.replaygainTrackDb, data.modified, data.sID, 'ytdl', hashV
           );
         }
         winston.info(`yt-dlp: added ${relativePath} to database`);
@@ -667,8 +673,11 @@ export function setup(mstream) {
     }
 
     // Dual-hash: file_hash (whole file) + audio_hash (audio region only,
-    // stable across tag edits). See src/db/audio-hash.js.
-    const { fileHash: hash, audioHash } = await (await import('../db/audio-hash.js')).computeHashes(downloadedFile);
+    // stable across tag edits). See src/db/audio-hash.js. hash_v stamps
+    // the helper's generation — see the POST handler above.
+    const audioHashLib = await import('../db/audio-hash.js');
+    const { fileHash: hash, audioHash } = await audioHashLib.computeHashes(downloadedFile);
+    const hashV = audioHashLib.HASH_GENERATION;
     const relativePath = path.relative(pathInfo.basePath, downloadedFile).replace(/\\/g, '/');
 
     // Extract album art
@@ -685,9 +694,7 @@ export function setup(mstream) {
         try { await fs.access(aaFilePath); } catch {
           await fs.writeFile(aaFilePath, picData);
           if (config.program.scanOptions.compressImage) {
-            const img = await Jimp.fromBuffer(picData);
-            await img.scaleToFit({ w: 256, h: 256 }).write(path.join(aaDir, 'zl-' + aaFile));
-            await img.scaleToFit({ w: 92, h: 92 }).write(path.join(aaDir, 'zs-' + aaFile));
+            await generateThumbnails(picData, aaFilePath, aaDir, aaFile);
           }
         }
       } catch (err) { /* ignore */ }
@@ -705,15 +712,15 @@ export function setup(mstream) {
       d.prepare(
         `INSERT OR REPLACE INTO tracks (filepath, library_id, title, artist_id, album_id, track_number,
          disc_number, year, format, file_hash, audio_hash, album_art_file, replaygain_track_db,
-         modified, scan_id, source)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         modified, scan_id, source, hash_v)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         relativePath, lib.id,
         userMeta.title || metadata.title || null, artistId, albumId,
         metadata.track?.no || null, metadata.disk?.no || null,
         metadata.year || null, expectedExt, hash, audioHash || null,
         aaFile, null,
-        Date.now(), null, 'ytdl'
+        Date.now(), null, 'ytdl', hashV
       );
     }
 

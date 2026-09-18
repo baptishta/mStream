@@ -7,6 +7,7 @@ import * as config from '../state/config.js';
 import * as db from '../db/manager.js';
 import { getBaseUrl } from '../dlna/ssdp.js';
 import { timeSeekMiddleware } from '../dlna/time-seek.js';
+import { ALBUM_TRACK_ORDER } from '../db/track-order.js';
 
 // ── Mutable state ────────────────────────────────────────────────────────────
 
@@ -22,6 +23,16 @@ const subscribers = new Map();
 // roughly linearly in number of items; this keeps a single response from
 // consuming excessive memory (~5MB at 512 bytes/item and this cap).
 const MAX_BROWSE_COUNT = 10000;
+
+// UPnP lets the server pick the page size when RequestedCount is 0. Browse
+// keeps MAX_BROWSE_COUNT there — a renderer drilling into a container expects
+// its listing, and some don't page. Search is a different shape: it spans the
+// whole server rather than one container, `SearchCriteria` of '*' matches
+// every track, and the action is only ever issued by control points that do
+// page. Choosing a page rather than 10,000 items keeps one unauthenticated
+// SOAP request from assembling a multi-megabyte DIDL document. An explicit
+// RequestedCount is still honoured, up to MAX_BROWSE_COUNT.
+const DEFAULT_SEARCH_COUNT = 500;
 
 // Hard cap on concurrent GENA subscribers. Each entry is tiny but we still
 // don't want a malicious client to grow the Map without bound by SUBSCRIBEing
@@ -54,6 +65,76 @@ function libraryIndex(libraries) {
   return m;
 }
 
+// ── Browse memos ─────────────────────────────────────────────────────────────
+//
+// Two caches with two different invalidation signals, because the browse
+// surface has two kinds of expensive question.
+//
+// 1. Library shape (artists, album-artists, albums, genres, track count, the
+//    sorted filepath list). One click on a library container runs six of
+//    these whole-library aggregates, and every folder click re-reads and
+//    re-sorts the library's entire filepath list — none of which changes
+//    until a scan changes the library. That is exactly what SystemUpdateID
+//    already signals to control points, so key on it. The TTL is a safety
+//    net rather than the invalidation: anything that edits a library WITHOUT
+//    bumping SystemUpdateID goes stale for at most a minute instead of until
+//    the next scan.
+//
+// 2. Smart-container totals (Recently Played, Most Played, Favorites,
+//    Shuffle, Recently Added, By Year, Playlists). These aggregate play
+//    history and ratings, which move on every scrobble and never touch
+//    SystemUpdateID — so they get a short time memo instead. Its job is to
+//    collapse the burst: one root-container click runs nine of these, and
+//    renderers re-browse the root constantly as the user navigates.
+//
+// Callers MUST treat the returned arrays as read-only — they are shared.
+// Both windows are test-overridable so a suite can make a direct DB edit
+// visible without sleeping one out; `0` disables the memo entirely.
+const TEST_CACHE_TTL_MS = process.env.MSTREAM_TEST_DLNA_CACHE_TTL_MS;
+const LIB_CACHE_TTL_MS = TEST_CACHE_TTL_MS !== undefined ? Number(TEST_CACHE_TTL_MS) : 60_000;
+const SMART_CACHE_TTL_MS = TEST_CACHE_TTL_MS !== undefined ? Number(TEST_CACHE_TTL_MS) : 5000;
+// Seven entry kinds per library, so this holds ~9 libraries' worth. The
+// filepath list is the only large one (~100 bytes/track); retaining one copy
+// per browsed library costs what the uncached code allocated and threw away
+// on every single click.
+const LIB_CACHE_MAX_ENTRIES = 64;
+
+const libCache = new Map();
+// Fixed, finite key set (one per smart container), so no eviction needed.
+const smartCache = new Map();
+
+function libMemo(key, build) {
+  const hit = libCache.get(key);
+  if (hit && hit.updateId === systemUpdateID && Date.now() - hit.at < LIB_CACHE_TTL_MS) {
+    libCache.delete(key);           // LRU: re-insert so the freshest key is last
+    libCache.set(key, hit);
+    return hit.value;
+  }
+  const value = build();
+  libCache.delete(key);
+  libCache.set(key, { updateId: systemUpdateID, at: Date.now(), value });
+  while (libCache.size > LIB_CACHE_MAX_ENTRIES) {
+    libCache.delete(libCache.keys().next().value);
+  }
+  return value;
+}
+
+function smartMemo(key, build) {
+  const hit = smartCache.get(key);
+  if (hit && Date.now() - hit.at < SMART_CACHE_TTL_MS) { return hit.value; }
+  const value = build();
+  smartCache.set(key, { at: Date.now(), value });
+  return value;
+}
+
+// Drop both memos. Called on every SystemUpdateID bump (a scan changed the
+// library) so the retained filepath lists are released immediately rather
+// than lingering until their keys are next probed; also the test hook.
+export function invalidateBrowseCaches() {
+  libCache.clear();
+  smartCache.clear();
+}
+
 // ── XML / SOAP helpers ───────────────────────────────────────────────────────
 
 // Characters forbidden in XML 1.0 content: C0 control chars except TAB, LF, CR.
@@ -71,18 +152,43 @@ const XML_LONE_HIGH_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g;
 const XML_LONE_LOW_SURROGATE = /(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
 const XML_NONCHARS = /[\uFFFE\uFFFF]/g;
 
-function xmlEscape(str) {
+// The union of the four strip regexes above, non-global, as a single probe.
+// The strip passes exist for mojibake-ridden ID3 tags, which is to say:
+// almost never. Probing once and skipping all four when nothing can match
+// turns the common case into two scans instead of nine \u2014 and xmlEscape runs
+// on every field of every DIDL element plus once over the whole assembled
+// document, so those scans add up over a 10,000-item response. The surrogate
+// alternatives carry the same lookarounds as the strip regexes so a legit
+// astral character (an emoji in a title) does NOT drag the response onto the
+// slow path.
+// eslint-disable-next-line no-control-regex
+const XML_NEEDS_STRIP = /[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+// The five entity replacements as one pass. Escaping is where the per-field
+// cost actually lives (many short strings), and one callback-driven pass
+// beats five chained ones by ~3\u00D7 there; over the multi-megabyte document it
+// is a further ~13%.
+const XML_ENTITIES = /[&<>"']/g;
+const XML_ENTITY_FOR = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' };
+const escapeEntities = (c) => XML_ENTITY_FOR[c];
+
+// Exported so the suite can pin the fast path against the nine-pass original
+// byte-for-byte — the whole premise of the probe is that output is unchanged.
+export function xmlEscape(str) {
   if (str == null) { return ''; }
-  return String(str)
-    .replace(XML_INVALID_CTRL, '')
-    .replace(XML_LONE_HIGH_SURROGATE, '')
-    .replace(XML_LONE_LOW_SURROGATE, '')
-    .replace(XML_NONCHARS, '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
+  const s = String(str);
+  // Strip-then-escape, exactly as before \u2014 the strip classes and the entity
+  // characters are disjoint, so skipping the strip passes when the probe
+  // misses is output-identical (pinned by the equivalence test).
+  if (XML_NEEDS_STRIP.test(s)) {
+    return s
+      .replace(XML_INVALID_CTRL, '')
+      .replace(XML_LONE_HIGH_SURROGATE, '')
+      .replace(XML_LONE_LOW_SURROGATE, '')
+      .replace(XML_NONCHARS, '')
+      .replace(XML_ENTITIES, escapeEntities);
+  }
+  return s.replace(XML_ENTITIES, escapeEntities);
 }
 
 // Reverse of xmlEscape — converts XML entities back to raw characters so
@@ -323,19 +429,25 @@ function viewContainer(libId, view, childCount) {
 function libraryViewContainers(libId) {
   const mode = config.program.dlna.browse || 'dirs';
   const order = VIEW_ORDER_BY_MODE[mode] || VIEW_ORDER_BY_MODE.dirs;
-  // Counts are required per UPnP. Folders needs a filepath scan — the others
-  // are fast aggregate queries.
-  const allTracks = getLibraryFilepaths(libId);
-  const { dirs: rootDirs, items: rootItems } = dirChildren(allTracks, '');
-  const counts = {
-    folders:      rootDirs.length + rootItems.length,
-    artists:      getLibraryArtists(libId).length,
-    albumartists: getLibraryAlbumArtists(libId).length,
-    albums:       getLibraryAlbums(libId).length,
-    genres:       getLibraryGenres(libId).length,
-    tracks:       allTracks.length,
-  };
-  return order.map(v => viewContainer(libId, v, counts[v]));
+  // The whole rendered listing is memoized, not just its inputs: this runs
+  // six whole-library aggregates and is the first thing a renderer asks for
+  // after picking a library. `browse` is part of the key because an admin
+  // can change the default view without a rescan.
+  return libMemo(`views:${mode}:${libId}`, () => {
+    // Counts are required per UPnP. Folders needs a filepath scan — the others
+    // are fast aggregate queries.
+    const allTracks = getLibraryFilepaths(libId);
+    const { dirs: rootDirs, items: rootItems } = dirChildren(allTracks, '');
+    const counts = {
+      folders:      rootDirs.length + rootItems.length,
+      artists:      getLibraryArtists(libId).length,
+      albumartists: getLibraryAlbumArtists(libId).length,
+      albums:       getLibraryAlbums(libId).length,
+      genres:       getLibraryGenres(libId).length,
+      tracks:       allTracks.length,
+    };
+    return order.map(v => viewContainer(libId, v, counts[v]));
+  });
 }
 
 // ── Music root & smart containers ────────────────────────────────────────────
@@ -403,13 +515,15 @@ function trackItem(track, lib, parentId) {
 // ── DB queries ───────────────────────────────────────────────────────────────
 
 function getLibraryTrackCount(libraryId) {
-  const row = db.getDB()
-    .prepare('SELECT COUNT(*) AS n FROM tracks WHERE library_id = ?')
-    .get(libraryId);
-  return row ? row.n : 0;
+  return libMemo(`count:${libraryId}`, () => {
+    const row = db.getDB()
+      .prepare('SELECT COUNT(*) AS n FROM tracks WHERE library_id = ?')
+      .get(libraryId);
+    return row ? row.n : 0;
+  });
 }
 
-function getLibraryTracks(libraryId, start, count, orderBy = 'al.name, t.disc_number, t.track_number, t.title') {
+function getLibraryTracks(libraryId, start, count, orderBy = `al.name, ${ALBUM_TRACK_ORDER}, t.title`) {
   const limit = count > 0 ? count : -1; // SQLite: -1 = no limit
   return db.getDB().prepare(`
     SELECT t.id, t.filepath, t.title, t.track_number, t.duration, t.format,
@@ -432,9 +546,9 @@ function getLibraryTracks(libraryId, start, count, orderBy = 'al.name, t.disc_nu
 // ever touches filepaths, so this fetches only those; getTracksByIds() below
 // fetches the full row (incl. genre) for just the items rendered on a page.
 function getLibraryFilepaths(libraryId) {
-  return db.getDB().prepare(
+  return libMemo(`paths:${libraryId}`, () => db.getDB().prepare(
     'SELECT t.id, t.filepath FROM tracks t WHERE t.library_id = ? ORDER BY t.filepath'
-  ).all(libraryId);
+  ).all(libraryId));
 }
 
 // Full DIDL columns (incl. the per-row primary-genre subquery) for a specific
@@ -457,19 +571,21 @@ function getTracksByIds(ids) {
 }
 
 function getLibraryArtists(libraryId) {
-  return db.getDB().prepare(`
+  return libMemo(`artists:${libraryId}`, () => db.getDB().prepare(`
     SELECT COALESCE(t.artist_id, 0) AS id,
            COALESCE(a.name, 'Unknown Artist') AS name,
            COUNT(DISTINCT COALESCE(t.album_id, 0)) AS album_count,
-           (SELECT t2.album_art_file FROM tracks t2
-            WHERE t2.library_id = t.library_id AND t2.artist_id IS t.artist_id
-              AND t2.album_art_file IS NOT NULL LIMIT 1) AS album_art_file
+           -- MIN (not an arbitrary LIMIT-1 row) so the art shown in this list
+           -- matches the BrowseMetadata art from getArtistById(), which also
+           -- uses MIN. MIN ignores NULLs, so it's still "first non-null art".
+           (SELECT MIN(t2.album_art_file) FROM tracks t2
+            WHERE t2.library_id = t.library_id AND t2.artist_id IS t.artist_id) AS album_art_file
     FROM tracks t
     LEFT JOIN artists a ON t.artist_id = a.id
     WHERE t.library_id = ?
     GROUP BY COALESCE(t.artist_id, 0)
     ORDER BY COALESCE(a.name, '') COLLATE NOCASE
-  `).all(libraryId);
+  `).all(libraryId));
 }
 
 // Targeted single-row lookups for BrowseMetadata. artistId=0 means "Unknown
@@ -529,7 +645,7 @@ function getAlbumTracks(libraryId, albumId) {
       LEFT JOIN artists a  ON t.artist_id = a.id
       LEFT JOIN albums  al ON t.album_id  = al.id
       WHERE t.library_id = ? AND t.album_id IS NULL
-      ORDER BY t.disc_number, t.track_number, t.title
+      ORDER BY ${ALBUM_TRACK_ORDER}, t.title
     `).all(libraryId);
   }
   return db.getDB().prepare(`
@@ -540,12 +656,12 @@ function getAlbumTracks(libraryId, albumId) {
     LEFT JOIN artists a  ON t.artist_id = a.id
     LEFT JOIN albums  al ON t.album_id  = al.id
     WHERE t.library_id = ? AND t.album_id = ?
-    ORDER BY t.disc_number, t.track_number, t.title
+    ORDER BY ${ALBUM_TRACK_ORDER}, t.title
   `).all(libraryId, albumId);
 }
 
 function getLibraryAlbums(libraryId) {
-  return db.getDB().prepare(`
+  return libMemo(`albums:${libraryId}`, () => db.getDB().prepare(`
     SELECT COALESCE(t.album_id, 0) AS id,
            COALESCE(al.name, 'Unknown Album') AS name,
            COUNT(*) AS track_count,
@@ -555,7 +671,7 @@ function getLibraryAlbums(libraryId) {
     WHERE t.library_id = ?
     GROUP BY COALESCE(t.album_id, 0)
     ORDER BY COALESCE(al.name, '') COLLATE NOCASE
-  `).all(libraryId);
+  `).all(libraryId));
 }
 
 // V34 helper: build the WHERE-clause condition for "track matches this
@@ -591,6 +707,10 @@ function trackGenreCondition(genre) {
 }
 
 function getLibraryGenres(libraryId) {
+  return libMemo(`genres:${libraryId}`, () => getLibraryGenresUncached(libraryId));
+}
+
+function getLibraryGenresUncached(libraryId) {
   // V34: read tagged genres via the M2M JOIN, plus a separate query
   // for the "Unknown Genre" bucket (tracks with no track_genres row).
   // The DLNA browse historically surfaced an empty-name entry for
@@ -708,7 +828,7 @@ function getGenreArtistAlbums(libraryId, genre, artistId) {
 // so compilation albums don't explode into dozens of single-album entries.
 
 function getLibraryAlbumArtists(libraryId) {
-  return db.getDB().prepare(`
+  return libMemo(`albumartists:${libraryId}`, () => db.getDB().prepare(`
     SELECT COALESCE(a.id, 0) AS id,
            COALESCE(a.name, 'Unknown Artist') AS name,
            COUNT(DISTINCT al.id) AS album_count,
@@ -718,10 +838,19 @@ function getLibraryAlbumArtists(libraryId) {
     WHERE EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = al.id AND t.library_id = ?)
     GROUP BY COALESCE(a.id, 0)
     ORDER BY COALESCE(a.name, '') COLLATE NOCASE
-  `).all(libraryId);
+  `).all(libraryId));
+}
+
+// artistId 0 is the "Unknown Artist" bucket (albums with a NULL artist_id).
+// Branching on it keeps the predicate on the bare column, so idx_albums_artist
+// applies — `COALESCE(al.artist_id, 0) = ?` is an expression and the planner
+// cannot use the index for it (2026-07 audit).
+function albumArtistCondition(artistId) {
+  return artistId === 0 ? 'al.artist_id IS NULL' : 'al.artist_id = ?';
 }
 
 function getAlbumArtistById(libraryId, artistId) {
+  const params = artistId === 0 ? [libraryId] : [libraryId, artistId];
   const row = db.getDB().prepare(`
     SELECT COALESCE(a.id, 0) AS id,
            COALESCE(a.name, 'Unknown Artist') AS name,
@@ -731,14 +860,15 @@ function getAlbumArtistById(libraryId, artistId) {
     FROM albums al
     LEFT JOIN artists a ON al.artist_id = a.id
     WHERE EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = al.id AND t.library_id = ?)
-      AND COALESCE(al.artist_id, 0) = ?
-  `).get(libraryId, artistId);
+      AND ${albumArtistCondition(artistId)}
+  `).get(...params);
   if (!row || row._n === 0) return null;
   delete row._n;
   return row;
 }
 
 function getAlbumArtistAlbums(libraryId, artistId) {
+  const params = artistId === 0 ? [libraryId] : [libraryId, artistId];
   return db.getDB().prepare(`
     SELECT al.id,
            COALESCE(al.name, 'Unknown Album') AS name,
@@ -746,10 +876,10 @@ function getAlbumArtistAlbums(libraryId, artistId) {
            COALESCE(al.album_art_file, MIN(t.album_art_file)) AS album_art_file
     FROM albums al
     JOIN tracks t ON t.album_id = al.id
-    WHERE t.library_id = ? AND COALESCE(al.artist_id, 0) = ?
+    WHERE t.library_id = ? AND ${albumArtistCondition(artistId)}
     GROUP BY al.id
     ORDER BY al.year, COALESCE(al.name, '') COLLATE NOCASE
-  `).all(libraryId, artistId);
+  `).all(...params);
 }
 
 // ── Smart-container queries ─────────────────────────────────────────────────
@@ -762,13 +892,15 @@ const SMART_TRACK_COLS = `
 `;
 
 function getRecentPlayedCount() {
-  const row = db.getDB().prepare(`
-    SELECT COUNT(DISTINCT t.id) AS n
-    FROM tracks t
-    JOIN user_metadata um ON um.track_hash = COALESCE(t.audio_hash, t.file_hash)
-    WHERE um.last_played IS NOT NULL
-  `).get();
-  return Math.min(row?.n || 0, SMART_LIMIT);
+  return smartMemo('recentplayed', () => {
+    const row = db.getDB().prepare(`
+      SELECT COUNT(DISTINCT t.id) AS n
+      FROM tracks t
+      JOIN user_metadata um ON um.track_hash = COALESCE(t.audio_hash, t.file_hash)
+      WHERE um.last_played IS NOT NULL
+    `).get();
+    return Math.min(row?.n || 0, SMART_LIMIT);
+  });
 }
 
 function getRecentPlayedTracks(start, count) {
@@ -789,15 +921,17 @@ function getRecentPlayedTracks(start, count) {
 }
 
 function getMostPlayedCount() {
-  const row = db.getDB().prepare(`
-    SELECT COUNT(*) AS n FROM (
-      SELECT t.id FROM tracks t
-      JOIN user_metadata um ON um.track_hash = COALESCE(t.audio_hash, t.file_hash)
-      GROUP BY t.id
-      HAVING SUM(um.play_count) > 0
-    )
-  `).get();
-  return Math.min(row?.n || 0, SMART_LIMIT);
+  return smartMemo('mostplayed', () => {
+    const row = db.getDB().prepare(`
+      SELECT COUNT(*) AS n FROM (
+        SELECT t.id FROM tracks t
+        JOIN user_metadata um ON um.track_hash = COALESCE(t.audio_hash, t.file_hash)
+        GROUP BY t.id
+        HAVING SUM(um.play_count) > 0
+      )
+    `).get();
+    return Math.min(row?.n || 0, SMART_LIMIT);
+  });
 }
 
 function getMostPlayedTracks(start, count) {
@@ -817,20 +951,29 @@ function getMostPlayedTracks(start, count) {
   `).all(limit, start);
 }
 
+// Favorites is bounded by SMART_LIMIT like every sibling smart container.
+// It used to be the odd one out: an uncapped count paired with a `LIMIT -1`
+// fetch, so a library with thousands of 4-star tracks built the whole list
+// into one DIDL document (2026-07 audit M14).
 function getFavoriteCount() {
-  const row = db.getDB().prepare(`
-    SELECT COUNT(*) AS n FROM (
-      SELECT t.id FROM tracks t
-      JOIN user_metadata um ON um.track_hash = COALESCE(t.audio_hash, t.file_hash)
-      GROUP BY t.id
-      HAVING MAX(um.rating) >= 4
-    )
-  `).get();
-  return row?.n || 0;
+  return smartMemo('favorites', () => {
+    const row = db.getDB().prepare(`
+      SELECT COUNT(*) AS n FROM (
+        SELECT t.id FROM tracks t
+        JOIN user_metadata um ON um.track_hash = COALESCE(t.audio_hash, t.file_hash)
+        GROUP BY t.id
+        HAVING MAX(um.rating) >= 4
+        LIMIT ${SMART_LIMIT}
+      )
+    `).get();
+    return Math.min(row?.n || 0, SMART_LIMIT);
+  });
 }
 
 function getFavoriteTracks(start, count) {
-  const limit = count > 0 ? count : -1;
+  const available = Math.max(0, SMART_LIMIT - start);
+  const limit = count > 0 ? Math.min(count, available) : available;
+  if (limit <= 0) return [];
   return db.getDB().prepare(`
     SELECT ${SMART_TRACK_COLS}, MAX(um.rating) AS top_rating
     FROM tracks t
@@ -839,14 +982,16 @@ function getFavoriteTracks(start, count) {
     LEFT JOIN albums  al ON t.album_id  = al.id
     GROUP BY t.id
     HAVING top_rating >= 4
-    ORDER BY top_rating DESC, a.name, al.name, t.disc_number, t.track_number
+    ORDER BY top_rating DESC, a.name, al.name, ${ALBUM_TRACK_ORDER}
     LIMIT ? OFFSET ?
   `).all(limit, start);
 }
 
 function getShuffleCount() {
-  const row = db.getDB().prepare('SELECT COUNT(*) AS n FROM tracks').get();
-  return Math.min(row?.n || 0, SMART_LIMIT);
+  return smartMemo('shuffle', () => {
+    const row = db.getDB().prepare('SELECT COUNT(*) AS n FROM tracks').get();
+    return Math.min(row?.n || 0, SMART_LIMIT);
+  });
 }
 
 // Shuffle is re-rolled per request — no pagination semantics beyond "give me a
@@ -866,13 +1011,13 @@ function getShuffleTracks(count) {
 }
 
 function getYears() {
-  return db.getDB().prepare(`
+  return smartMemo('years', () => db.getDB().prepare(`
     SELECT t.year AS year, COUNT(*) AS track_count
     FROM tracks t
     WHERE t.year IS NOT NULL AND t.year > 0
     GROUP BY t.year
     ORDER BY t.year DESC
-  `).all();
+  `).all());
 }
 
 function getYearTrackCount(year) {
@@ -888,20 +1033,20 @@ function getYearTracks(year, start, count) {
     LEFT JOIN artists a  ON t.artist_id = a.id
     LEFT JOIN albums  al ON t.album_id  = al.id
     WHERE t.year = ?
-    ORDER BY a.name COLLATE NOCASE, al.name COLLATE NOCASE, t.disc_number, t.track_number, t.title
+    ORDER BY a.name COLLATE NOCASE, al.name COLLATE NOCASE, ${ALBUM_TRACK_ORDER}, t.title
     LIMIT ? OFFSET ?
   `).all(year, limit, start);
 }
 
 function getAllPlaylists() {
-  return db.getDB().prepare(`
+  return smartMemo('playlists', () => db.getDB().prepare(`
     SELECT p.id, p.name, u.username, COUNT(pt.id) AS track_count
     FROM playlists p
     JOIN users u ON p.user_id = u.id
     LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
     GROUP BY p.id
     ORDER BY p.name COLLATE NOCASE
-  `).all();
+  `).all());
 }
 
 function getPlaylistById(playlistId) {
@@ -943,8 +1088,10 @@ function getPlaylistTracks(playlistId) {
 }
 
 function getRecentCount() {
-  const total = db.getDB().prepare('SELECT COUNT(*) AS n FROM tracks').get()?.n || 0;
-  return Math.min(total, RECENT_LIMIT);
+  return smartMemo('recent', () => {
+    const total = db.getDB().prepare('SELECT COUNT(*) AS n FROM tracks').get()?.n || 0;
+    return Math.min(total, RECENT_LIMIT);
+  });
 }
 
 function getRecentTracks(start, count) {
@@ -1072,6 +1219,19 @@ function handleBrowse(body, res) {
   const libraries = db.getAllLibraries();
   const libById = libraryIndex(libraries);
 
+  // Per-user surfaces (play history, ratings, playlists) are gated behind
+  // dlna.shareUserData because the DLNA control surface is unauthenticated.
+  const shareUserData = config.program.dlna.shareUserData !== false;
+  // Fixed virtual containers under "Music": Recently Added, Shuffle and By Year
+  // are always present (3); Recently Played, Most Played, Favorites and
+  // Playlists (4) are listed only when per-user data is shared.
+  const musicVirtualCount = shareUserData ? 7 : 3;
+  // Block direct browse to a gated container when sharing is off, so a client
+  // holding a cached object ID can't pull the data the listing hides.
+  if (!shareUserData && /^(recentplayed|mostplayed|favorites|playlists|playlist-\d+)$/.test(objectId)) {
+    return sendXml(res, soapError('701', 'No Such Object'), 500);
+  }
+
   // ── Root container — wraps everything in a single "Music" child ──────────
   // Matches the layout of MiniDLNA / Plex / Jellyfin: renderers expect a
   // top-level category folder, not libraries scattered at root.
@@ -1084,28 +1244,31 @@ function handleBrowse(body, res) {
   </container>`);
       return sendBrowseResponse(res, didl, 1, 1);
     }
-    const music = simpleContainer('music', '0', 'Music', libraries.length + 7);
+    const music = simpleContainer('music', '0', 'Music', libraries.length + musicVirtualCount);
     const slice = paginate([music], startIdx, reqCount);
     return sendBrowseResponse(res, didlWrapper(slice.join('')), slice.length, 1);
   }
 
   // ── Music container — libraries + virtual "Recently Added/Played/..." ────
   if (objectId === 'music') {
-    // N libraries + 7 fixed virtual containers (Recently Added, Recently
-    // Played, Most Played, Favorites, Shuffle, By Year, Playlists).
-    const musicTotal = libraries.length + 7;
+    // N libraries + the fixed virtual containers. Recently Added, Shuffle and
+    // By Year are always present; Recently Played, Most Played, Favorites and
+    // Playlists are per-user surfaces, listed only when dlna.shareUserData is on.
+    const musicTotal = libraries.length + musicVirtualCount;
     if (browseFlag === 'BrowseMetadata') {
       return sendBrowseResponse(res, didlWrapper(simpleContainer('music', '0', 'Music', musicTotal)), 1, 1);
     }
     const musicChildren = [
       ...libraries.map(lib => libraryContainer(lib, 'music', getLibraryTrackCount(lib.id))),
       recentContainer('music', getRecentCount()),
-      simpleContainer('recentplayed', 'music', 'Recently Played', getRecentPlayedCount()),
-      simpleContainer('mostplayed',   'music', 'Most Played',     getMostPlayedCount()),
-      simpleContainer('favorites',    'music', 'Favorites',       getFavoriteCount()),
+      ...(shareUserData ? [
+        simpleContainer('recentplayed', 'music', 'Recently Played', getRecentPlayedCount()),
+        simpleContainer('mostplayed',   'music', 'Most Played',     getMostPlayedCount()),
+        simpleContainer('favorites',    'music', 'Favorites',       getFavoriteCount()),
+      ] : []),
       simpleContainer('shuffle',      'music', 'Shuffle',         getShuffleCount()),
       simpleContainer('years',        'music', 'By Year',         getYears().length),
-      playlistsContainer('music', getAllPlaylists().length),
+      ...(shareUserData ? [playlistsContainer('music', getAllPlaylists().length)] : []),
     ];
     const slice = paginate(musicChildren, startIdx, reqCount);
     return sendBrowseResponse(res, didlWrapper(slice.join('')), slice.length, musicTotal);
@@ -1356,7 +1519,7 @@ function handleBrowse(body, res) {
       return sendBrowseResponse(res, didlWrapper(viewContainer(libId, 'tracks', total)), 1, 1);
     }
 
-    const orderBy = buildOrderBy(sortTerms, 'al.name, t.disc_number, t.track_number, t.title');
+    const orderBy = buildOrderBy(sortTerms, `al.name, ${ALBUM_TRACK_ORDER}, t.title`);
     const tracks = getLibraryTracks(libId, startIdx, reqCount, orderBy);
     return sendBrowseResponse(res, didlWrapper(tracks.map(t => trackItem(t, lib, objectId)).join('')), tracks.length, total);
   }
@@ -1615,7 +1778,7 @@ function handleSearch(body, res) {
   const criteria  = extractSoapField(body, 'SearchCriteria');
   const startIdx  = Math.max(0, parseInt(extractSoapField(body, 'StartingIndex') || '0', 10) || 0);
   const rawCount  = Math.max(0, parseInt(extractSoapField(body, 'RequestedCount') || '0', 10) || 0);
-  const reqCount  = rawCount === 0 ? MAX_BROWSE_COUNT : Math.min(rawCount, MAX_BROWSE_COUNT);
+  const reqCount  = rawCount === 0 ? DEFAULT_SEARCH_COUNT : Math.min(rawCount, MAX_BROWSE_COUNT);
   const sortTerms = parseSortCriteria(extractSoapField(body, 'SortCriteria'));
 
   const libraries = db.getAllLibraries();
@@ -2002,14 +2165,31 @@ function handleSubscribe(req, res, service) {
 }
 
 function handleUnsubscribe(req, res) {
+  // UPnP 1.0 §4.1.2: an UNSUBSCRIBE carries SID and neither NT nor CALLBACK,
+  // and the SID must reference a current subscription. Presence of NT/CALLBACK
+  // is a bad request (400); a missing or unknown SID is a precondition failure
+  // (412) — previously we 200'd unconditionally, which masked both.
+  if (req.headers['nt'] || req.headers['callback']) { return res.status(400).end(); }
   const sid = req.headers['sid'];
-  if (sid) { subscribers.delete(sid); }
+  if (!sid || !subscribers.has(sid)) { return res.status(412).end(); }
+  subscribers.delete(sid);
   res.status(200).end();
 }
+
+// Read-only view of the counter for other surfaces that want a cheap
+// "library content changed" signal — the subsonic getArtists memo keys on
+// it (task-queue bumps on every scan batch that changed the DB, whether or
+// not DLNA is enabled, so it is a process-wide content epoch, not a
+// DLNA-only one).
+export function getSystemUpdateID() { return systemUpdateID; }
 
 export function bumpSystemUpdateID() {
   // SystemUpdateID is a UPnP ui4 (32-bit unsigned). Wrap to stay in range.
   systemUpdateID = (systemUpdateID + 1) >>> 0;
+  // The library memo keys on the id, so the bump alone already invalidates
+  // it. Clearing releases the retained filepath lists right away instead of
+  // holding them until each key is next probed.
+  invalidateBrowseCaches();
   winston.debug(`[dlna] SystemUpdateID bumped to ${systemUpdateID}`);
   broadcastToService('cds');
 }

@@ -18,9 +18,21 @@ const MSTREAMPLAYER = (() => {
   var currentReplayGainAmp = 1.0;
 
   mstreamModule.editSongMetadata = function (key, value, songIndex) {
+    const target = mstreamModule.playlist[songIndex];
+    if (!target) { return; }
+    const targetHash = target.metadata ? target.metadata.hash : undefined;
     for (var i = 0, len = mstreamModule.playlist.length; i < len; i++) {
-      if ((mstreamModule.playlist[i].metadata && mstreamModule.playlist[i].metadata.hash === mstreamModule.playlist[songIndex].metadata.hash) || mstreamModule.playlist[i].filepath === mstreamModule.playlist[songIndex].filepath) {
-        mstreamModule.playlist[i].metadata[key] = value;
+      const cur = mstreamModule.playlist[i];
+      if (!cur.metadata) { continue; }
+      // Match the same song by hash when BOTH carry one, else by filepath.
+      // The `targetHash != null` guard matters because search hits carry the
+      // LITE metadata object (no `hash`); without it two hashless songs would
+      // collide on `undefined === undefined` and a single rating edit would
+      // smear across every hashless queue entry. filepath is always present
+      // and uniquely identifies a queue entry.
+      const hashMatch = targetHash != null && cur.metadata.hash === targetHash;
+      if (hashMatch || cur.filepath === target.filepath) {
+        cur.metadata[key] = value;
       }
     }
   }
@@ -209,6 +221,33 @@ const MSTREAMPLAYER = (() => {
       body.genreMode = AUTODJ.state.djGenreMode;
     }
 
+    // Sonic similarity — constrain picks to the discovery-embedding
+    // neighborhood of the session anchor (PR #697 server API). Gated on
+    // the ping capability flag so feature-off servers never receive the
+    // params (they would 403). Which paths land in `similarTo` is the
+    // anchor policy (rolling history vs locked seed) — AUTODJ owns it.
+    if (autodjLoaded
+        && AUTODJ.state.sonicEnabled
+        && MSTREAMAPI.currentServer.discovery === true) {
+      const curSong = mstreamModule.getCurrentSong && mstreamModule.getCurrentSong();
+      const sonic = AUTODJ.buildSonicParams(curSong ? curSong.rawFilePath : null);
+      if (sonic) {
+        body.similarTo = sonic.similarTo;
+        body.minSimilarity = sonic.minSimilarity;
+      } else {
+        // No resolvable anchor: empty queue and no explicit seed. The
+        // pick can't honor the "within the similarity range" promise —
+        // fail loud with a pointer at the seed picker rather than
+        // silently picking out-of-range.
+        const err = new Error('sonic seed required');
+        err.djToast = {
+          title: t('autoDJ.sonicSeedNeededTitle'),
+          message: t('autoDJ.sonicSeedNeeded'),
+        };
+        throw err;
+      }
+    }
+
     return { body, refBpm, refNeighbours };
   }
 
@@ -253,6 +292,11 @@ const MSTREAMPLAYER = (() => {
       if (!AUTODJ.getCamelotAnchor() && meta['musical-key']) {
         AUTODJ.setCamelotAnchor(meta['musical-key']);
       }
+      // Rolling sonic anchor — each DJ pick joins the last-N window the
+      // next request's `similarTo` centroid averages over.
+      if (AUTODJ.state.sonicEnabled) {
+        AUTODJ.pushSonicHistory(filepath);
+      }
       AUTODJ.markFilepathCounted(filepath);
     } else {
       AUTODJ.resetAnchors();
@@ -284,10 +328,14 @@ const MSTREAMPLAYER = (() => {
         // suppress the toast in that case — it's an intended teardown,
         // not a failure.
         if (err?.name !== 'AbortError') {
+          // Errors that know their own user-facing story (sonic seed
+          // missing / out-of-range) carry a djToast; everything else
+          // gets the generic failure.
           iziToast.warning({
-            title: 'Auto DJ Failed',
+            title: err?.djToast?.title || 'Auto DJ Failed',
+            message: err?.djToast?.message || '',
             position: 'topCenter',
-            timeout: 3500
+            timeout: err?.djToast ? 6000 : 3500
           });
         }
       } finally {
@@ -315,7 +363,24 @@ const MSTREAMPLAYER = (() => {
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       const { body, refBpm, refNeighbours } = await _buildAutoDjBody({ ignoreList });
-      const res = await MSTREAMAPI.getRandomSong(body, { signal });
+      let res;
+      try {
+        res = await MSTREAMAPI.getRandomSong(body, { signal });
+      } catch (err) {
+        // Sonic-mode failures have specific, actionable stories — map
+        // the server's distinct 400s onto them so the user knows
+        // whether to loosen the slider or pick another seed. req()
+        // attaches status + parsed body to thrown errors.
+        if (err?.name !== 'AbortError' && body.similarTo) {
+          const serverMsg = err?.body?.error || '';
+          if (/similarity range/i.test(serverMsg)) {
+            err.djToast = { title: t('autoDJ.sonicToastTitle'), message: t('autoDJ.sonicNoMatch') };
+          } else if (/analyzed/i.test(serverMsg)) {
+            err.djToast = { title: t('autoDJ.sonicToastTitle'), message: t('autoDJ.sonicSeedUnanalyzed') };
+          }
+        }
+        throw err;
+      }
       lastResponse = res;
       // Server returns the updated ignoreList (input list + the
       // just-picked index). Carry it into the next iteration so a
@@ -858,6 +923,11 @@ const MSTREAMPLAYER = (() => {
     // BPM continuity / harmonic-mixing anchor management.
     mstreamModule.playerStats.metadata.bpm = curSong.metadata && Number.isFinite(curSong.metadata.bpm) ? curSong.metadata.bpm : null;
     mstreamModule.playerStats.metadata['musical-key'] = curSong.metadata && curSong.metadata['musical-key'] ? curSong.metadata['musical-key'] : null;
+    // Lyrics availability — drives the now-playing "Lyrics" tag. Copied here
+    // (like bpm / musical-key above) so it tracks song changes; the metadata
+    // API supplies these flags (renderMetadataObj's has-lyrics / has-synced-lyrics).
+    mstreamModule.playerStats.metadata['has-lyrics'] = !!(curSong.metadata && curSong.metadata['has-lyrics']);
+    mstreamModule.playerStats.metadata['has-synced-lyrics'] = !!(curSong.metadata && curSong.metadata['has-synced-lyrics']);
     mstreamModule.playerStats.metadata.filepath = curSong.rawFilePath;
 
     // Auto-DJ song-change side-effects — pulled into a helper so the
@@ -1001,6 +1071,17 @@ const MSTREAMPLAYER = (() => {
     shouldLoopOne: false,
     shuffle: false,
     volume: 100,
+    // EVERY field resetCurrentMetadata() writes must be declared here.
+    // Vue 2 can only make properties reactive at observation time, so a
+    // field that only ever appears via assignment gets no accessor and no
+    // dependency tracking: watchers and computeds that read it never
+    // invalidate. `musical-key` was missing, which froze the key shown on
+    // the now-playing card at whatever the first keyed track of the
+    // session was, for every track after it. `bpm` survived only because
+    // it happens to be interpolated directly rather than through a
+    // computed, and `replaygain-track-db` has no default-UI reader today
+    // — both are declared anyway so the next reader doesn't inherit the
+    // same silent breakage.
     metadata: {
       "artist": "",
       "album": "",
@@ -1009,6 +1090,11 @@ const MSTREAMPLAYER = (() => {
       "year": "",
       "album-art": "",
       "filepath": "",
+      "has-lyrics": false,
+      "has-synced-lyrics": false,
+      "bpm": null,
+      "musical-key": null,
+      "replaygain-track-db": "",
     },
     replayGain: false,
     replayGainPreGainDb: 0
@@ -1295,9 +1381,14 @@ const MSTREAMPLAYER = (() => {
   async function _autoDjQueueN(n) {
     for (let i = 0; i < n; i++) {
       if (mstreamModule.playerStats.autoDJ !== true) { return; }
+      const before = mstreamModule.playlist.length;
       try {
         await autoDJ();
       } catch (_) { /* autoDJ already toasts; don't stack errors */ }
+      // A pick that added nothing failed (autoDJ toasted why) — the
+      // next bootstrap attempt would fail the same way; stop instead
+      // of stacking a duplicate toast + duplicate server round-trip.
+      if (mstreamModule.playlist.length === before) { return; }
     }
   }
 
@@ -1325,6 +1416,17 @@ const MSTREAMPLAYER = (() => {
     return mstreamModule.playerStats.autoDJ;
   }
 
+  // Nudge a stalled Auto-DJ session into picking. Used by the DJ
+  // panel's sonic seed picker: when the user enabled Auto-DJ on an
+  // empty queue with sonic mode on but no seed, the bootstrap pick
+  // fails (with a "pick a seed" toast) and nothing re-triggers it —
+  // so the panel calls this right after a seed is chosen.
+  mstreamModule.autoDjKick = () => {
+    if (mstreamModule.playerStats.autoDJ !== true) { return; }
+    if (mstreamModule.playlist.length > 0) { return; }
+    _autoDjQueueN(2);
+  }
+
   // ReplayGain
   mstreamModule.setReplayGainActive = (isActive) => {
     mstreamModule.playerStats.replayGain = isActive;
@@ -1339,6 +1441,93 @@ const MSTREAMPLAYER = (() => {
       mstreamModule.updateReplayGainFromSong(getCurrentPlayer().songObject);
     }
   }
+
+  // Player hotkeys — the central keymap shared by the main UI and the
+  // shared-playlist page. Bindings persist in localStorage ('playerHotkeys')
+  // as { enabled, bindings: { action: combo|null } } and are merged over the
+  // defaults on load, so new actions pick up their default key automatically
+  // and unknown/stale actions are dropped. A combo is event.key (lowercased
+  // for single characters) with an optional 'ctrl+' prefix, e.g. 'm',
+  // 'ctrl+ArrowRight', '<'. A null binding means the action is unbound.
+  // percentSeek is special: it covers the digit row 0-9 and is stored as the
+  // sentinel '0-9' (any truthy value enables it, null disables it).
+  const HOTKEY_STORAGE_KEY = 'playerHotkeys';
+  const hotkeyDefaults = {
+    playPause: ' ',
+    playPauseAlt: 'k',
+    seekBack: 'ArrowLeft',
+    seekForward: 'ArrowRight',
+    bigSeekBack: 'j',
+    bigSeekForward: 'l',
+    prevTrack: 'ctrl+ArrowLeft',
+    nextTrack: 'ctrl+ArrowRight',
+    volumeUp: 'ArrowUp',
+    volumeDown: 'ArrowDown',
+    mute: 'm',
+    shuffle: 's',
+    repeat: 'r',
+    speedDown: '<',
+    speedUp: '>',
+    percentSeek: '0-9',
+  };
+
+  function sanitizeHotkeyConfig(raw) {
+    const cfg = { enabled: true, bindings: Object.assign({}, hotkeyDefaults) };
+    if (raw && typeof raw === 'object') {
+      if (raw.enabled === false) { cfg.enabled = false; }
+      if (raw.bindings && typeof raw.bindings === 'object') {
+        Object.keys(hotkeyDefaults).forEach((action) => {
+          const val = raw.bindings[action];
+          if (val === null || typeof val === 'string') { cfg.bindings[action] = val; }
+        });
+      }
+    }
+    return cfg;
+  }
+
+  let hotkeyConfig = (() => {
+    try {
+      return sanitizeHotkeyConfig(JSON.parse(localStorage.getItem(HOTKEY_STORAGE_KEY)));
+    } catch (err) {
+      return sanitizeHotkeyConfig(null);
+    }
+  })();
+
+  mstreamModule.hotkeys = {
+    defaults: Object.assign({}, hotkeyDefaults),
+    getConfig: () => ({
+      enabled: hotkeyConfig.enabled,
+      bindings: Object.assign({}, hotkeyConfig.bindings),
+    }),
+    saveConfig: (newCfg) => {
+      hotkeyConfig = sanitizeHotkeyConfig(newCfg);
+      try {
+        localStorage.setItem(HOTKEY_STORAGE_KEY, JSON.stringify(hotkeyConfig));
+      } catch (err) { /* storage unavailable — config still applies for this session */ }
+    },
+    // Map a keydown event to a bound action name, or null if the key is
+    // unclaimed. Alt/Meta combos are never claimed (browser/OS shortcuts,
+    // e.g. Alt+Left = back). Shift is inherent to typing printable
+    // characters ('<' is Shift+comma) so it is ignored for single-char
+    // combos, but shifted named keys (Shift+ArrowRight etc.) stay free
+    // for text selection.
+    resolve: (event) => {
+      if (!hotkeyConfig.enabled) { return null; }
+      if (event.altKey || event.metaKey) { return null; }
+      if (event.key.length > 1 && event.shiftKey) { return null; }
+      const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+      const combo = (event.ctrlKey ? 'ctrl+' : '') + key;
+      const bindings = hotkeyConfig.bindings;
+      const match = Object.keys(bindings).find(
+        (action) => action !== 'percentSeek' && bindings[action] === combo
+      );
+      if (match) { return match; }
+      if (bindings.percentSeek && !event.ctrlKey && /^[0-9]$/.test(event.key)) {
+        return 'percentSeek';
+      }
+      return null;
+    },
+  };
 
   // Setup Media Session
   if ('mediaSession' in navigator) {

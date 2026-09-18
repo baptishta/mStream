@@ -7,7 +7,7 @@
  *
  *   GET    /api/v1/admin/subsonic/stats                  methods + now-playing
  *   GET    /api/v1/admin/subsonic/test                   ping-myself probe
- *   GET    /api/v1/admin/subsonic/jukebox                rust-server-audio status
+ *   GET    /api/v1/admin/subsonic/jukebox                mstream-player status
  *   GET    /api/v1/admin/subsonic/token-auth-attempts    token-auth warning log
  *   DELETE /api/v1/admin/subsonic/token-auth-attempts    clear the log
  *   POST   /api/v1/admin/subsonic/mint-key               mint a key for another user
@@ -114,7 +114,7 @@ describe('GET /api/v1/admin/subsonic/stats', () => {
 
   test('admin-only', async () => {
     const r = await adminGet('/api/v1/admin/subsonic/stats', userJwt);
-    assert.equal(r.status, 405);
+    assert.equal(r.status, 403);
   });
 });
 
@@ -135,7 +135,7 @@ describe('GET /api/v1/admin/subsonic/test', () => {
 
   test('admin-only', async () => {
     const r = await adminGet('/api/v1/admin/subsonic/test', userJwt);
-    assert.equal(r.status, 405);
+    assert.equal(r.status, 403);
   });
 });
 
@@ -144,7 +144,7 @@ describe('GET /api/v1/admin/subsonic/test', () => {
 describe('GET /api/v1/admin/subsonic/jukebox', () => {
   test('when autoBootServerAudio is false (default), reports available:false', async () => {
     // The default test server has autoBootServerAudio = false; the handler
-    // bails before even reaching the rust-server-audio stub.
+    // bails before even reaching the mstream-player stub.
     const r = await adminGet('/api/v1/admin/subsonic/jukebox');
     assert.equal(r.status, 200);
     const body = await r.json();
@@ -154,7 +154,7 @@ describe('GET /api/v1/admin/subsonic/jukebox', () => {
 
   test('admin-only', async () => {
     const r = await adminGet('/api/v1/admin/subsonic/jukebox', userJwt);
-    assert.equal(r.status, 405);
+    assert.equal(r.status, 403);
   });
 });
 
@@ -196,7 +196,7 @@ describe('token-auth-attempts endpoint', () => {
 
   test('admin-only', async () => {
     const r = await adminGet('/api/v1/admin/subsonic/token-auth-attempts', userJwt);
-    assert.equal(r.status, 405);
+    assert.equal(r.status, 403);
   });
 });
 
@@ -232,6 +232,6 @@ describe('POST /api/v1/admin/subsonic/mint-key', () => {
   test('admin-only', async () => {
     const r = await adminPost('/api/v1/admin/subsonic/mint-key',
       { username: ADMIN.username, name: 'x' }, userJwt);
-    assert.equal(r.status, 405);
+    assert.equal(r.status, 403);
   });
 });

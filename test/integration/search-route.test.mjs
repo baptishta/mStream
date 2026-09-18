@@ -24,6 +24,7 @@ import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import { lrcToSearchText } from '../../src/api/subsonic/lrc-parser.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
@@ -68,7 +69,6 @@ async function bootMstream(tmpDir, musicDir, extraLibraries = {}) {
       albumArtDirectory:   path.join(tmpDir, 'image-cache'),
       dbDirectory:         path.join(tmpDir, 'db'),
       logsDirectory:       path.join(tmpDir, 'logs'),
-      syncConfigDirectory: path.join(tmpDir, 'sync'),
     },
     // No boot scan — we seed the DB directly, the empty music dir
     // would otherwise trigger an "orphan tracks" purge.
@@ -88,7 +88,16 @@ async function bootMstream(tmpDir, musicDir, extraLibraries = {}) {
   proc.stdout.on('data', () => {});
   proc.stderr.on('data', () => {});
   const baseUrl = `http://127.0.0.1:${port}`;
-  await waitForReady(baseUrl);
+  try {
+    await waitForReady(baseUrl);
+  } catch (err) {
+    // A ready-timeout must not leak the child: the server can boot late but
+    // healthy on a loaded runner, and a live orphan's stdio keeps this file's
+    // event loop open — the run then hangs at exit instead of reporting the
+    // timeout. test/helpers/server.mjs kills on this path for the same reason.
+    try { proc.kill('SIGKILL'); } catch { /* already gone */ }
+    throw err;
+  }
   return { proc, baseUrl, port };
 }
 
@@ -135,6 +144,27 @@ function seedDB(dbPath) {
   // The "Funny" track is the deliberate infix-vs-prefix probe: an FTS5
   // prefix query `unny*` won't match, but LIKE `%unny%` will.
   insT.run('fun/01.flac',     lib1, 'Funny',            aFunOnly, albFun, 2020, 'h5', 'a5', ts);
+
+  // Give one track embedded lyrics so the lyrics search category — and its
+  // metadata enrichment + snippet handling — is exercised. The `basic`
+  // algorithm matches via LIKE on the lyrics column directly, so this works
+  // regardless of whether the FTS lyrics index was populated.
+  db.prepare("UPDATE tracks SET lyrics_embedded = ? WHERE filepath = 'pf/wall/01.flac'")
+    .run('Hello? Is there anybody in there? Just nod if you can hear me.');
+
+  // V59: a synced-only track, seeded the way the real writers write —
+  // raw LRC into lyrics_synced_lrc AND the stripped rendition into
+  // lyrics_search_text (derived with the production helper, so the seed
+  // can't drift from the writer contract). The stamps carry the digit
+  // pairs 22/37/48 that must NOT be matchable; 'crazyseventy' is a token
+  // unique to these lyrics.
+  const KARMA_LRC = [
+    '[ar:Header Person]',
+    '[00:22.10]for a minute there I lost myself',
+    '[00:37.48]crazyseventy phew',
+  ].join('\n');
+  db.prepare("UPDATE tracks SET lyrics_synced_lrc = ?, lyrics_search_text = ? WHERE filepath = 'rh/ok/01.flac'")
+    .run(KARMA_LRC, lrcToSearchText(KARMA_LRC));
 
   db.close();
 }
@@ -221,6 +251,25 @@ describe('/api/v1/db/search algorithm dispatch', () => {
     assert.equal(r.status, 400);
   });
 
+  // ── Search length cap (hardening audit follow-up) ────────────────
+
+  test('search longer than 512 chars → 400 from the Joi cap', async () => {
+    // Without the cap, a request-body-sized search (1MB express default)
+    // becomes a giant AND-of-prefixes MATCH expression or a megabyte
+    // LIKE pattern scanned against every lyrics blob.
+    const r = await searchReq(server.baseUrl, { search: 'a'.repeat(513) });
+    assert.equal(r.status, 400);
+  });
+
+  test('search at exactly 512 chars is accepted (cap is inclusive)', async () => {
+    for (const algorithm of ['basic', 'fts5', 'combo']) {
+      const r = await searchReq(server.baseUrl, { search: 'a'.repeat(512), algorithm });
+      assert.equal(r.status, 200, `algorithm=${algorithm} must accept a boundary-length search`);
+      assert.deepEqual(Object.keys(r.body).sort(), ['albums', 'artists', 'files', 'lyrics', 'title'],
+        'boundary-length search returns the normal envelope');
+    }
+  });
+
   // ── Default-is-combo + combo vs fts5 divergence on parse failure ──
 
   test("no-alnum query '&' — combo falls back to LIKE per category and returns rows", async () => {
@@ -304,18 +353,139 @@ describe('/api/v1/db/search algorithm dispatch', () => {
     const results = await Promise.all(algorithms.map(a =>
       searchReq(server.baseUrl, { search: 'pink', algorithm: a })
     ));
-    const TOP = ['albums', 'artists', 'files', 'title'];
-    const ITEM = ['album_art_file', 'filepath', 'name'];
+    const TOP = ['albums', 'artists', 'files', 'lyrics', 'title'];
+    // artists/albums are name aggregations — no per-track metadata object.
+    const ITEM_GROUP = ['album_art_file', 'filepath', 'name'];
+    // title/files are track-level and carry the full canonical metadata object
+    // alongside the legacy fields (additive, non-breaking).
+    const ITEM_TRACK = ['album_art_file', 'filepath', 'metadata', 'name'];
+    // lyrics = track-level + the matching excerpt.
+    const ITEM_LYRICS = ['album_art_file', 'filepath', 'metadata', 'name', 'snippet'];
+
+    const expectedKeys = (cat) =>
+      cat === 'lyrics' ? ITEM_LYRICS :
+      (cat === 'title' || cat === 'files') ? ITEM_TRACK :
+      ITEM_GROUP;
 
     for (const { body } of results) {
       assert.deepEqual(Object.keys(body).sort(), TOP);
       for (const cat of TOP) {
         for (const item of body[cat]) {
-          assert.deepEqual(Object.keys(item).sort(), ITEM,
+          assert.deepEqual(Object.keys(item).sort(), expectedKeys(cat),
             `per-item keys mismatch in ${cat} category`);
         }
       }
     }
+  });
+
+  test('track hits carry the LITE metadata object; group hits do not', async () => {
+    // 'comfortably' matches the title 'Comfortably Numb' via LIKE %...% under
+    // the basic algorithm — no FTS5 dependency, so this asserts the enrichment
+    // path independent of how SQLite was compiled.
+    const r = await searchReq(server.baseUrl, { search: 'comfortably', algorithm: 'basic' });
+    assert.equal(r.status, 200);
+    const hit = r.body.title.find(t => t.filepath === 'testlib/pf/wall/01.flac');
+    assert.ok(hit, 'Comfortably Numb track present in the title results');
+
+    // metadata is the LITE subset — exactly these keys, no more. Hardcoded
+    // here (rather than imported from src) as the wire contract; the unit test
+    // (render-metadata-by-ids) locks this list against LITE_METADATA_FIELDS.
+    const EXPECTED_LITE_KEYS = ['album', 'album-art', 'artist', 'bpm', 'disk',
+      'duration', 'genres', 'has-lyrics', 'has-synced-lyrics', 'musical-key',
+      'rating', 'replaygain-track', 'title', 'track', 'year'];
+    assert.ok(hit.metadata && typeof hit.metadata === 'object', 'title hit has a metadata object');
+    assert.deepEqual(Object.keys(hit.metadata).sort(), EXPECTED_LITE_KEYS,
+      'metadata carries exactly the lite field set');
+
+    // Kept (display/playback/Auto-DJ) fields carry real values.
+    assert.equal(hit.metadata.title, 'Comfortably Numb');
+    assert.equal(hit.metadata.artist, 'Pink Floyd');
+    assert.equal(hit.metadata.album, 'The Wall');
+    assert.equal(hit.metadata.year, 1979);
+    assert.ok('album-art' in hit.metadata, 'kebab-case lite fields are present');
+    assert.ok(Array.isArray(hit.metadata.genres), 'genres is always an array');
+
+    // Heavy / detail-only fields are NOT in the lite object — fetch
+    // /api/v1/db/metadata for those.
+    for (const dropped of ['hash', 'audio-hash', 'format', 'bitrate', 'sample-rate',
+      'channels', 'bit-depth', 'file-size', 'play-count', 'last-played', 'created-at',
+      'modified', 'source', 'bpm-source', 'track-total', 'disc-total']) {
+      assert.ok(!(dropped in hit.metadata), `lite metadata must not include ${dropped}`);
+    }
+
+    // Legacy fields are preserved alongside metadata (additive change).
+    assert.equal(typeof hit.name, 'string');
+    assert.equal(hit.filepath, 'testlib/pf/wall/01.flac');
+
+    // Group categories never gain a metadata key.
+    const grp = await searchReq(server.baseUrl, { search: 'pink', algorithm: 'basic' });
+    for (const item of grp.body.artists) assert.ok(!('metadata' in item), 'artist items stay minimal');
+    for (const item of grp.body.albums)  assert.ok(!('metadata' in item), 'album items stay minimal');
+  });
+
+  test('lyrics hits carry metadata + snippet (basic LIKE on the lyrics column)', async () => {
+    // 'anybody' lives only in the seeded embedded lyrics of Comfortably Numb.
+    const r = await searchReq(server.baseUrl, { search: 'anybody', algorithm: 'basic' });
+    assert.equal(r.status, 200);
+    const hit = r.body.lyrics.find(t => t.filepath === 'testlib/pf/wall/01.flac');
+    assert.ok(hit, 'lyrics match present');
+    assert.ok(hit.metadata && hit.metadata.title === 'Comfortably Numb',
+      'lyrics hit carries the full metadata object');
+    // basic LIKE has no FTS snippet — the key is present but null.
+    assert.ok('snippet' in hit, 'snippet key present on lyrics items');
+    assert.equal(hit.snippet, null, 'basic algorithm yields a null snippet');
+  });
+
+  test('noLyrics suppresses the lyrics category', async () => {
+    const r = await searchReq(server.baseUrl, { search: 'anybody', algorithm: 'basic', noLyrics: true });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.lyrics.length, 0, 'noLyrics returns an empty lyrics array');
+  });
+
+  // ── V59: FTS lyrics path over synced LRC (stripped index) ────────
+
+  const KARMA_FILEPATH = 'testlib/rh/ok/01.flac';
+
+  test('FTS lyrics hit on a synced-LRC track carries a non-null, stamp-free snippet', async () => {
+    // 'crazyseventy' lives only in the seeded synced lyrics of Karma
+    // Police — and only in its WORDS, so this exercises fts_tracks.lyrics
+    // end to end (MATCH + snippet()), not the LIKE fallback.
+    for (const algorithm of ['fts5', 'combo']) {
+      const r = await searchReq(server.baseUrl, { search: 'crazyseventy', algorithm });
+      assert.equal(r.status, 200);
+      const hit = r.body.lyrics.find(t => t.filepath === KARMA_FILEPATH);
+      assert.ok(hit, `algorithm=${algorithm} must find the synced-LRC track by a lyric word`);
+      assert.equal(typeof hit.snippet, 'string', `algorithm=${algorithm} FTS path must yield a snippet`);
+      assert.match(hit.snippet, /crazyseventy/, 'snippet shows the matching line');
+      assert.doesNotMatch(hit.snippet, /[[\]]/, 'snippet carries no LRC stamp brackets');
+      assert.doesNotMatch(hit.snippet, /\d/, 'snippet carries no stamp digits');
+      // Scoped: a lyric-only word must not leak into the other categories.
+      assert.equal(r.body.title.length, 0);
+      assert.equal(r.body.artists.length, 0);
+    }
+  });
+
+  test('numeric queries do not match LRC timestamps in any algorithm (V59)', async () => {
+    // '22', '37' and '48' appear in the seeded track ONLY inside
+    // [mm:ss.xx] stamps. Pre-V59 these were FTS tokens and this returned
+    // the track; now the index and the LIKE path both read the stripped
+    // lyrics_search_text, so every algorithm must come back empty.
+    for (const digits of ['22', '37', '48']) {
+      for (const algorithm of ['basic', 'fts5', 'combo']) {
+        const r = await searchReq(server.baseUrl, { search: digits, algorithm });
+        assert.equal(r.status, 200);
+        assert.equal(r.body.lyrics.length, 0,
+          `search '${digits}' (${algorithm}) must not match timestamp digits`);
+      }
+    }
+  });
+
+  test('LRC header-tag words are not lyrics (V59)', async () => {
+    // '[ar:Header Person]' is metadata, not a lyric line — lrcToSearchText
+    // drops it before indexing.
+    const r = await searchReq(server.baseUrl, { search: 'header', algorithm: 'fts5' });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.lyrics.length, 0, 'header-tag words must not match as lyrics');
   });
 
   test('filepath sentinel: false on artist/album rows, string on title/file rows', async () => {

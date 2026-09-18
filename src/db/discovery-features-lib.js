@@ -1,0 +1,447 @@
+// Embedding engine for the music-discovery dataset (discovery.db).
+//
+// This module owns the MODEL REGISTRY and the per-track embedding pipeline:
+// decode (ffmpeg → mono f32 at the model's sample rate) → fixed-length
+// windows → model inference → mean-pool → L2-normalize → one Float32Array
+// per track. The discovery worker (discovery-backfill.mjs) is the only
+// production caller.
+//
+// MODELS ARE DELIBERATELY SWAPPABLE. Vectors from different models (or
+// model versions) live in incompatible spaces, so every stored row and every
+// export snapshot carries a (model_id, model_version) pin, and the worker
+// re-embeds rows whose pin doesn't match the active model. Adding an engine
+// = one registry entry + (if it's a new kind) one embedder factory below.
+//
+// The default engine is MTG's Discogs-EffNet — the strongest music-specific
+// embedding model available, adopted after the project dropped all
+// commercial aspects of the discovery feature (its weights are
+// CC BY-NC-SA 4.0: non-commercial, share-alike — the license rides along in
+// discovery_meta and every export manifest). Its weights are mirrored as a
+// GitHub release asset under project control and downloaded on first use
+// with sha256 verification — the lesson from Xenova/larger_clap_music
+// silently vanishing off HF. Bonus: the same inference emits 400 Discogs
+// style activations, which become free genre tags per track.
+//
+// ⚠ THE NON-COMMERCIAL LICENSE IS NOW THE ONLY OPTION, DELIBERATELY.
+// LAION-CLAP (music_and_speech, Apache-2.0) used to be selectable here as a
+// permissively-licensed alternative, and was removed — nobody ran it, and it
+// was the sole reason `@huggingface/transformers` was a dependency, which
+// dragged in ~174 MB (onnxruntime-web + sharp + protobufjs) and a high-severity
+// sharp CVE that no published parent allowed us to patch. Consequences worth
+// knowing BEFORE you need them:
+//
+//   • Every exported discovery dataset now inherits CC BY-NC-SA 4.0 —
+//     non-commercial AND share-alike. If mStream (or an instance, or a
+//     partner) ever needs commercially-usable discovery data, that is a
+//     MODEL decision, not a licensing footnote: a permissive model has to
+//     come back into this registry first.
+//   • CLAP was also the only text↔audio model here — its shared embedding
+//     space is what natural-language search ("dreamy 80s synth ballad")
+//     would have been built on. Only the audio tower was ever wired up, so
+//     nothing regressed, but the capability left with it.
+//
+// If either need shows up, prefer bringing the runtime back as a Rust
+// sidecar (the rust-parser / p2p-sidecar pattern) rather than re-adding the
+// npm chain — that gets the model without re-importing sharp.
+//
+// All heavy runtimes are OPTIONAL dependencies imported lazily per model
+// kind — a failed native install must never break the music server; the
+// worker surfaces a clean error instead.
+
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
+import { decodePcmF32 } from './audio-analysis-lib.js';
+
+// ── Registry ─────────────────────────────────────────────────────────────────
+//
+// key            stable mStream-side id — this is what lands in
+//                discovery_tracks.model_id and the export manifest. Never
+//                reuse a key for semantically different weights; bump
+//                `version` (or add a new key) instead.
+// kind           which embedder factory below handles it.
+// version        OUR pin, stored per row; bump when the underlying weights
+//                change meaningfully.
+// dim            embedding length (floats).
+// sampleRate     decode rate the model expects.
+// segmentSeconds / segmentPositions
+//                fixed windows fed to the model; their mean is the track
+//                vector (validated in the spike: 3×10 s ≈ full-track quality
+//                at a fraction of the cost).
+const MODELS_RELEASE_BASE =
+  'https://github.com/IrosTheBeggar/mStream/releases/download/discovery-models-1';
+
+export const EMBEDDING_MODELS = {
+  // MTG-UPF's Discogs-EffNet (trained on 4M Discogs releases / 400 styles).
+  // DEFAULT. Weights are the project-mirrored copy of the official ONNX
+  // export from essentia.upf.edu — small (18 MB), sha256-pinned, fetched on
+  // first use into storage.modelCacheDirectory. The 'labels' file carries
+  // the 400 style names so the activations head can fill genre_tags.
+  'effnet-discogs': {
+    kind: 'effnet-discogs',
+    version: '1',
+    dim: 1280,
+    sampleRate: 16000,
+    segmentSeconds: 10,
+    segmentPositions: [0.25, 0.5, 0.75],
+    // NON-COMMERCIAL license, accepted deliberately: the discovery feature
+    // is free and must never be gated by / bundled into a paid offering.
+    // ShareAlike: exported datasets built from these embeddings inherit
+    // NC-SA terms (declared in the export manifest).
+    license: 'CC-BY-NC-SA-4.0',
+    attribution: 'Discogs-EffNet by Music Technology Group, Universitat Pompeu Fabra (essentia.upf.edu/models)',
+    weights: {
+      filename: 'discogs-effnet-bsdynamic-1.onnx',
+      url: `${MODELS_RELEASE_BASE}/discogs-effnet-bsdynamic-1.onnx`,
+      sha256: 'a280825b334797cf677939db8cd5762c0392aedd0ca6415dbc1cd083f045e43c',
+    },
+    labels: {
+      filename: 'discogs-effnet-bsdynamic-1.json',
+      url: `${MODELS_RELEASE_BASE}/discogs-effnet-bsdynamic-1.json`,
+      sha256: 'a2e85b2e7372d5f8e0f35bdd6aeae1139f101087d183d0b2fb60b0ea0f01a0ff',
+    },
+    // essentia's TensorflowInputMusiCNN front-end contract (the model was
+    // trained on exactly this mel pipeline — do not change independently).
+    frameSize: 512,
+    hopSize: 256,
+    melBands: 96,
+    patchFrames: 128,
+    // Style activations >= this probability become genre_tags (top-K).
+    tagThreshold: 0.1,
+    tagTopK: 5,
+  },
+  // Deterministic, dependency-free pseudo-embedder. Exists for two reasons:
+  // it lets the whole worker/task-queue/export pipeline be tested without a
+  // model download, and it exercises the model-swap path for real (tests
+  // flip between this and other pins). Not meaningful for similarity.
+  'test-fake': {
+    kind: 'fake',
+    version: '1',
+    dim: 8,
+    sampleRate: 8000,
+    segmentSeconds: 5,
+    segmentPositions: [0.5],
+    license: 'GPL-3.0',   // it's just mStream code
+    attribution: 'mStream test fixture',
+  },
+};
+
+export const DEFAULT_EMBEDDING_MODEL = 'effnet-discogs';
+
+// Registry keys that USED to be valid. `scanOptions.discoveryModel` is
+// validated with Joi .valid(...Object.keys(EMBEDDING_MODELS)) and config
+// validation THROWS, so simply deleting a key would turn any config still
+// naming it into a server that refuses to boot — including an operator who
+// tried the model once and left the line in. src/state/config.js coerces
+// these back to the default (and persists) before validation runs.
+// Keep entries here forever; they cost nothing and the alternative is a
+// dead server on upgrade.
+export const RETIRED_EMBEDDING_MODELS = {
+  'clap-music-and-speech':
+    'the LAION-CLAP engine was removed (it required the @huggingface/transformers '
+    + 'runtime, which carried an unpatchable sharp advisory)',
+};
+
+export function getModelSpec(key) {
+  const spec = EMBEDDING_MODELS[key];
+  if (!spec) {
+    throw new Error(`unknown discovery embedding model '${key}' (known: ${Object.keys(EMBEDDING_MODELS).join(', ')})`);
+  }
+  return spec;
+}
+
+// ── Vector helpers ───────────────────────────────────────────────────────────
+
+function l2normalize(v) {
+  let ss = 0;
+  for (let i = 0; i < v.length; i++) { ss += v[i] * v[i]; }
+  const n = Math.sqrt(ss) || 1;
+  const out = new Float32Array(v.length);
+  for (let i = 0; i < v.length; i++) { out[i] = v[i] / n; }
+  return out;
+}
+
+function meanPool(vectors) {
+  const out = new Float32Array(vectors[0].length);
+  for (const v of vectors) {
+    for (let i = 0; i < out.length; i++) { out[i] += v[i]; }
+  }
+  for (let i = 0; i < out.length; i++) { out[i] /= vectors.length; }
+  return out;
+}
+
+// Fixed windows at the spec's fractional positions; the whole (padded-by-
+// the-model) signal when the track is shorter than one window.
+function segments(signal, spec) {
+  const win = spec.segmentSeconds * spec.sampleRate;
+  if (signal.length <= win) { return [signal]; }
+  const out = [];
+  for (const p of spec.segmentPositions) {
+    const start = Math.min(Math.floor(signal.length * p), signal.length - win);
+    out.push(signal.subarray(start, start + win));
+  }
+  return out;
+}
+
+// ── Model-file acquisition ───────────────────────────────────────────────────
+
+function sha256OfFile(filePath) {
+  const hash = crypto.createHash('sha256');
+  hash.update(fs.readFileSync(filePath));
+  return hash.digest('hex');
+}
+
+// A permission-class failure on the cache dir means the OPERATOR pointed (or
+// defaulted) storage.modelCacheDirectory somewhere the server can't write —
+// e.g. a Docker image whose config template predates the key, leaving it at
+// the read-only app directory. The raw EACCES names a path but not the
+// config key that controls it; say both, or the error is undebuggable from
+// the log alone.
+function rethrowIfCacheDirUnwritable(err, modelCacheDir) {
+  if (err.code === 'EACCES' || err.code === 'EPERM' || err.code === 'EROFS') {
+    throw new Error(
+      `model cache directory '${modelCacheDir}' is not writable — point storage.modelCacheDirectory `
+      + `at a writable path (on Docker, somewhere under your writable config mount, `
+      + `e.g. '/config/model-cache') and restart (${err.message})`);
+  }
+  throw err;
+}
+
+/**
+ * Ensure a pinned model file exists in `modelCacheDir`, downloading it (once)
+ * from the project-controlled mirror when absent. The sha256 pin is the
+ * integrity AND identity check: a cached file with the wrong hash is treated
+ * as corrupt and re-fetched; a downloaded file with the wrong hash is
+ * deleted and the pass fails cleanly (better no data than wrong-model data).
+ * Exported for tests.
+ */
+export async function ensureModelFile({ filename, url, sha256 }, modelCacheDir) {
+  if (!modelCacheDir) { throw new Error('modelCacheDir is required to download model files'); }
+  const dest = path.join(modelCacheDir, filename);
+
+  if (fs.existsSync(dest)) {
+    if (sha256OfFile(dest) === sha256) { return dest; }
+    // Corrupt / partial from a previous crash — refetch below.
+    try { fs.rmSync(dest, { force: true }); }
+    catch (err) { rethrowIfCacheDirUnwritable(err, modelCacheDir); }
+  }
+
+  const tmp = `${dest}.downloading`;
+  try {
+    fs.mkdirSync(modelCacheDir, { recursive: true });
+    fs.rmSync(tmp, { force: true });
+  } catch (err) { rethrowIfCacheDirUnwritable(err, modelCacheDir); }
+
+  const res = await fetch(url, { redirect: 'follow' });
+  if (!res.ok || !res.body) {
+    throw new Error(`model download failed: HTTP ${res.status} for ${url}`);
+  }
+  try {
+    await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(tmp));
+  } catch (err) {
+    // The dir can exist but be unwritable (created under a different uid —
+    // the Docker PUID-remap case); the open() inside createWriteStream is
+    // where that surfaces.
+    rethrowIfCacheDirUnwritable(err, modelCacheDir);
+  }
+
+  const actual = sha256OfFile(tmp);
+  if (actual !== sha256) {
+    fs.rmSync(tmp, { force: true });
+    throw new Error(`model download checksum mismatch for ${filename}: expected ${sha256}, got ${actual}`);
+  }
+  fs.renameSync(tmp, dest);
+  return dest;
+}
+
+// ── Embedder factories ───────────────────────────────────────────────────────
+
+// Every factory returns { analyzeSignal(Float32Array) → Promise<{
+//   embedding: Float32Array (spec.dim, L2-normalized),
+//   genreTags: string[] | null      // model-derived style tags, when the
+// }> }                              // model has a classification head
+//
+// MTG's Discogs-EffNet through onnxruntime-node, fed by the pure-JS mel
+// front-end in effnet-mel.js — a parity-exact reimplementation of essentia's
+// TensorflowInputMusiCNN (the pipeline the model was trained on), ~20×
+// faster than the WASM-per-frame original and with no AGPL dependency in
+// this path. One inference yields both the 1280-d embedding and the
+// 400-style activations (→ genre tags).
+async function createEffnetEmbedder(spec, { modelCacheDir } = {}) {
+  let ort;
+  try {
+    // NOTE for Bun `--compile`: onnxruntime-node's loader requires a
+    // per-(platform,arch) .node binary that upstream doesn't ship for every
+    // target, so bundling it breaks cross-builds. It is marked `--external`
+    // in scripts/build-bun.mjs — concatenation tricks don't help because
+    // Bun's bundler constant-folds them. In a standalone binary this import
+    // fails at runtime and lands in the catch below.
+    ort = (await import('onnxruntime-node')).default;
+  } catch (err) {
+    // Distinguish "the package isn't there" from "it's there but this OS
+    // can't load it". onnxruntime ships glibc-only binaries; on musl they
+    // load through a glibc compat layer, and a modern one genuinely works —
+    // verified 2026-07 on Alpine 3.24 + gcompat (the linuxserver.io image,
+    // x64 and arm64): loads AND runs inference. The dlopen-failure hint
+    // below is for systems that still can't — no compat layer, or one too
+    // old to cover onnxruntime's fortified symbols.
+    const muslHint = /ld-linux|Error relocating|ERR_DLOPEN/i.test(`${err.message} ${err.code || ''}`)
+      ? ' — this system cannot load onnxruntime’s glibc binaries (on musl/Alpine, install or update the gcompat package; otherwise use a glibc-based image such as Debian/Ubuntu)'
+      : '';
+    const e = new Error(`onnxruntime-node is not available — the '${spec.weights.filename}' embedding model cannot run${muslHint} (${err.message})`);
+    e.dependencyMissing = true;
+    throw e;
+  }
+  const { createMelExtractor } = await import('./effnet-mel.js');
+  const { melFrames } = createMelExtractor();
+
+  const modelPath = await ensureModelFile(spec.weights, modelCacheDir);
+  const labelsPath = await ensureModelFile(spec.labels, modelCacheDir);
+  const classes = JSON.parse(fs.readFileSync(labelsPath, 'utf8')).classes;
+
+  const session = await ort.InferenceSession.create(modelPath);
+
+  return {
+    // Core path: pre-cut segments (either sliced from one decoded signal by
+    // analyzeSignal below, or seek-decoded windows from analyzeFile).
+    async analyzeSegments(segs) {
+      // Mel rows per segment → non-overlapping 128-frame patches. A segment
+      // shorter than one patch is zero-padded (silence rows) so short-but-
+      // eligible tracks still embed instead of crashing.
+      const patches = [];
+      for (const seg of segs) {
+        const rows = melFrames(seg);
+        if (!rows.length) { continue; }
+        while (rows.length < spec.patchFrames) { rows.push(new Float32Array(spec.melBands)); }
+        for (let start = 0; start + spec.patchFrames <= rows.length; start += spec.patchFrames) {
+          const patch = new Float32Array(spec.patchFrames * spec.melBands);
+          for (let f = 0; f < spec.patchFrames; f++) { patch.set(rows[start + f], f * spec.melBands); }
+          patches.push(patch);
+        }
+      }
+      if (!patches.length) { throw new Error('no audio content to analyse'); }
+
+      const batch = new Float32Array(patches.length * spec.patchFrames * spec.melBands);
+      patches.forEach((p, i) => batch.set(p, i * spec.patchFrames * spec.melBands));
+      const out = await session.run({
+        melspectrogram: new ort.Tensor('float32', batch, [patches.length, spec.patchFrames, spec.melBands]),
+      });
+
+      const embDim = out.embeddings.dims[1];
+      const perPatchEmb = [];
+      for (let i = 0; i < out.embeddings.dims[0]; i++) {
+        perPatchEmb.push(Float32Array.from(out.embeddings.data.subarray(i * embDim, (i + 1) * embDim)));
+      }
+
+      const actDim = out.activations.dims[1];
+      const perPatchAct = [];
+      for (let i = 0; i < out.activations.dims[0]; i++) {
+        perPatchAct.push(Float32Array.from(out.activations.data.subarray(i * actDim, (i + 1) * actDim)));
+      }
+      const styles = meanPool(perPatchAct);
+      const genreTags = Array.from(styles)
+        .map((p, i) => ({ p, name: classes[i] }))
+        .filter((s) => s.p >= spec.tagThreshold)
+        .sort((a, b) => b.p - a.p)
+        .slice(0, spec.tagTopK)
+        .map((s) => s.name);
+
+      return {
+        embedding: l2normalize(meanPool(perPatchEmb)),
+        genreTags: genreTags.length ? genreTags : null,
+      };
+    },
+    // Whole-signal path (callers without a known duration): cut the fixed
+    // windows out of the decoded signal, then run the core path. Returns
+    // analyzeSegments' promise directly — no `async` needed.
+    analyzeSignal(signal) {
+      return this.analyzeSegments(segments(signal, spec));
+    },
+  };
+}
+
+// Deterministic pseudo-embedder: dim buckets of per-band RMS over the
+// segment. Same audio → same vector, on every platform, no dependencies.
+function createFakeEmbedder(spec) {
+  return {
+    // Not declared async (nothing to await) — callers `await` it anyway,
+    // which is a no-op on a plain value, so the interface stays uniform
+    // with the real embedders.
+    analyzeSignal(signal) {
+      const segEmbeds = segments(signal, spec).map((seg) => {
+        const v = new Float32Array(spec.dim);
+        const band = Math.max(1, Math.floor(seg.length / spec.dim));
+        for (let b = 0; b < spec.dim; b++) {
+          let ss = 0;
+          const start = b * band;
+          const end = Math.min(start + band, seg.length);
+          for (let i = start; i < end; i++) { ss += seg[i] * seg[i]; }
+          v[b] = Math.sqrt(ss / Math.max(1, end - start));
+        }
+        return v;
+      });
+      return { embedding: l2normalize(meanPool(segEmbeds)), genreTags: null };
+    },
+  };
+}
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+/**
+ * Build the embedder for a registry key. Expensive for real models (module
+ * load + weights download on first use + graph init) — call once per run.
+ */
+export async function createEmbedder(key, opts = {}) {
+  const spec = getModelSpec(key);
+  switch (spec.kind) {
+    case 'effnet-discogs': return { spec, ...(await createEffnetEmbedder(spec, opts)) };
+    case 'fake': return { spec, ...createFakeEmbedder(spec) };
+    default: throw new Error(`no embedder factory for model kind '${spec.kind}'`);
+  }
+}
+
+/**
+ * Decode + analyse one file: ffmpeg → mono f32 at the model's rate →
+ * analyze. Decode reuses audio-analysis-lib's ffmpeg glue.
+ *
+ * When the caller knows the track duration (the worker reads it from the
+ * library DB) and the embedder supports pre-cut segments, only the analysis
+ * WINDOWS are decoded (ffmpeg input-seek per window) instead of the whole
+ * file — for a typical 4-minute track that's 30 s of decode instead of
+ * 240 s. Without a duration (or for whole-signal embedders) it falls back
+ * to the original full decode, which is also the path for tracks short
+ * enough to fit inside one window.
+ *
+ * @returns {Promise<{embedding: Float32Array, genreTags: string[]|null}>}
+ */
+export async function analyzeFile(embedder, audioPath, ffmpegBin, { maxSeconds = 600, timeoutMs, durationSec } = {}) {
+  const spec = embedder.spec;
+  const decodeOpts = {
+    sampleRate: spec.sampleRate,
+    ...(timeoutMs ? { timeoutMs } : {}),
+  };
+
+  const seekable = typeof embedder.analyzeSegments === 'function'
+    && Number.isFinite(durationSec)
+    && Array.isArray(spec.segmentPositions)
+    && durationSec > spec.segmentSeconds * 2;   // short tracks: one decode is cheaper
+
+  if (seekable) {
+    const cappedDuration = Math.min(durationSec, maxSeconds);
+    const segs = [];
+    for (const p of spec.segmentPositions) {
+      const start = Math.max(0, Math.min(cappedDuration * p, cappedDuration - spec.segmentSeconds));
+      segs.push(await decodePcmF32(audioPath, ffmpegBin, {
+        ...decodeOpts,
+        seekSec: start,
+        maxSeconds: spec.segmentSeconds,
+      }));
+    }
+    return embedder.analyzeSegments(segs);
+  }
+
+  const signal = await decodePcmF32(audioPath, ffmpegBin, { ...decodeOpts, maxSeconds });
+  return embedder.analyzeSignal(signal);
+}

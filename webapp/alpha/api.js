@@ -22,7 +22,14 @@ const MSTREAMAPI = (() => {
     });
 
     if (res.ok !== true) {
-      throw new Error(res);
+      // Carry the status + parsed error envelope ({error: message} —
+      // src/server.js's handler shape) so callers can branch on WHAT
+      // failed instead of showing a generic toast. Previously this
+      // threw `new Error(res)` whose message was "[object Response]".
+      const err = new Error(`${type} ${url} failed: ${res.status}`);
+      err.status = res.status;
+      err.body = await res.json().catch(() => null);
+      throw err;
     }
 
     return await res.json();
@@ -64,6 +71,65 @@ const MSTREAMAPI = (() => {
     } catch (_) {
       return { artists: [] };
     }
+  };
+
+  // Discovery similarity (model embeddings — /api/v1/discovery/*). The
+  // Discover panel degrades on these, never breaks: a 403 means the
+  // feature is disabled on this server ({disabled:true} → the panel hides
+  // itself for the session); any other failure returns null (panel just
+  // skips this refresh). Uses raw fetch instead of req() because the
+  // disabled-vs-error distinction needs the status code.
+  async function discoveryReq(route, body) {
+    try {
+      const res = await fetch(mstreamModule.currentServer.host + route, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-access-token': mstreamModule.currentServer.token
+        },
+        body: JSON.stringify(body)
+      });
+      if (res.status === 403) { return { disabled: true }; }
+      if (!res.ok) { return null; }
+      return await res.json();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  mstreamModule.discoverySimilar = (filePath, limit) => {
+    return discoveryReq('api/v1/discovery/local/similar/tracks', { filePath, limit: limit || 5 });
+  };
+
+  mstreamModule.discoverySimilarArtists = (artist, limit) => {
+    return discoveryReq('api/v1/discovery/local/similar/artists', { artist, limit: limit || 3 });
+  };
+
+  // The network side of Discover: similar tracks on OTHER servers' fetched
+  // snapshots (metadata only — these tracks aren't in the local library).
+  mstreamModule.discoveryP2pSimilar = (filePath, limit, newArtistsOnly) => {
+    return discoveryReq('api/v1/discovery/p2p/similar', {
+      filePath, limit: limit || 5, newArtistsOnly: newArtistsOnly === true,
+    });
+  };
+
+  // The federated side of Discover: live similarity answers from the
+  // servers this one is PAIRED with (Admin → Federation). Leads for now —
+  // they become playable once the federation stream proxy lands.
+  mstreamModule.discoveryFederationSimilar = (filePath, limit, newArtistsOnly) => {
+    return discoveryReq('api/v1/discovery/federation/similar', {
+      filePath, limit: limit || 5, newArtistsOnly: newArtistsOnly === true,
+    });
+  };
+
+  // The sonic path: an ordered, queueable journey from one local track to
+  // another — waypoints along the arc between their embeddings, seeds
+  // included in the results. Reveal via the ping's discoveryPath flag
+  // (the flag means "this server version has the route"), never a probe.
+  mstreamModule.discoveryPath = (startFilePath, endFilePath, length) => {
+    return discoveryReq('api/v1/discovery/local/path', {
+      startFilePath, endFilePath, length: length || 14,
+    });
   };
 
   // POST /api/v1/db/genres → { genres: [{ name, track_count }] }.

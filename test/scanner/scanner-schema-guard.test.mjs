@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url';
 import { MIGRATIONS, SCHEMA_VERSION } from '../../src/db/schema.js';
 import {
   writeScannerPidfile, clearScannerPidfile, reapOrphanedScanner,
+  looksLikeScanner,
 } from '../../src/db/scan-pidfile.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -118,7 +119,7 @@ describe('stale sweep verify-absence (deleteStaleTracks)', () => {
 
     const deleted = deleteStaleTracks(db, allCandidates(db), SCHEMA_VERSION,
       { libraryRoot: lib, followSymlinks: false });
-    assert.strictEqual(deleted, 1, 'only the file that is really gone gets deleted');
+    assert.strictEqual(deleted.removed, 1, 'only the file that is really gone gets deleted');
     // Spread into plain objects: node:sqlite rows have a null prototype,
     // which deepStrictEqual treats as a mismatch against object literals.
     const rows = db.prepare('SELECT filepath, scan_id FROM tracks ORDER BY filepath')
@@ -136,7 +137,7 @@ describe('stale sweep verify-absence (deleteStaleTracks)', () => {
     const again = deleteStaleTracks(check, allCandidates(check), SCHEMA_VERSION,
       { libraryRoot: lib, followSymlinks: false });
     check.close();
-    assert.strictEqual(again, 0);
+    assert.strictEqual(again.removed, 0);
   });
 
   test('failed-walk prefixes shield rows; unverifiable listings are left untouched', async () => {
@@ -157,7 +158,7 @@ describe('stale sweep verify-absence (deleteStaleTracks)', () => {
 
     const deleted = deleteStaleTracks(db, allCandidates(db), SCHEMA_VERSION,
       { libraryRoot: lib, followSymlinks: false, failedWalkPrefixes: ['broken'] });
-    assert.strictEqual(deleted, 1, 'only the verifiable-and-gone row is deleted');
+    assert.strictEqual(deleted.removed, 1, 'only the verifiable-and-gone row is deleted');
     const rows = db.prepare('SELECT filepath, scan_id FROM tracks ORDER BY filepath')
       .all().map(r => ({ ...r }));
     db.close();
@@ -184,7 +185,7 @@ describe('stale sweep verify-absence (deleteStaleTracks)', () => {
       { libraryRoot: lib, followSymlinks: false });
     const n = db.prepare('SELECT COUNT(*) AS n FROM tracks').get().n;
     db.close();
-    assert.strictEqual(deleted, 1);
+    assert.strictEqual(deleted.removed, 1);
     assert.strictEqual(n, 0);
   });
 
@@ -208,13 +209,13 @@ describe('stale sweep verify-absence (deleteStaleTracks)', () => {
     // sweep must agree it is "absent" and delete the row...
     const deletedNoFollow = deleteStaleTracks(db, allCandidates(db), SCHEMA_VERSION,
       { libraryRoot: lib, followSymlinks: false });
-    assert.strictEqual(deletedNoFollow, 1);
+    assert.strictEqual(deletedNoFollow.removed, 1);
     // ...while followSymlinks=true treats it as present (kept untouched).
     db.prepare('INSERT INTO tracks (filepath, library_id, scan_id, modified) VALUES (?, 1, ?, 1)')
       .run('linked.mp3', 'ancient');
     const deletedFollow = deleteStaleTracks(db, allCandidates(db), SCHEMA_VERSION,
       { libraryRoot: lib, followSymlinks: true });
-    assert.strictEqual(deletedFollow, 0);
+    assert.strictEqual(deletedFollow.removed, 0);
     const row = db.prepare('SELECT scan_id FROM tracks WHERE filepath = ?').get('linked.mp3');
     db.close();
     assert.strictEqual(row.scan_id, 'ancient');
@@ -475,14 +476,30 @@ describe('orphan reaper (scan-pidfile.js)', () => {
     }
   });
 
-  test('live orphaned JS scanner is killed', { timeout: 60000 }, async () => {
+  test('live orphaned JS scanner is killed', { timeout: 150000 }, async () => {
     const tmp = makeTmp('orphan');
     // A real "orphan": a node process running a file named scanner.mjs,
     // which is what the identity check requires before killing a
     // node-image pid. The recording server process is dead, so the file
-    // is written by hand with a foreign ppid. (The command-line probe
-    // shells out — on Windows via PowerShell CIM — hence the generous
-    // timeout.)
+    // is written by hand with a foreign ppid.
+    //
+    // Timing: reapOrphanedScanner is fully synchronous, and for a js
+    // record on Windows the command-line probe can legitimately blow its
+    // whole budget on a cold, loaded runner (wmic ≤5s, then PowerShell
+    // CIM ≤30s — the 30s cap was itself blown on 2026-08-20 after the 8s
+    // cap fell on 2026-08-04). When that happens the verdict is
+    // 'unknown' and the reaper — BY CONTRACT — keeps the record and
+    // declines to kill: a later boot retries. A single reap call plus a
+    // fixed wait therefore flakes by design pressure, not by bug.
+    //
+    // So model successive boots: reap in a loop. The first attempt
+    // doubles as the WMI/PowerShell warm-up, and a retry against warm
+    // services decides in seconds. The loop still fails if the reaper
+    // never kills what it CAN identify — the behavior under guard — and
+    // the record must be gone once it has. Budget arithmetic for the
+    // declared timeout: worst-case attempt ≈ 40s of shell-out caps
+    // (tasklist 5 + wmic 5 + CIM 30) + 10s wait; new attempts start only
+    // inside the first 90s, so the ceiling is ~140s — 150s covers it.
     const fakeScanner = path.join(tmp, 'scanner.mjs');
     fs.writeFileSync(fakeScanner, 'setInterval(() => {}, 1000);\n');
     const p = child.spawn(process.execPath, [fakeScanner], { stdio: 'ignore' });
@@ -495,13 +512,93 @@ describe('orphan reaper (scan-pidfile.js)', () => {
         marker: fakeScanner,
         startedAt: 'x',
       }));
-      reapOrphanedScanner(tmp);
-      const died = await waitFor(() => p.exitCode !== null || p.signalCode !== null, 10000);
-      assert.ok(died, 'orphaned scanner should be terminated by the reaper');
+      const lastBoot = Date.now() + 90000;
+      let died = false;
+      do {
+        reapOrphanedScanner(tmp);
+        died = await waitFor(() => p.exitCode !== null || p.signalCode !== null, 10000);
+      } while (!died && Date.now() < lastBoot);
+      assert.ok(died, 'orphaned scanner should be terminated by the reaper (retried across simulated boots)');
       assert.ok(!fs.existsSync(path.join(tmp, '.scanner.pid.json')));
     } finally {
       try { p.kill(); } catch (_) { /* already dead */ }
     }
+  });
+});
+
+// ── looksLikeScanner verdict table ──────────────────────────────────────────
+// The tri-state is the reaper's safety contract: it kills ONLY on
+// 'scanner', drops the record only on 'stranger' (provably recycled pid),
+// and keeps the record on 'unknown' so a later boot retries instead of
+// forgetting a live orphan. The verdicts are truthy STRINGS — a caller
+// using them as booleans would treat 'stranger' as a kill license — so
+// these tests pin the exact values, with hand-built probes (no process
+// spawning, no shell-outs).
+describe('looksLikeScanner verdicts (kill only on provable identity)', () => {
+  const rustImage = 'rust-parser-win32-x64.exe';
+
+  test('rust: image match with the rust-parser prefix → scanner', () => {
+    assert.strictEqual(looksLikeScanner(
+      { image: rustImage, cmdline: null },
+      { kind: 'rust', image: rustImage }), 'scanner');
+  });
+
+  test('rust: recycled pid (different image) → stranger', () => {
+    assert.strictEqual(looksLikeScanner(
+      { image: 'node.exe', cmdline: null },
+      { kind: 'rust', image: rustImage }), 'stranger');
+  });
+
+  test('rust: matching but non-rust-parser image (corrupt record) → stranger, never scanner', () => {
+    assert.strictEqual(looksLikeScanner(
+      { image: 'node.exe', cmdline: null },
+      { kind: 'rust', image: 'node.exe' }), 'stranger');
+  });
+
+  test('waveform follows the rust rule', () => {
+    assert.strictEqual(looksLikeScanner(
+      { image: rustImage, cmdline: null },
+      { kind: 'waveform', image: rustImage }), 'scanner');
+  });
+
+  test('js: matching image + marker in the command line → scanner', () => {
+    assert.strictEqual(looksLikeScanner(
+      { image: 'node.exe', cmdline: '"C:\\node.exe" C:\\app\\src\\db\\scanner.mjs {"dbPath":"x"}' },
+      { kind: 'js', image: 'node.exe', marker: 'C:\\app\\src\\db\\scanner.mjs' }), 'scanner');
+  });
+
+  test('js: pre-marker record falls back to the bare scanner.mjs needle', () => {
+    assert.strictEqual(looksLikeScanner(
+      { image: 'node', cmdline: 'node /srv/mstream/src/db/scanner.mjs payload' },
+      { kind: 'js', image: 'node' }), 'scanner');
+  });
+
+  test('js: image mismatch → stranger, even when the cmdline mentions the marker', () => {
+    assert.strictEqual(looksLikeScanner(
+      { image: 'python.exe', cmdline: 'python watch.py scanner.mjs' },
+      { kind: 'js', image: 'node.exe', marker: 'scanner.mjs' }), 'stranger');
+  });
+
+  test('js: matching image but NO readable command line → unknown (keep + retry, never kill)', () => {
+    // The 2026-08-04 CI failure mode: PowerShell CIM timed out, cmdline
+    // came back null, and the old boolean collapse dropped the record —
+    // permanently forgetting a live orphan. 'unknown' is what makes the
+    // reaper retry on the next boot instead.
+    assert.strictEqual(looksLikeScanner(
+      { image: 'node.exe', cmdline: null },
+      { kind: 'js', image: 'node.exe', marker: 'scanner.mjs' }), 'unknown');
+  });
+
+  test('js: matching image, unrelated command line → stranger', () => {
+    assert.strictEqual(looksLikeScanner(
+      { image: 'node.exe', cmdline: '"C:\\node.exe" C:\\somewhere\\server.js' },
+      { kind: 'js', image: 'node.exe', marker: 'scanner.mjs' }), 'stranger');
+  });
+
+  test('unrecognized kind can never be verified → stranger', () => {
+    assert.strictEqual(looksLikeScanner(
+      { image: 'node.exe', cmdline: 'node scanner.mjs' },
+      { kind: 'zig', image: 'node.exe' }), 'stranger');
   });
 });
 
