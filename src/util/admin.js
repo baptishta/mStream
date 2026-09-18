@@ -8,7 +8,11 @@ import * as mStreamServer from '../server.js';
 import * as dbQueue from '../db/task-queue.js';
 import * as logger from '../logger.js';
 import * as db from '../db/manager.js';
-import * as syncthing from '../state/syncthing.js';
+import { cleanupOrphans } from '../db/orphan-cleanup.js';
+// syncthing import disabled — federation feature is being rebuilt
+// around the local-backup story (see src/server.js). Restore this
+// import when re-enabling enableFederation() below.
+// import * as syncthing from '../state/syncthing.js';
 import * as dlnaSsdp from '../dlna/ssdp.js';
 import * as dlnaServer from '../dlna/dlna-server.js';
 import * as subsonicServer from '../subsonic/subsonic-server.js';
@@ -90,15 +94,14 @@ export async function removeDirectory(vpath) {
   // CASCADE will delete tracks and user_libraries entries
   d.prepare('DELETE FROM libraries WHERE id = ?').run(library.id);
 
-  // Clean up orphaned artists/albums. Keep artists referenced by either
-  // the single-valued FKs OR the V17 M2M tables — otherwise cascade would
-  // drop track_artists/album_artists rows for featured/co-credited artists.
-  d.exec('DELETE FROM albums WHERE id NOT IN (SELECT DISTINCT album_id FROM tracks WHERE album_id IS NOT NULL)');
-  d.exec(`DELETE FROM artists
-          WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks         WHERE artist_id IS NOT NULL)
-            AND id NOT IN (SELECT DISTINCT artist_id FROM albums         WHERE artist_id IS NOT NULL)
-            AND id NOT IN (SELECT DISTINCT artist_id FROM track_artists)
-            AND id NOT IN (SELECT DISTINCT artist_id FROM album_artists)`);
+  // Clean up orphan albums / artists / genres left over after the
+  // tracks cascade. Chunked + commits per chunk so the multi-second
+  // 4-way NOT IN on artists doesn't bust busy_timeout for concurrent
+  // API writes — see src/db/orphan-cleanup.js for the design notes.
+  // Worse here than in the scanner because this runs INSIDE the main
+  // Node process — a multi-second sync DELETE would block every other
+  // request handler too.
+  cleanupOrphans(d);
 
   db.invalidateCache();
 
@@ -181,6 +184,29 @@ export async function editUserAccess(username, admin, allowMkdir, allowUpload, a
     'UPDATE users SET is_admin = ?, allow_mkdir = ?, allow_upload = ?, allow_file_modify = ?, allow_server_audio = ? WHERE id = ?'
   ).run(admin ? 1 : 0, allowMkdir ? 1 : 0, allowUpload ? 1 : 0, allowFileModify ? 1 : 0, allowServerAudio ? 1 : 0, user.id);
 
+  db.invalidateCache();
+}
+
+// Set or clear the V35 opt-in Subsonic-specific password. Pass null/empty
+// to clear (revert the user to no token-auth, friendly error message
+// at /rest/* time). Used by both the admin endpoint and (by way of
+// the user-side endpoint) by users managing their own.
+//
+// Imports the encrypt helper lazily — the helper depends on
+// config.program.subsonicSecret which isn't populated until config.setup
+// runs, and admin.js is imported much earlier in the boot path.
+export async function setSubsonicPassword(username, plaintext) {
+  const user = db.getUserByUsername(username);
+  if (!user) { throw new Error(`'${username}' does not exist`); }
+
+  const d = db.getDB();
+  if (plaintext == null || plaintext === '') {
+    d.prepare('UPDATE users SET subsonic_password_encrypted = NULL WHERE id = ?').run(user.id);
+  } else {
+    const { encryptSubsonicPassword } = await import('./subsonic-password.js');
+    const encrypted = encryptSubsonicPassword(plaintext);
+    d.prepare('UPDATE users SET subsonic_password_encrypted = ? WHERE id = ?').run(encrypted, user.id);
+  }
   db.invalidateCache();
 }
 
@@ -283,14 +309,6 @@ export async function editBootScanDelay(val) {
   config.program.scanOptions.bootScanDelay = val;
 }
 
-export async function editMaxConcurrentTasks(val) {
-  const loadConfig = await loadFile(config.configFile);
-  if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
-  loadConfig.scanOptions.maxConcurrentTasks = val;
-  await saveFile(loadConfig, config.configFile);
-  config.program.scanOptions.maxConcurrentTasks = val;
-}
-
 export async function editCompressImages(val) {
   const loadConfig = await loadFile(config.configFile);
   if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
@@ -305,6 +323,37 @@ export async function editScanCommitInterval(val) {
   loadConfig.scanOptions.scanCommitInterval = val;
   await saveFile(loadConfig, config.configFile);
   config.program.scanOptions.scanCommitInterval = val;
+}
+
+export async function editScanThreads(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
+  loadConfig.scanOptions.scanThreads = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.scanOptions.scanThreads = val;
+}
+
+export async function editGenerateWaveforms(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
+  loadConfig.scanOptions.generateWaveforms = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.scanOptions.generateWaveforms = val;
+}
+
+// stratum-dsp BPM + musical-key detection toggle. Mirrors the
+// generateWaveforms pattern above: persist to config.json on disk
+// so the new value survives restart, then mutate config.program
+// in-memory so the *next* scan-task spawn (task-queue.js builds
+// jsonLoad fresh each scan, see :461) picks up the change without
+// waiting for a process restart. Rust-only feature — the JS
+// fallback scanner accepts the field but doesn't run analysis.
+export async function editAnalyzeBpm(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.scanOptions) { loadConfig.scanOptions = {}; }
+  loadConfig.scanOptions.analyzeBpm = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.scanOptions.analyzeBpm = val;
 }
 
 export async function editAutoAlbumArt(val) {
@@ -434,14 +483,17 @@ export async function enableSubsonic(mode, port) {
   if (mode === 'separate-port') { subsonicServer.start(); }
 }
 
-export async function enableFederation(val) {
-  const loadConfig = await loadFile(config.configFile);
-  if (!loadConfig.federation) { loadConfig.federation = {}; }
-  loadConfig.federation.enabled = val;
-  await saveFile(loadConfig, config.configFile);
-  config.program.federation.enabled = val;
-  syncthing.setup();
-}
+// Federation toggle disabled — see the syncthing import above.
+// Re-enable along with the syncthing import + the API endpoint in
+// src/api/admin.js when federation comes back.
+// export async function enableFederation(val) {
+//   const loadConfig = await loadFile(config.configFile);
+//   if (!loadConfig.federation) { loadConfig.federation = {}; }
+//   loadConfig.federation.enabled = val;
+//   await saveFile(loadConfig, config.configFile);
+//   config.program.federation.enabled = val;
+//   syncthing.setup();
+// }
 
 export async function removeSSL() {
   const loadConfig = await loadFile(config.configFile);

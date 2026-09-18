@@ -4,7 +4,6 @@ import * as vpath from '../util/vpath.js';
 import * as dbQueue from '../db/task-queue.js';
 import * as db from '../db/manager.js';
 import { joiValidate, dualId } from '../util/validation.js';
-import WebError from '../util/web-error.js';
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -28,7 +27,33 @@ export function renderMetadataObj(row) {
       rating: row.rating || null,
       'play-count': row.play_count || null,
       'last-played': row.last_played || null,
-      'replaygain-track': row.replaygain_track_db || null
+      'replaygain-track': row.replaygain_track_db || null,
+      // V32 columns surfaced for client-side Auto-DJ. The webapp uses
+      // these to display "128 BPM · A minor (8A)" pills and to drive
+      // the BPM-continuity / harmonic-mixing toggles (build a request
+      // body for /api/v1/db/random-songs from the currently-playing
+      // song's tag values). NULL on rows whose tags didn't carry BPM
+      // or musical key — the client falls back to no-anchor behaviour.
+      //
+      // Note the kebab-case `musical-key` on the wire. The DB column
+      // stays snake_case (SQL convention) but every multi-word field
+      // in this output object uses kebab-case to match the existing
+      // shape (`album-art`, `play-count`, `last-played`,
+      // `replaygain-track`).
+      bpm: row.bpm ?? null,
+      'musical-key': row.musical_key ?? null,
+      // V35 (planned): multi-genre list surfaced for the client-side
+      // Auto-DJ genre filter (whitelist / blacklist `songBlocked`
+      // branch). Always emitted, even when empty — caller null-coalesce
+      // checks against `metadata.genres.length === 0` rather than
+      // `=== undefined`. Names match the order they were inserted into
+      // track_genres by the scanner (typically tag order). Sourced via
+      // a LEFT JOIN + GROUP_CONCAT aggregation in trackQuery() below;
+      // char(31) (ASCII unit separator) is the join delimiter so no
+      // legal genre name can collide with it.
+      genres: row.genres_concat
+        ? row.genres_concat.split(String.fromCharCode(31)).filter(Boolean)
+        : [],
     }
   };
 }
@@ -53,18 +78,64 @@ export function libraryFilter(user, ignoreVPaths) {
   };
 }
 
-// Base query: tracks joined with artists, albums, library, and optionally user_metadata
-export function trackQuery(userId) {
+// Base query: tracks joined with artists, albums, library, optionally
+// user_metadata, and (when `includeGenres` is set) a track_genres
+// aggregation.
+//
+// `includeGenres` controls whether the `tg_agg` LEFT JOIN runs:
+//
+//   • true (default) — adds a GROUP_CONCAT subquery over track_genres
+//     so `renderMetadataObj` can emit `metadata.genres: string[]`
+//     without per-row follow-ups. Use this for response-shaped queries
+//     (velvet-stubs list endpoints, smart-playlists, pullMetaData).
+//
+//   • false — skip the join. Use for candidate-set queries where only
+//     ONE row will actually be rendered (the random-songs picker
+//     loads the candidate pool, picks one index, then enriches just
+//     that row via fetchGenresForTrack below). SQLite has to
+//     MATERIALIZE tg_agg before applying the WHERE clause, so the
+//     cost scales with the full tracks table, not the filtered
+//     candidate set — skipping it cuts the picker's SQL time by ~80%
+//     on a smoke-sized DB and avoids ~460ms of overhead extrapolated
+//     to a 100k-track library.
+//
+// char(31) (ASCII unit separator) is the join delimiter so no legal
+// genre name can collide with it.
+export function trackQuery(userId, { includeGenres = true } = {}) {
+  const aggJoin = includeGenres ? `
+    LEFT JOIN (
+      SELECT tg.track_id, GROUP_CONCAT(g.name, char(31)) AS genres_concat
+        FROM track_genres tg
+        JOIN genres g ON g.id = tg.genre_id
+       GROUP BY tg.track_id
+    ) tg_agg ON tg_agg.track_id = t.id` : '';
+  const aggCol = includeGenres ? ', tg_agg.genres_concat' : '';
   return `
     SELECT t.*, a.name AS artist_name, al.name AS album_name,
            l.name AS library_name,
-           um.rating, um.play_count, um.last_played
+           um.rating, um.play_count, um.last_played${aggCol}
     FROM tracks t
     LEFT JOIN artists a ON t.artist_id = a.id
     LEFT JOIN albums al ON t.album_id = al.id
     LEFT JOIN libraries l ON t.library_id = l.id
-    LEFT JOIN user_metadata um ON COALESCE(t.audio_hash, t.file_hash) = um.track_hash AND um.user_id = ${userId ? '?' : 'NULL'}
+    LEFT JOIN user_metadata um ON COALESCE(t.audio_hash, t.file_hash) = um.track_hash AND um.user_id = ${userId ? '?' : 'NULL'}${aggJoin}
   `;
+}
+
+// Look up the genres list for a single track. Used by callers that
+// run `trackQuery(..., { includeGenres: false })` to keep the
+// candidate-set query lean (random-songs picker) and then enrich
+// just the chosen row before response. Returns the row in the same
+// shape the LEFT JOIN aggregation produces — `{ genres_concat: <str>|null }`
+// — so callers can splat it onto the picked row and feed it to
+// renderMetadataObj unchanged.
+export function fetchGenresForTrack(d, trackId) {
+  return d.prepare(`
+    SELECT GROUP_CONCAT(g.name, char(31)) AS genres_concat
+      FROM track_genres tg
+      JOIN genres g ON g.id = tg.genre_id
+     WHERE tg.track_id = ?
+  `).get(trackId) || { genres_concat: null };
 }
 
 // ── Exported metadata lookup (used by other modules) ────────────────────────
@@ -242,11 +313,15 @@ export function setup(mstream) {
       ? [req.user.id, String(req.body.genre), ...filter.params]
       : [String(req.body.genre), ...filter.params];
 
+    // V34: case-insensitive name match — uniform with the post-V34
+    // case-folded vocabulary getGenres now returns. Pre-V34 this
+    // would silently miss "Jazz" vs "jazz" if the M2M had both rows
+    // (the "1247 jazz tracks shown but only 800 returned" bug).
     const rows = d().prepare(`
       ${trackQuery(req.user?.id)}
       JOIN track_genres tg ON tg.track_id = t.id
       JOIN genres g ON g.id = tg.genre_id
-      WHERE g.name = ? AND ${filter.clause}
+      WHERE g.name COLLATE NOCASE = ? AND ${filter.clause}
       ORDER BY a.name COLLATE NOCASE, al.name COLLATE NOCASE, t.disc_number, t.track_number
     `).all(...allParams);
 
@@ -290,79 +365,10 @@ export function setup(mstream) {
   });
 
   // ── Search ──────────────────────────────────────────────────────────────
-
-  mstream.post('/api/v1/db/search', (req, res) => {
-    const schema = Joi.object({
-      search: Joi.string().required(),
-      noArtists: Joi.boolean().optional(),
-      noAlbums: Joi.boolean().optional(),
-      noTitles: Joi.boolean().optional(),
-      noFiles: Joi.boolean().optional(),
-      ignoreVPaths: Joi.array().items(Joi.string()).optional()
-    });
-    joiValidate(schema, req.body);
-
-    const filter = libraryFilter(req.user, req.body?.ignoreVPaths);
-    const searchPattern = `%${req.body.search}%`;
-
-    const artists = req.body.noArtists ? [] : d().prepare(`
-      SELECT DISTINCT a.name, (
-        SELECT t2.album_art_file FROM tracks t2
-        WHERE t2.artist_id = a.id AND t2.album_art_file IS NOT NULL
-        LIMIT 1
-      ) AS album_art_file
-      FROM artists a JOIN tracks t ON t.artist_id = a.id
-      WHERE a.name LIKE ? AND ${filter.clause}
-      ORDER BY a.name COLLATE NOCASE LIMIT 30
-    `).all(searchPattern, ...filter.params).map(r => ({
-      name: r.name,
-      album_art_file: r.album_art_file || null,
-      filepath: false
-    }));
-
-    const albums = req.body.noAlbums ? [] : d().prepare(`
-      SELECT DISTINCT al.name, al.album_art_file
-      FROM albums al JOIN tracks t ON t.album_id = al.id
-      WHERE al.name LIKE ? AND ${filter.clause}
-      ORDER BY al.name COLLATE NOCASE LIMIT 30
-    `).all(searchPattern, ...filter.params).map(r => ({
-      name: r.name,
-      album_art_file: r.album_art_file || null,
-      filepath: false
-    }));
-
-    const title = req.body.noTitles ? [] : d().prepare(`
-      SELECT t.title, t.album_art_file, a.name AS artist_name, l.name AS library_name, t.filepath
-      FROM tracks t
-      JOIN libraries l ON t.library_id = l.id
-      LEFT JOIN artists a ON t.artist_id = a.id
-      WHERE t.title LIKE ? AND ${filter.clause}
-      LIMIT 30
-    `).all(searchPattern, ...filter.params).map(r => {
-      const fp = path.join(r.library_name, r.filepath).replace(/\\/g, '/');
-      return {
-        name: r.artist_name ? `${r.artist_name} - ${r.title}` : r.title,
-        album_art_file: r.album_art_file || null,
-        filepath: fp
-      };
-    });
-
-    const files = req.body.noFiles ? [] : d().prepare(`
-      SELECT l.name AS library_name, t.filepath, t.album_art_file
-      FROM tracks t JOIN libraries l ON t.library_id = l.id
-      WHERE t.filepath LIKE ? AND ${filter.clause}
-      LIMIT 30
-    `).all(searchPattern, ...filter.params).map(r => {
-      const fp = path.join(r.library_name, r.filepath).replace(/\\/g, '/');
-      return {
-        name: fp,
-        album_art_file: r.album_art_file || null,
-        filepath: fp
-      };
-    });
-
-    res.json({ artists, albums, title, files });
-  });
+  // /api/v1/db/search lives in src/api/search.js. server.js calls
+  // searchApi.setup(mstream) separately. Kept out of this file so
+  // the search implementation can grow without bloating the generic
+  // DB route module.
 
   // ── Rated Songs ─────────────────────────────────────────────────────────
 
@@ -475,52 +481,9 @@ export function setup(mstream) {
   });
 
   // ── Random Songs (Auto DJ) ──────────────────────────────────────────────
-
-  mstream.post('/api/v1/db/random-songs', (req, res) => {
-    const filter = libraryFilter(req.user, req.body?.ignoreVPaths);
-    const conditions = [filter.clause];
-    const params = [...(req.user?.id ? [req.user.id] : []), ...filter.params];
-
-    if (req.body.minRating && Number(req.body.minRating) > 0) {
-      conditions.push('um.rating >= ?');
-      params.push(Number(req.body.minRating));
-    }
-
-    // Get all matching songs (needed for ignoreList index-based deduplication)
-    const results = d().prepare(`
-      ${trackQuery(req.user?.id)}
-      WHERE ${conditions.join(' AND ')}
-    `).all(...params);
-
-    const count = results.length;
-    if (count === 0) { throw new WebError('No songs that match criteria', 400); }
-
-    // Restore v5.16 ignoreList deduplication behavior
-    let ignoreList = Array.isArray(req.body.ignoreList) ? [...req.body.ignoreList] : [];
-    let ignorePercentage = 0.5;
-    if (req.body.ignorePercentage && typeof req.body.ignorePercentage === 'number') {
-      ignorePercentage = req.body.ignorePercentage;
-    }
-
-    // Trim ignoreList when it grows too large
-    while (ignoreList.length > count * ignorePercentage) {
-      ignoreList.shift();
-    }
-
-    // Pick a random index not in ignoreList
-    let randomNumber = Math.floor(Math.random() * count);
-    while (ignoreList.indexOf(randomNumber) > -1) {
-      randomNumber = Math.floor(Math.random() * count);
-    }
-
-    const randomSong = results[randomNumber];
-    ignoreList.push(randomNumber);
-
-    res.json({
-      songs: [renderMetadataObj(randomSong)],
-      ignoreList: ignoreList
-    });
-  });
+  // Route lives in src/api/random.js — it owns the BPM/key fallback
+  // waterfall + Camelot expansion + tier filter. Registered from
+  // src/server.js as randomApi.setup(mstream).
 
   // ── Load Playlist (with metadata) ───────────────────────────────────────
 

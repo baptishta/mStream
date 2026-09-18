@@ -10,6 +10,8 @@ import https from 'https';
 import { createRequire } from 'module';
 
 import * as dbApi from './api/db.js';
+import * as searchApi from './api/search.js';
+import * as randomApi from './api/random.js';
 import * as playlistApi from './api/playlist.js';
 import * as authApi from './api/auth.js';
 import * as fileExplorerApi from './api/file-explorer.js';
@@ -22,8 +24,15 @@ import * as config from './state/config.js';
 import * as logger from './logger.js';
 import * as transcode from './api/transcode.js';
 import * as dbManager from './db/manager.js';
-import * as syncthing from './state/syncthing.js';
-import * as federationApi from './api/federation.js';
+// Federation + syncthing are disabled while the feature is rebuilt
+// around the new local-backup story. The source files in
+// src/state/syncthing.js and src/api/federation.js stay on disk for
+// the eventual revival but aren't wired up — no syncthing process is
+// spawned, no /api/v1/federation/* routes are mounted. The admin UI
+// shows a "Coming Soon" placeholder where the Federation tab used
+// to be.
+// import * as syncthing from './state/syncthing.js';
+// import * as federationApi from './api/federation.js';
 // scanner.js removed — parser now writes directly to SQLite
 import * as ytdlApi from './api/ytdl.js';
 import * as dlnaApi from './api/dlna.js';
@@ -32,11 +41,15 @@ import * as dlnaServer from './dlna/dlna-server.js';
 import * as subsonicApi from './api/subsonic/index.js';
 import * as subsonicServer from './subsonic/subsonic-server.js';
 import * as userApiKeysApi from './api/user-api-keys.js';
+import * as userSubsonicPasswordApi from './api/user-subsonic-password.js';
 import * as serverPlaybackApi from './api/server-playback.js';
 import * as albumArtApi from './api/album-art.js';
 import * as waveformApi from './api/waveform.js';
+import * as scanApi from './api/scan.js';
 import * as lyricsApi from './api/lyrics.js';
 import * as lyricsLrclib from './api/lyrics-lrclib.js';
+import * as backupApi from './api/backup.js';
+import * as backupManager from './backup/manager.js';
 // Velvet UI modules — dynamically imported only when ui='velvet' is active
 import WebError from './util/web-error.js';
 
@@ -92,6 +105,10 @@ export async function serveIt(configFile) {
     );
     next();
   });
+  // Trust Proxy
+  if (config.program.trustProxy) {
+    mstream.set("trust proxy", true);
+  }
 
   // Setup DB
   dbManager.initDB();
@@ -237,6 +254,8 @@ export async function serveIt(configFile) {
 
   adminApi.setup(mstream);
   dbApi.setup(mstream);
+  searchApi.setup(mstream);
+  randomApi.setup(mstream);
   playlistApi.setup(mstream);
   downloadApi.setup(mstream);
   fileExplorerApi.setup(mstream);
@@ -244,19 +263,29 @@ export async function serveIt(configFile) {
   scrobblerApi.setup(mstream);
   remoteApi.setupAfterAuth(mstream, server);
   sharedApi.setupAfterSecurity(mstream);
-  syncthing.setup();
-  federationApi.setup(mstream);
+  // Federation/syncthing intentionally not set up — see disabled
+  // imports near the top of this file.
+  // syncthing.setup();
+  // federationApi.setup(mstream);
   ytdlApi.setup(mstream);
   albumArtApi.setup(mstream);
   waveformApi.setup(mstream);
+  scanApi.setup(mstream);
   lyricsApi.setup(mstream);
+  backupApi.setup(mstream);
   // V20 housekeeping: clean up 'pending' lyrics_cache rows from any
   // previous process that crashed mid-fetch, and start the periodic
   // orphan sweep. Both are opt-in-cheap (single UPDATE / DELETE on
   // a table that starts empty and is usually tiny).
   lyricsLrclib.onBoot();
+  // V26: mark any 'running' backup_history rows as failed (carryover
+  // from a crashed prior process), then start the daily-trigger and
+  // trash-retention timers. Idempotent — safe to call on every boot
+  // and on reboot().
+  backupManager.init();
   serverPlaybackApi.setup(mstream);
   userApiKeysApi.setup(mstream);
+  userSubsonicPasswordApi.setup(mstream);
 
   // VELVET ONLY: additional API modules loaded only when ui='velvet'
   // These provide features specific to the Velvet UI (ListenBrainz, smart playlists,
@@ -282,8 +311,18 @@ export async function serveIt(configFile) {
     velvetStubs.setup(mstream);
   }
 
-  // Versioned APIs
-  mstream.get('/api/', (req, res) => res.json({ "server": packageJson.version, "apiVersions": ["1"] }));
+  // Versioned APIs. Includes a small `features` block for the frontend
+  // to gate UI on without an extra round-trip — currently just whether
+  // the Subsonic API surface is mounted (used by the mobile-clients
+  // panel to conditionally render the Subsonic password / API key UI).
+  // Public — no auth required for this endpoint.
+  mstream.get('/api/', (req, res) => res.json({
+    server: packageJson.version,
+    apiVersions: ["1"],
+    features: {
+      subsonic: config.program.subsonic.mode !== 'disabled',
+    },
+  }));
 
   // album art folder
   mstream.get('/album-art/:file', albumArtApi.serveAlbumArtFile);
@@ -349,10 +388,8 @@ export function reboot() {
     scrobblerApi.reset();
     transcode.reset();
 
-    if (config.program.federation.enabled === false) {
-      syncthing.kill2();
-    }
-
+    // Federation/syncthing kill-on-reboot disabled — the syncthing
+    // process is never spawned while the feature is rebuilt.
     dlnaSsdp.stop();
     dlnaServer.stop();
     subsonicServer.stop();

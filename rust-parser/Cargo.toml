@@ -13,7 +13,11 @@ serde_json = "1"
 rusqlite = { version = "0.33", features = ["bundled"] }
 lofty = "0.22"
 walkdir = "2"
-md5 = "0.7"
+# RustCrypto's MD5 impl. The older `md5` crate (0.7) is marked unmaintained
+# (RUSTSEC informational — MD5 isn't used for security here, only content
+# addressing for cache keys + JS parity). `md-5` exports its library as
+# `md5`, so call sites still `use md5::{Md5, Digest}`.
+md-5 = "0.10"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # Pure-Rust audio decoder used to build the 800-bar waveform cache during a
 # scan. Codec features cover every extension in supportedAudioFiles
@@ -34,6 +38,26 @@ symphonia = { version = "0.5", default-features = false, features = [
     "ogg",
     "wav",
 ] }
+# File-level parallelism for the scan loop. Pure Rust, no C deps —
+# fits the same philosophy as md-5 / image-rs above. Workers run
+# extract_track concurrently and pipe results to the single writer
+# thread that owns the SQLite Connection (see run_scan in main.rs).
+rayon = "1"
+# Pure-Rust BPM + musical-key detector. Used during the existing
+# symphonia decode pass (see waveform_from_source / extract_track):
+# the same mono PCM buffer that feeds the 800-bar waveform is handed
+# to stratum-dsp::analyze_audio for tracks that don't already have
+# tag-sourced BPM/key. See `analyze_bpm` in ScanConfig + the audiobook
+# / duration gate in extract_track for the skip conditions.
+#
+# Pinned to the exact `1.0.0` release: stratum-dsp is a young niche
+# crate (single author, ~11 stars, December 2025 launch). Hermetic
+# builds beat caret-range surprises until the crate has a track
+# record. Transitively pulls symphonia 0.5 with features=["all"];
+# cargo merges feature unions, so our existing narrower symphonia
+# feature list still applies — the extra decoders just get linked
+# in. Pure Rust throughout — no new C deps.
+stratum-dsp = "=1.0.0"
 
 [profile.release]
 strip = true

@@ -80,6 +80,11 @@ export function setup(mstream) {
     const result = {};
     for (const lib of libraries) {
       result[lib.name] = {
+        // Numeric library id, exposed so admin UI flows that need to
+        // address libraries by id (e.g. /api/v1/admin/backup/* — the
+        // backup module joins on libraries.id) can avoid a second
+        // lookup. Existing consumers ignore unknown fields.
+        id: lib.id,
         root: lib.root_path,
         type: lib.type,
         // V21: per-library boolean. Admin panel renders a simple
@@ -124,16 +129,6 @@ export function setup(mstream) {
     res.json({});
   });
 
-  mstream.post("/api/v1/admin/db/params/max-concurrent-scans", async (req, res) => {
-    const schema = Joi.object({
-      maxConcurrentTasks:  Joi.number().integer().min(0).required()
-    });
-    joiValidate(schema, req.body);
-
-    await admin.editMaxConcurrentTasks(req.body.maxConcurrentTasks);
-    res.json({});
-  });
-
   mstream.post("/api/v1/admin/db/params/compress-image", async (req, res) => {
     const schema = Joi.object({
       compressImage:  Joi.boolean().required()
@@ -145,12 +140,77 @@ export function setup(mstream) {
   });
 
   mstream.post("/api/v1/admin/db/params/scan-commit-interval", async (req, res) => {
+    // Mirrors the soft cap in src/state/config.js's Joi schema —
+    // clamp+warn to 1000 instead of 400-rejecting. Same reasoning as
+    // there: a typo in an admin slider shouldn't take the API down,
+    // and the warning makes it visible in logs. We pass `value` (the
+    // post-clamp number) to the persister so the stored config matches
+    // the running config, not whatever oversized number the request
+    // body originally carried.
     const schema = Joi.object({
-      scanCommitInterval: Joi.number().integer().min(1).required()
+      scanCommitInterval: Joi.number().integer().min(1).required().custom((value) => {
+        if (value > 1000) {
+          winston.warn(`scanCommitInterval=${value} from admin POST exceeds 1000 cap; clamping to 1000`);
+          return 1000;
+        }
+        return value;
+      })
+    });
+    const { value } = joiValidate(schema, req.body);
+
+    await admin.editScanCommitInterval(value.scanCommitInterval);
+    res.json({});
+  });
+
+  // 0 = auto (Rust scanner picks half the available cores). Operators
+  // who want to push harder during a known-quiet maintenance window
+  // can set N explicitly; pinning to 1 keeps the legacy single-
+  // threaded behaviour. Only the Rust scanner honours this — the JS
+  // fallback ignores the field, see src/db/scanner.mjs.
+  mstream.post("/api/v1/admin/db/params/scan-threads", async (req, res) => {
+    const schema = Joi.object({
+      scanThreads: Joi.number().integer().min(0).required()
     });
     joiValidate(schema, req.body);
 
-    await admin.editScanCommitInterval(req.body.scanCommitInterval);
+    await admin.editScanThreads(req.body.scanThreads);
+    res.json({});
+  });
+
+  // Toggle inline waveform generation during scans. true (default) =
+  // scanner decodes and writes <hash>.bin files (instant playback
+  // bar, ~90% of scan wall-time). false = scanner skips the decode
+  // entirely; the on-demand /api/v1/db/waveform endpoint regenerates
+  // via ffmpeg on first playback. ~10× scan speedup at the cost of
+  // a few hundred ms latency on first waveform request per track.
+  mstream.post("/api/v1/admin/db/params/generate-waveforms", async (req, res) => {
+    const schema = Joi.object({
+      generateWaveforms: Joi.boolean().required()
+    });
+    joiValidate(schema, req.body);
+
+    await admin.editGenerateWaveforms(req.body.generateWaveforms);
+    res.json({});
+  });
+
+  // Toggle stratum-dsp BPM + musical-key detection during scans.
+  // true (default) = Rust scanner runs analyze_audio over the same
+  // mono PCM buffer it decodes for the waveform, populating
+  // tracks.bpm / tracks.musical_key / tracks.bpm_source='stratum'
+  // for files without tag-sourced values. false = scanner only
+  // ingests tag-sourced BPM/key, leaves the rest NULL. Tag-sourced
+  // tracks always skip stratum regardless of this flag — toggling
+  // off doesn't suddenly overwrite a TBPM tag's value.
+  // Rust-only — JS fallback scanner accepts the field but doesn't
+  // run analysis (no stratum-dsp port). To backfill on existing
+  // libraries, trigger a force-rescan after enabling.
+  mstream.post("/api/v1/admin/db/params/analyze-bpm", async (req, res) => {
+    const schema = Joi.object({
+      analyzeBpm: Joi.boolean().required()
+    });
+    joiValidate(schema, req.body);
+
+    await admin.editAnalyzeBpm(req.body.analyzeBpm);
     res.json({});
   });
 
@@ -261,7 +321,13 @@ export function setup(mstream) {
       // Server-audio access is opt-in per user — admins always bypass
       // the gate in server-playback.js, everyone else must be granted
       // explicitly via the admin panel.
-      allowServerAudio: Joi.boolean().optional().default(false)
+      allowServerAudio: Joi.boolean().optional().default(false),
+      // Optional opt-in Subsonic-specific password (V35). When provided,
+      // it's stored AES-encrypted alongside the PBKDF2 main password.
+      // Without it, the user can still log in via Subsonic apiKey or
+      // by setting a Subsonic password later via the mobile-clients
+      // panel; only token-auth Subsonic clients require it.
+      subsonicPassword: Joi.string().min(1).optional(),
     });
     const input = joiValidate(schema, req.body);
 
@@ -274,6 +340,26 @@ export function setup(mstream) {
       input.value.allowUpload,
       input.value.allowServerAudio
     );
+    if (input.value.subsonicPassword) {
+      await admin.setSubsonicPassword(input.value.username, input.value.subsonicPassword);
+    }
+    res.json({});
+  });
+
+  // Update an existing user's Subsonic password (admin-side; the
+  // user-side equivalent is PUT /api/v1/user/subsonic-password).
+  // Admin can already change the main PBKDF2 password via the sibling
+  // POST /api/v1/admin/users/password — exposing the same capability
+  // for the Subsonic-specific column is consistent and avoids forcing
+  // admins through an "ask the user to set their own" loop. Pass
+  // `password: null` to clear the column.
+  mstream.post("/api/v1/admin/users/subsonic-password", async (req, res) => {
+    const schema = Joi.object({
+      username: Joi.string().required(),
+      password: Joi.string().min(1).allow(null).required(),
+    });
+    joiValidate(schema, req.body);
+    await admin.setSubsonicPassword(req.body.username, req.body.password);
     res.json({});
   });
 
@@ -593,21 +679,35 @@ export function setup(mstream) {
     res.json({});
   });
 
-  let enableFederationDebouncer = false;
-  mstream.post('/api/v1/admin/federation/enable', async (req, res) => {
-    const schema = Joi.object({ enable: Joi.boolean().required() });
-    joiValidate(schema, req.body);
-
-    if (enableFederationDebouncer === true) { throw new Error('Debouncer Enabled'); }
-    await admin.enableFederation(req.body.enable);
-
-    enableFederationDebouncer = true;
-    setTimeout(() => {
-      enableFederationDebouncer = false;
-    }, 5000);
-
-    res.json({});
+  // Stub: federation toggle is unavailable while the feature is being
+  // rebuilt around the new local-backup story (see src/server.js for
+  // why the syncthing+federation modules are no longer wired up). The
+  // route stays mounted so old admin clients hitting it get a clear,
+  // structured "feature is disabled" response instead of a 404 that
+  // they might mistake for a transient routing issue. The original
+  // implementation is preserved below — restore it (and the
+  // enableFederation helper in src/util/admin.js, plus the syncthing
+  // import in src/server.js) when federation comes back.
+  mstream.post('/api/v1/admin/federation/enable', (req, res) => {
+    res.status(410).json({
+      error: 'Federation is being rebuilt and is currently unavailable. See the Federation tab for status.',
+    });
   });
+  // let enableFederationDebouncer = false;
+  // mstream.post('/api/v1/admin/federation/enable', async (req, res) => {
+  //   const schema = Joi.object({ enable: Joi.boolean().required() });
+  //   joiValidate(schema, req.body);
+  //
+  //   if (enableFederationDebouncer === true) { throw new Error('Debouncer Enabled'); }
+  //   await admin.enableFederation(req.body.enable);
+  //
+  //   enableFederationDebouncer = true;
+  //   setTimeout(() => {
+  //     enableFederationDebouncer = false;
+  //   }, 5000);
+  //
+  //   res.json({});
+  // });
 
   mstream.delete("/api/v1/admin/ssl", async (req, res) => {
     if (!config.program.ssl.cert) { throw new Error('No Certs'); }

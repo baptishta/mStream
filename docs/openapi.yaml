@@ -244,6 +244,32 @@ components:
               type: number
               nullable: true
               description: Track-level ReplayGain adjustment in dB.
+            bpm:
+              type: integer
+              nullable: true
+              description: |
+                Beats-per-minute, range-validated 20..300 at scan time
+                (V32). NULL when the file's `TBPM` / Vorbis `BPM` /
+                MP4 `tmpo` tag is absent or out of range. Drives the
+                webapp Auto-DJ BPM-continuity feature.
+            musical-key:
+              type: string
+              nullable: true
+              description: |
+                Musical key as stored in the file's tag (`TKEY` /
+                `INITIALKEY` / Vorbis `KEY`), trimmed and capped at
+                12 chars at scan time. Format varies by tagger —
+                may be a raw key name ("A minor"), a Camelot code
+                ("8A"), or an enharmonic spelling ("Am"). Clients
+                that need canonicalisation should run the value
+                through `toCamelot()` (see the velvet helper or the
+                server-side `CAMELOT_TO_KEYS` map).
+
+                Field name is kebab-case on the wire to match the
+                other multi-word fields here (`album-art`,
+                `play-count`, `last-played`, `replaygain-track`).
+                The DB column name is `musical_key` (snake_case,
+                SQL convention).
 
     Album:
       type: object
@@ -300,6 +326,54 @@ components:
             type: string
           description: Libraries (vpaths) to exclude from the query.
 
+    SearchArtistOrAlbumItem:
+      type: object
+      description: |
+        One artist or album hit from `/api/v1/db/search`. The
+        `filepath` field is always the literal boolean `false` on
+        artist/album rows — used by clients as a sentinel that
+        distinguishes "browseable group" results from individual
+        tracks (which have a real `filepath` string).
+      required: [name, album_art_file, filepath]
+      properties:
+        name:
+          type: string
+          description: Artist or album name.
+        album_art_file:
+          type: string
+          nullable: true
+          description: Filename of associated cover art, or `null` if none.
+            Resolve via `/album-art/<file>`.
+        filepath:
+          type: boolean
+          enum: [false]
+          description: Always `false`. Sentinel value distinguishing this
+            from a track-shaped result.
+
+    SearchTrackItem:
+      type: object
+      description: |
+        One track hit from `/api/v1/db/search`. Returned in the
+        `title` array (when the track's title matched) and the
+        `files` array (when the filepath matched).
+      required: [name, album_art_file, filepath]
+      properties:
+        name:
+          type: string
+          description: |
+            Display name. For title-matched tracks: `"<artist> - <title>"`
+            when an artist is known, otherwise just the title. For
+            filepath-matched tracks: the same library-prefixed path
+            value as `filepath`.
+        album_art_file:
+          type: string
+          nullable: true
+          description: Filename of the track's cover art, or `null`.
+        filepath:
+          type: string
+          description: Library-prefixed path (e.g. `"music/Artist/Album/01.flac"`).
+            Use directly with `/media/<library>/<rest>` to stream.
+
     ScanOptions:
       type: object
       properties:
@@ -309,8 +383,6 @@ components:
           type: number
         bootScanDelay:
           type: number
-        maxConcurrentTasks:
-          type: integer
         compressImage:
           type: boolean
         scanCommitInterval:
@@ -326,6 +398,13 @@ components:
           items:
             type: string
             enum: [musicbrainz, itunes, deezer]
+        analyzeBpm:
+          type: boolean
+          description: |
+            Run scanner-time BPM + musical-key analysis via stratum-dsp
+            on tracks that don't already have tag-sourced values
+            (TBPM/TKEY etc.). Rust scanner only — the JS fallback
+            accepts but ignores. Default true.
 
   responses:
     EmptySuccess:
@@ -920,9 +999,58 @@ paths:
   /api/v1/db/random-songs:
     post:
       tags: [Library]
-      summary: Get a random song
-      description: Returns one random song, optionally filtered by rating. `ignoreList` tracks
-        already-seen IDs so the caller can deduplicate across repeated calls.
+      summary: Get a random song (Auto-DJ)
+      description: |
+        Returns one random song. With no body fields set, behaves like the
+        pre-V32 route — pick a random track from everything the user can see.
+
+        When any BPM / key / artist filter is set the server runs a
+        fallback waterfall that progressively relaxes constraints until
+        at least one track matches.
+
+        Without `artists`:
+          1.  tight BPM + key
+          2.  wide BPM + key (only if `bpmRangesWide` set)
+          3.  tight BPM only (drop key)
+          4.  wide BPM only (drop key)
+          5.  unrestricted random within library + rating scope
+
+        With `artists` (similar-artists Auto-DJ — typically the output
+        of `GET /api/v1/lastfm/similar-artists`), a similar-prioritised
+        chain runs FIRST, and only falls through to the chain above if
+        every similar-artist combination is empty:
+          1.  similar + tight BPM + key
+          2.  similar + wide BPM + key
+          3.  similar + tight BPM (drop key)
+          4.  similar + wide BPM (drop key)
+          5.  similar only (drop BPM/key)
+          5b. similar (drop `ignoreArtists` cooldown — only if set)
+          6-10. the non-similar chain above
+
+        After the SQL-side waterfall, a tier filter sorts the surviving
+        rows so an in-range pick wins over an unknown-tag pick wins over
+        a known-wrong pick. The route always returns exactly one song
+        (or 400 if scope is empty).
+
+        Musical keys are Camelot codes (`1A`..`12B`). The server expands
+        each code to all known raw-key spellings — `8A` matches stored
+        values "A minor", "Am", "Amin", or literal "8A" — so tags from
+        any common DJ-software convention work without client-side
+        normalisation. Unknown codes silently match nothing.
+
+        Tracks must have the corresponding column populated to be
+        considered when a BPM or key constraint is active (NULL columns
+        are excluded by the SQL filter, then re-considered as Tier 1
+        candidates by the post-fallback tier filter). The scanner
+        populates these columns from embedded `TBPM` / `TKEY` (ID3v2)
+        or `BPM` / `KEY` / `INITIALKEY` (Vorbis) tags.
+
+        `ignoreList` is a round-trip cursor — the server returns an
+        updated list with the just-picked index appended, and clients
+        echo it back on the next call to deduplicate across a session.
+        The server trims older entries automatically when the list
+        exceeds ~half the candidate-pool size; clients don't need to
+        prune it themselves. Capped at 500 entries.
       requestBody:
         content:
           application/json:
@@ -933,12 +1061,114 @@ paths:
                     minRating: { type: integer, minimum: 0, maximum: 10 }
                     ignoreList:
                       type: array
-                      items: { type: integer }
-                    ignorePercentage: { type: number }
+                      maxItems: 500
+                      items: { type: integer, minimum: 0 }
+                      description: |
+                        Indices of recently-picked tracks to skip. Echo
+                        back the `ignoreList` from the previous response
+                        unchanged; the server appends + trims.
+                    bpmRanges:
+                      type: array
+                      maxItems: 16
+                      description: |
+                        Primary BPM windows. Multiple ranges are OR-ed
+                        in SQL — clients typically send three (normal
+                        ± tolerance, half tempo, double tempo) for
+                        octave-equivalent continuity. Tracks whose `bpm`
+                        is NULL are excluded by this filter.
+                      items:
+                        type: object
+                        required: [min, max]
+                        properties:
+                          min: { type: number }
+                          max: { type: number }
+                    bpmRangesWide:
+                      type: array
+                      maxItems: 16
+                      description: |
+                        Optional widened BPM windows used only by step
+                        2 / step 4 of the waterfall when the tight
+                        `bpmRanges` returned zero rows. Same shape as
+                        `bpmRanges`.
+                      items:
+                        type: object
+                        required: [min, max]
+                        properties:
+                          min: { type: number }
+                          max: { type: number }
+                    requireBpm:
+                      type: boolean
+                      description: |
+                        When true, exclude tracks with NULL `bpm`. Ignored
+                        when `bpmRanges` is set (the range filter already
+                        requires non-null).
+                    musicalKeys:
+                      type: array
+                      maxItems: 24
+                      description: |
+                        Camelot codes (`1A`..`12B`). Each code is
+                        expanded server-side to all spellings the DB
+                        might contain ("A minor" / "Am" / "Amin" / `8A`).
+                        Sending only unrecognised codes returns 403; an
+                        empty / omitted array disables the filter.
+                      items: { type: string }
+                    requireMusicalKey:
+                      type: boolean
+                      description: |
+                        When true, exclude tracks with NULL `musical_key`.
+                        Implicit when `musicalKeys` is non-empty.
+                    artists:
+                      type: array
+                      maxItems: 100
+                      description: |
+                        Canonical library artist names — typically the
+                        output of `GET /api/v1/lastfm/similar-artists`.
+                        When set, the waterfall prioritises tracks
+                        credited to any of these artists via primary,
+                        featured (`track_artists`), or album-level
+                        (`album_artists`) credit. Falls through to
+                        non-similar picks only after every BPM/key
+                        combination on the similar pool is empty.
+                      items: { type: string }
+                    ignoreArtists:
+                      type: array
+                      maxItems: 100
+                      description: |
+                        Recently-played artists to exclude (Auto-DJ
+                        cooldown). Symmetric V18 widening: a cooldown
+                        on "Foo" also drops "Foo feat. Bar" and tracks
+                        on albums credited to Foo. The waterfall has a
+                        drop-cooldown fallback step so a user who
+                        blacklisted the entire library still gets a
+                        pick from the similar pool.
+                      items: { type: string }
+                    genres:
+                      type: array
+                      maxItems: 200
+                      description: |
+                        Genre filter list (V35). Names are case-insensitive
+                        and matched against `track_genres` (the M2M store
+                        that replaced `tracks.genre` in V34). Pair with
+                        `genreMode` to choose whitelist vs blacklist.
+                        Empty / omitted → no filtering. This filter is an
+                        ALWAYS-ON base condition — the waterfall never
+                        relaxes it, so an over-narrow filter can produce
+                        a 400 even when other constraints would pass.
+                      items: { type: string, minLength: 1, maxLength: 200 }
+                    genreMode:
+                      type: string
+                      enum: [whitelist, blacklist]
+                      default: whitelist
+                      description: |
+                        `whitelist` (default) plays only tracks with at
+                        least one matching genre; tracks with no
+                        `track_genres` rows are BLOCKED. `blacklist`
+                        skips tracks with any matching genre; tracks
+                        with no `track_genres` rows are ALLOWED.
                 - { $ref: "#/components/schemas/IgnoreVPaths" }
       responses:
         "200":
-          description: Random song.
+          description: One random song that satisfies the (possibly relaxed) constraints.
           content:
             application/json:
               schema:
@@ -950,7 +1180,14 @@ paths:
                   ignoreList:
                     type: array
                     items: { type: integer }
+                    description: |
+                      Updated cursor: previous request's `ignoreList`
+                      with the just-picked index appended, plus any
+                      server-side trimming. Echo back unchanged on the
+                      next call.
+        "400": { description: "No songs match the criteria, even after the waterfall fully drops them." }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: "Joi validation failed on the request body (e.g. bpmRange min > max, or `musicalKeys` contained no recognised Camelot codes)." }
 
   /api/v1/albums/browse:
     get:
@@ -1008,8 +1245,35 @@ paths:
     post:
       tags: [Search]
       summary: Full-text search
-      description: Searches artist names, album names, track titles, and filepaths. Each category
-        returns up to 30 matches.
+      description: |
+        Searches artist names, album names, track titles, and filepaths.
+        Each category returns up to 30 matches.
+
+        Three algorithms selectable via the `algorithm` request body
+        field (default `combo`):
+
+        - `basic` — LIKE only, no FTS5 involved. Infix substring match,
+          alphabetical order. The pre-V31 behaviour, preserved as an
+          escape hatch.
+        - `fts5` — strict FTS5 MATCH. No LIKE fallback even on parse
+          failure or SQLite-level error; the affected category just
+          returns an empty array. Debug mode.
+        - `combo` — FTS5 primary with per-category LIKE fallback when
+          MATCH fails to parse or errors. The default — what every
+          client gets unless it opts out.
+
+        FTS5 semantics differ from LIKE in two user-visible ways:
+        prefix matching only (e.g. `unny` does NOT match `Funny`,
+        but `fun` does), and unicode61 diacritic folding (e.g. `ros`
+        matches `Sigur Rós`). BM25 ranking replaces alphabetical
+        ordering — terms with higher in-row frequency rank first.
+
+        Per-category fallback in `combo` mode fires on SQLITE_ERROR
+        (a malformed FTS5 MATCH expression that survived the JS
+        parser) or when the parser refuses to build an expression
+        (no alphanumeric tokens, single sub-2-char positive). Zero
+        rows from a clean MATCH does NOT trigger fallback — that
+        is a real "no match" result, not an error.
       requestBody:
         required: true
         content:
@@ -1024,10 +1288,27 @@ paths:
                     noAlbums: { type: boolean }
                     noTitles: { type: boolean }
                     noFiles: { type: boolean }
+                    algorithm:
+                      type: string
+                      enum: [basic, fts5, combo]
+                      default: combo
+                      description: |
+                        Search algorithm. Unknown values return 403 via
+                        the Joi validation middleware. When SQLite was
+                        compiled without FTS5 support, both `fts5` and
+                        `combo` are silently coerced to `basic` for
+                        the lifetime of the process; a single warning
+                        is logged at first request.
                 - { $ref: "#/components/schemas/IgnoreVPaths" }
       responses:
         "200":
-          description: Search results.
+          description: |
+            Search results — four parallel arrays, one per category.
+            Every item shares the same three-key shape (`name`,
+            `album_art_file`, `filepath`); the response is byte-identical
+            across all three algorithms by construction (both paths
+            route through the same shape* callbacks in
+            `src/api/search.js`).
           content:
             application/json:
               schema:
@@ -1035,17 +1316,39 @@ paths:
                 properties:
                   artists:
                     type: array
-                    items: { type: string }
+                    items: { $ref: "#/components/schemas/SearchArtistOrAlbumItem" }
+                    description: Matched artists. `filepath` is always `false`.
                   albums:
                     type: array
-                    items: { $ref: "#/components/schemas/Album" }
+                    items: { $ref: "#/components/schemas/SearchArtistOrAlbumItem" }
+                    description: Matched albums. `filepath` is always `false`.
                   title:
                     type: array
-                    items: { $ref: "#/components/schemas/Metadata" }
+                    items: { $ref: "#/components/schemas/SearchTrackItem" }
+                    description: Tracks whose title matched. `name` is rendered as
+                      `"<artist> - <title>"` when an artist is known, otherwise just
+                      the title. `filepath` is the library-prefixed path used by
+                      `/media/<library>/<rest>` streaming.
                   files:
                     type: array
-                    items: { type: string }
+                    items: { $ref: "#/components/schemas/SearchTrackItem" }
+                    description: Tracks whose filepath matched. `name` is the
+                      library-prefixed path (same value as `filepath`).
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            Joi validation failed. Returned for unknown `algorithm`
+            values (anything outside `basic` / `fts5` / `combo`),
+            missing `search`, or any other schema violation. mStream's
+            error middleware maps `Joi.ValidationError` to 403, not
+            400 — a server-wide convention since long before this
+            endpoint.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
 
   # ── Stats ────────────────────────────────────────────────────────────────
 
@@ -2504,18 +2807,46 @@ paths:
   /api/v1/lastfm/status:
     get:
       tags: [Scrobbler - Last.fm]
-      summary: Last.fm integration status
+      summary: Probe Last.fm availability for this user
+      description: |
+        Tells the webapp Auto-DJ panel whether Last.fm features are
+        actually usable: the server-side API key (`hasApiKey`) gates
+        every `artist.getSimilar` call, and `linkedUser` reports
+        whether the current user has stored credentials for personal
+        scrobbling. Both fields drive UI visibility — the similar-
+        artists toggle renders disabled when `hasApiKey === false`.
+
+        Returned values are read-only state, no auth side-effects.
       responses:
         "200":
-          description: Status.
+          description: Last.fm availability + this user's link state.
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  serverEnabled: { type: boolean }
-                  hasApiKey: { type: boolean }
-                  linkedUser: { type: string, nullable: true }
+                  serverEnabled:
+                    type: boolean
+                    description: |
+                      Whether the operator has configured a Last.fm
+                      API key (`lastFM.apiKey` in config). Without
+                      this, `similar-artists` returns empty and the
+                      webapp Auto-DJ "Similar artists" toggle should
+                      be disabled.
+                  hasApiKey:
+                    type: boolean
+                    description: |
+                      Duplicate of `serverEnabled` kept for clients
+                      reading the original velvet shape.
+                  linkedUser:
+                    type: string
+                    nullable: true
+                    description: |
+                      The user's stored Last.fm username, or `null`
+                      if they haven't linked an account via
+                      `POST /api/v1/lastfm/connect`. Used only for
+                      personal scrobbling — Auto-DJ similar-artists
+                      doesn't depend on this.
 
   /api/v1/lastfm/connect:
     post:
@@ -2576,15 +2907,40 @@ paths:
   /api/v1/lastfm/similar-artists:
     get:
       tags: [Scrobbler - Last.fm]
-      summary: Get similar artists from Last.fm
+      summary: Get similar artists (filtered to local library)
+      description: |
+        Calls Last.fm's `artist.getSimilar`, then intersects the result
+        with the local library — returns only the artists that actually
+        exist in the user's tracks, using each one's canonical library
+        spelling. Pair with `POST /api/v1/db/random-songs`'s `artists`
+        body field for Auto-DJ similar-artists picks.
+
+        Matching is fuzzy: case-insensitive, diacritic-folded (`Sigur Ros`
+        ≡ `Sigur Rós`), `&`/`and` interchangeable, dots/slashes stripped
+        (`M.I.A.` ≡ `MIA`, `AC/DC` ≡ `ACDC`). So a Last.fm result of
+        "Beyoncé" matches a library row tagged "Beyonce", and the
+        response contains the library's spelling.
+
+        Returns `{ artists: [] }` (NOT a 4xx) when any of:
+          - `artist` query param is missing
+          - no Last.fm API key configured in `lastFM.apiKey`
+          - Last.fm HTTP call failed or returned malformed JSON
+          - Last.fm has no similar artists for this name
+          - none of the similar artists exist in the local library
+
+        Results are cached per-artist for 24 hours (LRU, 500-entry cap)
+        to stay friendly to Last.fm's rate limit.
       parameters:
         - name: artist
           in: query
           required: true
           schema: { type: string }
+          description: |
+            Source artist name. `feat. X` / `ft. X` / `featuring X` /
+            `vs. X` suffixes are stripped before the Last.fm call.
       responses:
         "200":
-          description: Similar artists.
+          description: Library artists similar to the input (may be empty).
           content:
             application/json:
               schema:
@@ -2592,6 +2948,9 @@ paths:
                 properties:
                   artists:
                     type: array
+                    description: |
+                      Canonical library artist names — suitable for use
+                      directly in `/api/v1/db/random-songs` `artists`.
                     items: { type: string }
 
   /api/v1/lastfm/scrobble-by-metadata:
@@ -3370,23 +3729,6 @@ paths:
         "200": { $ref: "#/components/responses/EmptySuccess" }
         "405": { $ref: "#/components/responses/AdminLocked" }
 
-  /api/v1/admin/db/params/max-concurrent-scans:
-    post:
-      tags: [Admin - Scanner]
-      summary: Set max concurrent scans
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [maxConcurrentTasks]
-              properties:
-                maxConcurrentTasks: { type: integer, minimum: 0 }
-      responses:
-        "200": { $ref: "#/components/responses/EmptySuccess" }
-        "405": { $ref: "#/components/responses/AdminLocked" }
-
   /api/v1/admin/db/params/compress-image:
     post:
       tags: [Admin - Scanner]
@@ -3417,7 +3759,50 @@ paths:
               type: object
               required: [scanCommitInterval]
               properties:
-                scanCommitInterval: { type: integer, minimum: 1 }
+                scanCommitInterval:
+                  type: integer
+                  minimum: 1
+                  description: |
+                    Tracks scanned per SQLite COMMIT. Soft-capped at 1000
+                    server-side: values above 1000 are accepted but
+                    clamped to 1000 (with a warning logged) rather than
+                    rejected, so a typo in the admin UI doesn't 400.
+      responses:
+        "200": { $ref: "#/components/responses/EmptySuccess" }
+        "405": { $ref: "#/components/responses/AdminLocked" }
+
+  /api/v1/admin/db/params/analyze-bpm:
+    post:
+      tags: [Admin - Scanner]
+      summary: Toggle scanner-time BPM + musical-key detection (stratum-dsp)
+      description: |
+        Enables or disables stratum-dsp analysis during scans. When true
+        (default), the Rust scanner runs BPM + musical-key extraction on
+        the same mono PCM buffer it decodes for the waveform cache,
+        populating `tracks.bpm` / `tracks.musical_key` /
+        `tracks.bpm_source = 'stratum'` for any file without
+        tag-sourced values.
+
+        Tag-sourced BPM/key always wins regardless of this flag —
+        toggling off does not overwrite an existing TBPM/TKEY value.
+        Audiobook-genre tracks and tracks outside the [30s, 30min]
+        duration window are skipped by other gates in the scanner.
+
+        Rust-only feature. The JS fallback scanner accepts the
+        `analyzeBpm` field in its config but does not run analysis.
+        To backfill BPM/key on a previously-scanned library after
+        enabling this flag, trigger a force-rescan from the admin
+        panel — the fast-path mtime check skips unchanged files
+        otherwise.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [analyzeBpm]
+              properties:
+                analyzeBpm: { type: boolean }
       responses:
         "200": { $ref: "#/components/responses/EmptySuccess" }
         "405": { $ref: "#/components/responses/AdminLocked" }

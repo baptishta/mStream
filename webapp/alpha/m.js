@@ -488,7 +488,6 @@ function playNow(el) {
   VUEPLAYERCORE.addSongWizard(el.getAttribute("data-file_location"), {}, true, MSTREAMPLAYER.positionCache.val + 1);
 }
 
-let startInterval = false;
 async function init() {
   try {
     const response = await MSTREAMAPI.ping();
@@ -540,10 +539,11 @@ async function init() {
     MSTREAMPLAYER.ignoreVPaths = ivp;
   } catch (e) {}
 
-  try {
-    // forced to an array to assure we're not stuffing nul values in here
-    MSTREAMPLAYER.minRating = JSON.parse(localStorage.getItem('minRating'))[0];
-  } catch (e) {}
+  // Legacy MSTREAMPLAYER.minRating boot-time hydrate removed — no
+  // consumer reads that global anymore. The Auto-DJ rating filter
+  // now reads AUTODJ.state.djMinRating directly. The legacy
+  // localStorage `minRating` key is migrated to the new namespace
+  // by `_autoDjMigrateLegacyKeys()` on first panel render.
 
   try {
     if(localStorage.getItem('transcode') === 'true' && MSTREAMPLAYER.transcodeOptions.serverEnabled === true) {
@@ -577,40 +577,13 @@ async function init() {
     }
 
   }catch(err) {}
-
-  dbStatus();
 }
 
-async function dbStatus() {
-  try {
-    const response = await MSTREAMAPI.dbStatus();
-    // if not scanning
-    if (!response.locked || response.locked === false) {
-      clearInterval(startInterval);
-      startInterval = false;
-      document.getElementById('scan-status').innerHTML = '';
-      document.getElementById('scan-status-files').innerHTML = '';
-
-      return;
-    }
-
-    // Set Interval
-    if (startInterval === false) {
-      startInterval = setInterval(function () {
-        dbStatus();
-      }, 2000);
-    }
-
-    // Update status
-    document.getElementById('scan-status').innerHTML = t('status.scanInProgress');
-    document.getElementById('scan-status-files').innerHTML = t('status.filesInDB', { count: response.totalFileCount });
-  }catch(err) {
-    document.getElementById('scan-status').innerHTML = '';
-    document.getElementById('scan-status-files').innerHTML = '';
-    clearInterval(startInterval);
-    startInterval = false;
-  }
-}
+// Scan progress display moved to webapp/alpha/scan-progress.js — that
+// poller hits /api/v1/scan/progress unconditionally on a 3s interval and
+// renders rich per-vpath cards. The old dbStatus() polled /api/v1/db/status
+// only after seeing locked=true once, so a scan triggered post-page-load
+// never appeared. Removed entirely.
 
 function createPopper3(el) {
   if (curFileTracker === el.getAttribute("data-file_location")) {
@@ -2028,11 +2001,20 @@ function toggleTranscoding(el, manual){
 }
 
 ///////////////////////////// Mobile Stuff
-function getMobilePanel(){
+async function getMobilePanel(){
   setBrowserRootPanel(t('panel.mobileApps'), false);
 
-  document.getElementById('filelist').innerHTML = 
-    `<div class="mobile-links pad-6">
+  // Probe whether Subsonic is enabled on this server. The panel always
+  // shows the app-store links + QR shortcut; the Subsonic sections are
+  // gated behind subsonic.mode !== 'disabled' (server-side config).
+  let subsonicEnabled = false;
+  try {
+    const info = await MSTREAMAPI.serverInfo();
+    subsonicEnabled = info?.features?.subsonic === true;
+  } catch (_) { /* server too old or offline; just hide Subsonic UI */ }
+
+  let html = `
+    <div class="mobile-links pad-6">
       <a target="_blank" href="https://play.google.com/store/apps/details?id=mstream.music&pcampaignid=MKT-Other-global-all-co-prtnr-py-PartBadge-Mar2515-1">
         <img alt='Get it on Google Play' src='https://play.google.com/intl/en_us/badges/images/generic/en_badge_web_generic.png'/>
       </a>
@@ -2043,9 +2025,156 @@ function getMobilePanel(){
       </a>
     </div>
     <br>
+    <!--
+      QR-code tool link disabled — the current mobile apps don't support
+      the QR-add-server flow it generates. Re-enable when the apps catch up.
     <div class="pad-6">
       <a target="_blank" href="/qr"><b>Checkout the QR Code tool to help add your server to the app</b></a>
-    </div>`;
+    </div>
+    -->`;
+
+  if (subsonicEnabled) {
+    const serverUrl = window.location.origin;
+    const username = MSTREAMAPI.currentServer.username || '';
+    html += `
+      <hr>
+      <div class="pad-6">
+        <h4>Subsonic Access</h4>
+        <p>Use any Subsonic-compatible client (Symfonium, DSub, substreamer, Sonixd, Feishin…) with these credentials.</p>
+        <p>
+          <b>Server URL:</b> <code id="subsonic-server-url">${serverUrl}</code><br>
+          <b>Username:</b> <code>${username}</code>
+        </p>
+
+        <h5>Subsonic Password</h5>
+        <p style="font-size: 0.9em; opacity: 0.85;">
+          Many Subsonic clients require a separately-stored password (the protocol's "token authentication" mode).
+          mStream protects your main password with strong one-way PBKDF2 hashing, which doesn't support that mode.
+          Set a Subsonic-specific password here to enable those clients.
+          <b>This password is stored in encrypted (recoverable) form on the server</b> — it's intentionally
+          less secure than your main password. We recommend a different value than your mStream login.
+        </p>
+        <div id="subsonic-password-status" style="margin-bottom: 0.5em;"><i>Loading…</i></div>
+        <div>
+          <input type="password" id="subsonic-password-input" placeholder="New Subsonic password" style="max-width: 280px;"/>
+          <button id="subsonic-password-set" onclick="setSubsonicPasswordFromForm()">Set / Update</button>
+          <button id="subsonic-password-clear" onclick="clearSubsonicPasswordFromForm()" style="display:none">Clear</button>
+        </div>
+
+        <h5 style="margin-top: 1.5em;">API Keys</h5>
+        <p style="font-size: 0.9em; opacity: 0.85;">
+          Modern Subsonic clients can also authenticate with an API key — no password needed.
+          The key is shown once at creation; copy it into your client immediately.
+        </p>
+        <div id="subsonic-api-keys-list" style="margin-bottom: 0.5em;"><i>Loading…</i></div>
+        <div>
+          <input type="text" id="subsonic-api-key-name" placeholder="Key name (e.g. iPhone Symfonium)" style="max-width: 280px;"/>
+          <button onclick="createSubsonicApiKeyFromForm()">Generate</button>
+        </div>
+        <div id="subsonic-api-key-just-created" style="margin-top: 0.75em;"></div>
+      </div>`;
+  }
+
+  document.getElementById('filelist').innerHTML = html;
+
+  if (subsonicEnabled) {
+    refreshSubsonicPasswordStatus();
+    refreshSubsonicApiKeyList();
+  }
+}
+
+// ── Subsonic password helpers (mobile panel) ─────────────────────────────────
+async function refreshSubsonicPasswordStatus() {
+  try {
+    const { set } = await MSTREAMAPI.getSubsonicPasswordStatus();
+    const status = document.getElementById('subsonic-password-status');
+    const clearBtn = document.getElementById('subsonic-password-clear');
+    if (set) {
+      status.innerHTML = '<b style="color: #2e7d32;">Subsonic password is set.</b>';
+      if (clearBtn) { clearBtn.style.display = 'inline-block'; }
+    } else {
+      status.innerHTML = '<i>No Subsonic password set. Token-auth clients will not work until you set one.</i>';
+      if (clearBtn) { clearBtn.style.display = 'none'; }
+    }
+  } catch (err) {
+    boilerplateFailure(err);
+  }
+}
+
+async function setSubsonicPasswordFromForm() {
+  const input = document.getElementById('subsonic-password-input');
+  const password = input.value;
+  if (!password) { return; }
+  try {
+    await MSTREAMAPI.setSubsonicPassword(password);
+    input.value = '';
+    await refreshSubsonicPasswordStatus();
+  } catch (err) {
+    boilerplateFailure(err);
+  }
+}
+
+async function clearSubsonicPasswordFromForm() {
+  if (!confirm('Clear the Subsonic password? Token-auth Subsonic clients will stop working until you set a new one.')) {
+    return;
+  }
+  try {
+    await MSTREAMAPI.clearSubsonicPassword();
+    await refreshSubsonicPasswordStatus();
+  } catch (err) {
+    boilerplateFailure(err);
+  }
+}
+
+// ── Subsonic API key helpers (mobile panel) ──────────────────────────────────
+async function refreshSubsonicApiKeyList() {
+  try {
+    const keys = await MSTREAMAPI.listSubsonicApiKeys();
+    const list = document.getElementById('subsonic-api-keys-list');
+    if (!Array.isArray(keys) || keys.length === 0) {
+      list.innerHTML = '<i>No API keys yet.</i>';
+      return;
+    }
+    list.innerHTML = keys.map(k => `
+      <div style="display: flex; align-items: center; gap: 1em; margin-bottom: 0.25em;">
+        <code>${escapeHtml(k.name || '(unnamed)')}</code>
+        <span style="font-size: 0.85em; opacity: 0.7;">
+          ${k.last_used ? 'last used ' + new Date(k.last_used).toLocaleString() : 'never used'}
+        </span>
+        <button onclick="revokeSubsonicApiKey(${k.id})" style="margin-left: auto;">Revoke</button>
+      </div>
+    `).join('');
+  } catch (err) {
+    boilerplateFailure(err);
+  }
+}
+
+async function createSubsonicApiKeyFromForm() {
+  const input = document.getElementById('subsonic-api-key-name');
+  const name = input.value.trim();
+  if (!name) { return; }
+  try {
+    const { key } = await MSTREAMAPI.createSubsonicApiKey(name);
+    input.value = '';
+    document.getElementById('subsonic-api-key-just-created').innerHTML = `
+      <div style="background: #fff3cd; border: 1px solid #ffeaa7; padding: 0.75em; border-radius: 4px;">
+        <b>New API key (copy this — it won't be shown again):</b><br>
+        <code style="word-break: break-all; user-select: all;">${escapeHtml(key)}</code>
+      </div>`;
+    await refreshSubsonicApiKeyList();
+  } catch (err) {
+    boilerplateFailure(err);
+  }
+}
+
+async function revokeSubsonicApiKey(id) {
+  if (!confirm('Revoke this API key? Any client using it will stop working immediately.')) { return; }
+  try {
+    await MSTREAMAPI.revokeSubsonicApiKey(id);
+    await refreshSubsonicApiKeyList();
+  } catch (err) {
+    boilerplateFailure(err);
+  }
 }
 
 //////////////////////////  Share playlists
@@ -2076,58 +2205,689 @@ async function submitShareForm() {
 }
 
 ///////////////// Auto DJ
-function autoDjPanel() {
-  setBrowserRootPanel(t('panel.autoDJ'), false);
+//
+// New panel UI (PR-E2 of the Auto-DJ port). Replaces the previous
+// folder-checkbox + min-rating-select layout with the velvet-style
+// toggle layout, plus three new toggles that the upcoming player
+// rewrite will read from AUTODJ.state:
+//
+//   • Similar artists (Last.fm) — gated on the /lastfm/status probe
+//     (disabled when no API key is configured server-side)
+//   • BPM continuity + tolerance slider
+//   • Harmonic mixing
+//
+// State lives in webapp/alpha/auto-dj.js (window.AUTODJ). Every
+// toggle change mutates AUTODJ.state via setState(), which writes
+// to the `mstream-dj-*` localStorage namespace immediately.
+//
+// BRIDGE: the existing autoDJ() implementation in
+// webapp/assets/js/mstream.player.js still reads from the legacy
+// globals MSTREAMPLAYER.ignoreVPaths / .minRating. The panel keeps
+// those mirrors in sync so the player keeps working until its own
+// rewrite ships in the next commit. The legacy `ignoreVPaths` +
+// `minRating` localStorage keys also keep getting written so a tab
+// reload mid-rollout doesn't lose state. The follow-up player
+// commit will drop the legacy reads.
 
-  let newHtml = `<div class="pad-6"><p>${t('autoDJ.description')}</p>
-    <h5>${t('autoDJ.useFolders')}</h5>`;
-  for (let i = 0; i < MSTREAMAPI.currentServer.vpaths.length; i++) {
-    let checkedString = '';
-    if (!MSTREAMPLAYER.ignoreVPaths[MSTREAMAPI.currentServer.vpaths[i]]) {
-      checkedString = 'checked';
-    }
-    newHtml += `
-      <label for="autodj-folder-${MSTREAMAPI.currentServer.vpaths[i]}">
-        <input ${checkedString} id="autodj-folder-${MSTREAMAPI.currentServer.vpaths[i]}" type="checkbox"
-          value="${MSTREAMAPI.currentServer.vpaths[i]}" name="autodj-folders" onchange="onAutoDJFolderChange(this)">
-        <span>${MSTREAMAPI.currentServer.vpaths[i]}</span>
-      </label><br>`;
-  }
+// Promise-cache for /lastfm/status. Two reasons for the indirection
+// over a plain value cache:
+//
+//   1. Race avoidance — multiple panel renders in quick succession
+//      used to spawn parallel fetches. Now they all await the same
+//      in-flight promise.
+//   2. Cheap TTL invalidation — admins might enable/disable Last.fm
+//      while a panel is open. 5-minute TTL means the worst-case
+//      stale window is short without making every render hit the
+//      network.
+//
+// The actual HTTP request goes through MSTREAMAPI.lastfmStatus(),
+// which uses the shared req() helper (centralised auth header +
+// error handling + JSON parse). We only wrap it for caching.
+const _LASTFM_STATUS_TTL_MS = 5 * 60 * 1000;
+let _autoDjLastfmStatusEntry = null;  // { promise, ts } or null
 
-  newHtml += `<h5>${t('autoDJ.minRating')}</h5> <select class="browser-default" onchange="updateAutoDJRatings(this)" id="autodj-ratings">`;
-  for (let i = 0; i < 11; i++) {
-    newHtml += `<option ${(Number(MSTREAMPLAYER.minRating) === i) ? 'selected' : ''} value="${i}">${(i ===0) ? t('label.disabled') : +(i/2).toFixed(1)}</option>`;
+function _fetchLastfmStatus() {
+  const now = Date.now();
+  if (_autoDjLastfmStatusEntry && (now - _autoDjLastfmStatusEntry.ts) < _LASTFM_STATUS_TTL_MS) {
+    return _autoDjLastfmStatusEntry.promise;
   }
-  newHtml += '</select>';
-  newHtml += `<br><p><input type="button" class="btn blue" value="${t('autoDJ.toggleButton')}" onclick="MSTREAMPLAYER.toggleAutoDJ();"></p></div>`
-  
-  document.getElementById('filelist').innerHTML = newHtml;
+  const promise = MSTREAMAPI.lastfmStatus();
+  _autoDjLastfmStatusEntry = { promise, ts: now };
+  return promise;
 }
 
-function onAutoDJFolderChange(el) {
-  // Don't allow user to deselect all options
-  if (document.querySelector('input[name=autodj-folders]:checked') === null) {
-    el.checked = true;
-    iziToast.warning({
-      title: t('toast.autoDJRequiresDir'),
-      position: 'topCenter',
-      timeout: 3500
-    });
-    return;
+// One-time migration of the pre-PR-E1 localStorage keys onto the
+// new `mstream-dj-*` namespace. Idempotent — only fires when the
+// new key is absent AND the legacy key is present. Doesn't delete
+// the legacy keys (the player still reads them during the bridge
+// period); the player commit will retire both reads + delete.
+function _autoDjMigrateLegacyKeys() {
+  // Legacy `minRating` (single-element array `[n]`) → new djMinRating.
+  if (localStorage.getItem('mstream-dj-djMinRating') === null) {
+    try {
+      const raw = localStorage.getItem('minRating');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        const val = Array.isArray(parsed) ? Number(parsed[0]) : Number(parsed);
+        if (Number.isFinite(val)) {
+          AUTODJ.setState({ djMinRating: Math.max(0, Math.min(10, val)) });
+        }
+      }
+    } catch (_e) { /* malformed — fall back to default */ }
   }
-
-  if (el.checked) {
-    MSTREAMPLAYER.ignoreVPaths[el.value] = false;
-  } else {
-    MSTREAMPLAYER.ignoreVPaths[el.value] = true;
+  // Legacy `ignoreVPaths` (`{name: true}`) → new djVpaths (inverted: array of INCLUDED names).
+  if (localStorage.getItem('mstream-dj-djVpaths') === null) {
+    try {
+      const raw = localStorage.getItem('ignoreVPaths');
+      if (raw) {
+        const ignored = JSON.parse(raw) || {};
+        const allVpaths = (MSTREAMAPI.currentServer && MSTREAMAPI.currentServer.vpaths) || [];
+        // Empty djVpaths means "include all". Only persist a non-empty
+        // selection when at least one vpath is explicitly excluded.
+        const someExcluded = Object.values(ignored).some(v => v === true);
+        if (someExcluded && allVpaths.length > 0) {
+          AUTODJ.setState({
+            djVpaths: allVpaths.filter(v => ignored[v] !== true),
+          });
+        }
+      }
+    } catch (_e) { /* malformed — fall back to default */ }
   }
+}
 
+// Convert AUTODJ.state.djVpaths → MSTREAMPLAYER.ignoreVPaths
+// (the existing player.js still reads this shape).
+function _syncVpathsToLegacy() {
+  const allVpaths = (MSTREAMAPI.currentServer && MSTREAMAPI.currentServer.vpaths) || [];
+  const included = new Set(AUTODJ.state.djVpaths.length > 0 ? AUTODJ.state.djVpaths : allVpaths);
+  MSTREAMPLAYER.ignoreVPaths = MSTREAMPLAYER.ignoreVPaths || {};
+  for (const v of allVpaths) {
+    MSTREAMPLAYER.ignoreVPaths[v] = !included.has(v);
+  }
   localStorage.setItem('ignoreVPaths', JSON.stringify(MSTREAMPLAYER.ignoreVPaths));
 }
 
-function updateAutoDJRatings(el) {
-  MSTREAMPLAYER.minRating = el.value;
-  localStorage.setItem('minRating', JSON.stringify([MSTREAMPLAYER.minRating]));
+// Note: there is intentionally NO `_syncMinRatingToLegacy()`. The
+// rewritten autoDJ() in mstream.player.js reads djMinRating directly
+// from AUTODJ.state, and no other code path reads MSTREAMPLAYER.minRating.
+// The legacy `minRating` localStorage key is migrated once by
+// `_autoDjMigrateLegacyKeys()` below and never written again — letting
+// it go stale is fine since nothing reads the legacy key either.
+
+// Listeners attached inside autoDjPanel get this signal; the previous
+// render's controller is aborted at the top of each call so the old
+// DOM's listeners are removed atomically before the new ones land.
+// innerHTML re-render would eventually GC them, but a noisy click on
+// Start/Stop fires repeated renders that overlap during the async
+// fetches at the top of the function — explicit abort closes that
+// window without leaning on the GC.
+let _autoDjPanelAbortController = null;
+
+async function autoDjPanel() {
+  _autoDjPanelAbortController?.abort();
+  _autoDjPanelAbortController = new AbortController();
+  const _autoDjPanelSignal = _autoDjPanelAbortController.signal;
+
+  setBrowserRootPanel(t('panel.autoDJ'), false);
+
+  // First-render side-effect: pull legacy keys onto the new namespace.
+  // Safe to call repeatedly — guarded against double-migrate.
+  _autoDjMigrateLegacyKeys();
+
+  const lastfm = await _fetchLastfmStatus();
+  const lastfmAvailable = !!lastfm.serverEnabled;
+
+  // Library genres list — feeds the suggestion dropdown in the genre
+  // filter row. Cached for 5 min (see AUTODJ.getCachedGenresList);
+  // a stale cache returns null so we re-fetch transparently. Network
+  // / auth errors are non-blocking: the panel still renders, the
+  // dropdown just shows the appropriate inline hint.
+  let genresListLoadState = 'ready';   // 'ready' | 'auth' | 'error'
+  let cachedGenresList = AUTODJ.getCachedGenresList();
+  if (!cachedGenresList) {
+    const res = await MSTREAMAPI.getGenres();
+    if (res.status === 'ok') {
+      AUTODJ.setCachedGenresList(res.value);
+      cachedGenresList = AUTODJ.getCachedGenresList();
+    } else {
+      // 401 from the server when unauthenticated → soft-disable the
+      // toggle and surface the auth hint. Any other error (5xx, 0 =
+      // network) gets the generic "couldn't load" message.
+      genresListLoadState = res.code === 401 ? 'auth' : 'error';
+      cachedGenresList = [];
+    }
+  }
+  const allVpaths = (MSTREAMAPI.currentServer && MSTREAMAPI.currentServer.vpaths) || [];
+  // djVpaths default = empty means "all". For UI rendering, materialise
+  // the actual inclusion set so each pill knows its state.
+  const includedSet = new Set(
+    AUTODJ.state.djVpaths.length > 0 ? AUTODJ.state.djVpaths : allVpaths,
+  );
+
+  const sourcesBlock = allVpaths.length > 1 ? `
+    <div class="autodj-opt-row autodj-opt-col">
+      <div>
+        <div class="autodj-opt-label">${t('autoDJ.sectionSources')}</div>
+        <div class="autodj-opt-hint">${t('autoDJ.sourcesHint')}</div>
+      </div>
+      <div class="dj-vpath-pills" id="dj-vpaths" role="group" aria-label="${escapeHtml(t('autoDJ.sectionSources'))}">
+        ${allVpaths.map(v => `
+          <button type="button" class="dj-vpath-pill${includedSet.has(v) ? ' on' : ''}" data-vpath="${escapeHtml(v)}" aria-pressed="${includedSet.has(v) ? 'true' : 'false'}">${escapeHtml(v)}</button>
+        `).join('')}
+      </div>
+    </div>` : '';
+
+  // Min-rating select: 0..10 in 0.5-star increments. Labels match
+  // velvet's "★" visual vocabulary so the panel reads as a rating
+  // chooser at a glance — backend stays continuous so half-star
+  // ratings still work (e.g. ★ 3 catches 3, 3.5, 4, 4.5, 5).
+  // 0 is rendered as "Any" via `autoDJ.ratingAny`.
+  let ratingOptions = `<option value="0" ${AUTODJ.state.djMinRating === 0 ? 'selected' : ''}>${t('autoDJ.ratingAny')}</option>`;
+  for (let i = 1; i <= 10; i++) {
+    const stars = +(i / 2).toFixed(1); // 0.5, 1, 1.5, …, 5
+    const label = `★ ${stars}`;
+    ratingOptions += `<option value="${i}" ${AUTODJ.state.djMinRating === i ? 'selected' : ''}>${label}</option>`;
+  }
+
+  // Similar-artists toggle row. When no API key is configured the
+  // toggle is rendered disabled with an explanatory hint so the
+  // user understands WHY it's not available.
+  //
+  // a11y note: the `.toggle-sw` input is opacity:0 (the visible
+  // affordance is the .toggle-sw-track sibling), so it needs an
+  // explicit aria-labelledby pointing to the label div — screen
+  // readers won't otherwise associate the description text with the
+  // checkbox.
+  const similarRow = `
+    <div class="autodj-opt-row${lastfmAvailable ? '' : ' autodj-opt-disabled'}">
+      <div>
+        <div class="autodj-opt-label" id="dj-similar-label">${t('autoDJ.similarLabel')}</div>
+        <div class="autodj-opt-hint">${lastfmAvailable ? t('autoDJ.similarHint') : '<em>' + t('autoDJ.similarHintNoKey') + '</em>'}</div>
+      </div>
+      <label class="toggle-sw">
+        <input type="checkbox" id="dj-similar" aria-labelledby="dj-similar-label" ${AUTODJ.state.similar && lastfmAvailable ? 'checked' : ''} ${lastfmAvailable ? '' : 'disabled'}>
+        <span class="toggle-sw-track"><span class="toggle-sw-thumb"></span></span>
+      </label>
+    </div>`;
+
+  const bpmContinuityRow = `
+    <div class="autodj-opt-row">
+      <div>
+        <div class="autodj-opt-label" id="dj-bpm-cont-label">${t('autoDJ.bpmContinuityLabel')}</div>
+        <div class="autodj-opt-hint">${t('autoDJ.bpmContinuityHint')}</div>
+      </div>
+      <label class="toggle-sw">
+        <input type="checkbox" id="dj-bpm-cont" aria-labelledby="dj-bpm-cont-label" ${AUTODJ.state.bpmContinuity ? 'checked' : ''}>
+        <span class="toggle-sw-track"><span class="toggle-sw-thumb"></span></span>
+      </label>
+    </div>`;
+
+  // BPM tolerance slider — hidden when BPM continuity is off so the
+  // panel doesn't waste vertical space on an inert control.
+  const bpmToleranceRow = `
+    <div class="autodj-opt-row" id="dj-bpm-tol-row" style="${AUTODJ.state.bpmContinuity ? '' : 'display:none'}">
+      <div>
+        <div class="autodj-opt-label" id="dj-bpm-tol-label">${t('autoDJ.bpmToleranceLabel')}</div>
+        <div class="autodj-opt-hint" id="dj-bpm-tol-val">${t('autoDJ.bpmToleranceValue', { n: AUTODJ.state.bpmTolerance })}</div>
+      </div>
+      <input type="range" id="dj-bpm-tol" class="autodj-slider" min="1" max="20" step="1" value="${AUTODJ.state.bpmTolerance}" aria-labelledby="dj-bpm-tol-label" aria-valuemin="1" aria-valuemax="20" aria-valuenow="${AUTODJ.state.bpmTolerance}">
+    </div>`;
+
+  const harmonicRow = `
+    <div class="autodj-opt-row">
+      <div>
+        <div class="autodj-opt-label" id="dj-harmonic-label">${t('autoDJ.harmonicMixingLabel')}</div>
+        <div class="autodj-opt-hint">${t('autoDJ.harmonicMixingHint')}</div>
+      </div>
+      <label class="toggle-sw">
+        <input type="checkbox" id="dj-harmonic" aria-labelledby="dj-harmonic-label" ${AUTODJ.state.harmonicMixing ? 'checked' : ''}>
+        <span class="toggle-sw-track"><span class="toggle-sw-thumb"></span></span>
+      </label>
+    </div>`;
+
+  // Keyword filter — full-width row (autodj-opt-col stacks the
+  // toggle row above the tag chips + input field). The chip list
+  // is rendered initially here; subsequent add/remove operations
+  // call the inline `_renderFilterTags()` helper below to avoid
+  // a full panel re-render (which would lose input focus + steal
+  // the typed-but-not-yet-Enter'd word from the field).
+  const filterTagsHtml = AUTODJ.state.djFilterWords.map(w => `
+    <span class="dj-filter-tag" role="listitem">
+      ${escapeHtml(w)}<button type="button" class="dj-filter-tag-rm" data-word="${escapeHtml(w)}" aria-label="${escapeHtml(t('autoDJ.keywordFilterTagRemove', { word: w }))}">×</button>
+    </span>
+  `).join('');
+  const keywordFilterRow = `
+    <div class="autodj-opt-row autodj-opt-col">
+      <div class="dj-filter-head">
+        <div>
+          <div class="autodj-opt-label" id="dj-filter-label">${t('autoDJ.keywordFilterLabel')}</div>
+          <div class="autodj-opt-hint">${t('autoDJ.keywordFilterHint')}</div>
+        </div>
+        <label class="toggle-sw">
+          <input type="checkbox" id="dj-filter-on" aria-labelledby="dj-filter-label" ${AUTODJ.state.djFilterEnabled ? 'checked' : ''}>
+          <span class="toggle-sw-track"><span class="toggle-sw-thumb"></span></span>
+        </label>
+      </div>
+      <div class="dj-filter-tags" id="dj-filter-tags" role="list" aria-label="${escapeHtml(t('autoDJ.keywordFilterTagsLabel'))}">${filterTagsHtml}</div>
+      <input
+        type="text"
+        class="dj-filter-input"
+        id="dj-filter-input"
+        placeholder="${escapeHtml(t('autoDJ.keywordFilterPlaceholder'))}"
+        ${AUTODJ.state.djFilterEnabled ? '' : 'disabled'}
+        aria-label="${escapeHtml(t('autoDJ.keywordFilterInputLabel'))}">
+    </div>`;
+
+  // Genre filter row. Mirrors keywordFilterRow's outer shape (head with
+  // label/hint/toggle + chip list + input). Differences:
+  //   • A two-button segmented control between the head and the chip
+  //     list selects whitelist vs blacklist mode (aria-pressed reflects
+  //     the active mode).
+  //   • The input has a sibling suggestion dropdown (.dj-genre-suggest)
+  //     populated from the cached library-genres list. Free-text adds
+  //     are allowed (Enter / comma commits whatever's typed, even if
+  //     it's not in the dropdown) so the user can target a scanner-
+  //     produced typo'd genre name.
+  //
+  // Empty-library / error states disable the toggle + mode buttons +
+  // input. The hint text below the label swaps to the appropriate
+  // explanation. genresListLoadState (auth / error / ready) and
+  // cachedGenresList.length are the two inputs driving the state.
+  const genreTagsHtml = AUTODJ.state.djGenres.map(g => `
+    <span class="dj-filter-tag" role="listitem">
+      ${escapeHtml(g)}<button type="button" class="dj-filter-tag-rm" data-genre="${escapeHtml(g)}" aria-label="${escapeHtml(t('autoDJ.genreTagRemove', { genre: g }))}">×</button>
+    </span>
+  `).join('');
+  const genreFilterDisabled = (genresListLoadState !== 'ready') || (cachedGenresList.length === 0);
+  const genreInputDisabled = genreFilterDisabled || !AUTODJ.state.djGenreEnabled;
+  let genreHintKey = 'autoDJ.genreFilterHint';
+  if (genresListLoadState === 'auth')         { genreHintKey = 'autoDJ.genreHintAuth'; }
+  else if (genresListLoadState === 'error')   { genreHintKey = 'autoDJ.genreHintError'; }
+  else if (cachedGenresList.length === 0)     { genreHintKey = 'autoDJ.genreHintEmpty'; }
+  const genreMode = AUTODJ.state.djGenreMode;
+  const genreFilterRow = `
+    <div class="autodj-opt-row autodj-opt-col">
+      <div class="dj-filter-head">
+        <div>
+          <div class="autodj-opt-label" id="dj-genre-label">${t('autoDJ.genreFilterLabel')}</div>
+          <div class="autodj-opt-hint" id="dj-genre-hint">${t(genreHintKey)}</div>
+        </div>
+        <label class="toggle-sw">
+          <input type="checkbox" id="dj-genre-on" aria-labelledby="dj-genre-label" ${AUTODJ.state.djGenreEnabled ? 'checked' : ''} ${genreFilterDisabled ? 'disabled' : ''}>
+          <span class="toggle-sw-track"><span class="toggle-sw-thumb"></span></span>
+        </label>
+      </div>
+      <div class="dj-genre-mode" role="radiogroup" aria-label="${escapeHtml(t('autoDJ.genreModeLabel'))}">
+        <button type="button" class="dj-genre-mode-btn" data-mode="whitelist" aria-pressed="${genreMode === 'whitelist'}" ${genreFilterDisabled ? 'disabled' : ''}>${t('autoDJ.genreModeWhitelist')}</button>
+        <button type="button" class="dj-genre-mode-btn" data-mode="blacklist" aria-pressed="${genreMode === 'blacklist'}" ${genreFilterDisabled ? 'disabled' : ''}>${t('autoDJ.genreModeBlacklist')}</button>
+      </div>
+      <div class="dj-filter-tags" id="dj-genre-tags" role="list" aria-label="${escapeHtml(t('autoDJ.genreTagsLabel'))}">${genreTagsHtml}</div>
+      <div class="dj-genre-combo">
+        <input
+          type="text"
+          class="dj-filter-input"
+          id="dj-genre-input"
+          placeholder="${escapeHtml(t('autoDJ.genrePlaceholder'))}"
+          ${genreInputDisabled ? 'disabled' : ''}
+          autocomplete="off"
+          aria-autocomplete="list"
+          aria-controls="dj-genre-suggest"
+          aria-label="${escapeHtml(t('autoDJ.genreInputLabel'))}">
+        <div class="dj-genre-suggest" id="dj-genre-suggest" role="listbox" hidden></div>
+      </div>
+    </div>`;
+
+  const html = `
+    <div class="pad-6 autodj-root">
+      <div class="autodj-hero">
+        <h2>${t('panel.autoDJ')}</h2>
+        <p class="autodj-hero-desc">${t('autoDJ.heroDescription')}</p>
+      </div>
+
+      <button type="button" class="autodj-toggle${MSTREAMPLAYER.playerStats.autoDJ ? ' on' : ''}" id="autodj-main-btn">
+        ${MSTREAMPLAYER.playerStats.autoDJ ? t('autoDJ.btnStop') : t('autoDJ.btnStart')}
+      </button>
+      <div class="autodj-status${MSTREAMPLAYER.playerStats.autoDJ ? ' on' : ''}" id="autodj-status-msg">
+        ${MSTREAMPLAYER.playerStats.autoDJ ? t('autoDJ.statusOn') : t('autoDJ.statusOff')}
+      </div>
+
+      <div class="autodj-opts">
+        ${sourcesBlock}
+
+        <div class="autodj-opt-row">
+          <div class="autodj-opt-label">${t('autoDJ.minRating')}</div>
+          <!-- .browser-default opts out of Materialize's select-replacement
+               wrapper so we can style the native control directly. -->
+          <select class="autodj-select browser-default" id="dj-min-rating">${ratingOptions}</select>
+        </div>
+
+        <h4 class="autodj-section-heading">${t('autoDJ.sectionContinuity')}</h4>
+        ${similarRow}
+        ${bpmContinuityRow}
+        ${bpmToleranceRow}
+        ${harmonicRow}
+
+        <h4 class="autodj-section-heading">${t('autoDJ.sectionFilters')}</h4>
+        ${keywordFilterRow}
+        ${genreFilterRow}
+      </div>
+    </div>`;
+
+  document.getElementById('filelist').innerHTML = html;
+
+  // ── Wire event handlers (post-innerHTML attach) ─────────────────
+
+  // Start/stop button — delegates to the existing player module.
+  document.getElementById('autodj-main-btn').onclick = () => {
+    MSTREAMPLAYER.toggleAutoDJ();
+    // Re-render so the button label + status text flip immediately.
+    autoDjPanel();
+  };
+
+  // Vpath pills — click to toggle inclusion.
+  if (allVpaths.length > 1) {
+    document.getElementById('dj-vpaths').addEventListener('click', (e) => {
+      const btn = e.target.closest('.dj-vpath-pill');
+      if (!btn) { return; }
+      const vpath = btn.dataset.vpath;
+      const current = new Set(AUTODJ.state.djVpaths.length > 0 ? AUTODJ.state.djVpaths : allVpaths);
+      if (current.has(vpath)) {
+        current.delete(vpath);
+      } else {
+        current.add(vpath);
+      }
+      // Disallow deselecting every vpath — matches the previous panel
+      // behaviour. Re-add the just-removed one with a toast.
+      if (current.size === 0) {
+        current.add(vpath);
+        iziToast.warning({
+          title: t('toast.autoDJRequiresDir'),
+          position: 'topCenter',
+          timeout: 3500,
+        });
+        return;
+      }
+      // If every vpath is selected, persist as an empty array
+      // (= "all"). Otherwise persist the explicit inclusion set.
+      const next = current.size === allVpaths.length ? [] : [...current];
+      AUTODJ.setState({ djVpaths: next });
+      _syncVpathsToLegacy();
+      // Visual update without full re-render — flip the class on
+      // the clicked pill AND its aria-pressed attribute (screen
+      // readers depend on the latter to announce the new state).
+      btn.classList.toggle('on');
+      btn.setAttribute('aria-pressed', current.has(vpath) ? 'true' : 'false');
+    }, { signal: _autoDjPanelSignal });
+  }
+
+  // Min-rating select.
+  document.getElementById('dj-min-rating').onchange = (e) => {
+    const val = Math.max(0, Math.min(10, parseInt(e.target.value, 10)));
+    AUTODJ.setState({ djMinRating: val });
+  };
+
+  // Similar-artists toggle (no-op while disabled, but the event still
+  // fires on label-click in some browsers).
+  const simEl = document.getElementById('dj-similar');
+  if (simEl && !simEl.disabled) {
+    simEl.onchange = (e) => {
+      AUTODJ.setState({ similar: !!e.target.checked });
+    };
+  }
+
+  // BPM continuity toggle. Show/hide the tolerance row reactively.
+  // Toggling OFF clears the rolling BPM history — re-enabling should
+  // re-anchor on whatever's playing then, not on stale data from a
+  // previous session segment.
+  document.getElementById('dj-bpm-cont').onchange = (e) => {
+    const on = !!e.target.checked;
+    AUTODJ.setState({ bpmContinuity: on });
+    if (!on) { AUTODJ.clearBpmHistory(); }
+    document.getElementById('dj-bpm-tol-row').style.display = on ? '' : 'none';
+  };
+
+  // BPM tolerance slider — update the displayed value AND persist.
+  // Sync aria-valuenow so screen readers announce the current
+  // tolerance as the user drags.
+  const tolEl = document.getElementById('dj-bpm-tol');
+  tolEl.oninput = (e) => {
+    const val = Math.max(1, Math.min(20, parseInt(e.target.value, 10)));
+    AUTODJ.setState({ bpmTolerance: val });
+    document.getElementById('dj-bpm-tol-val').textContent =
+      t('autoDJ.bpmToleranceValue', { n: val });
+    e.target.setAttribute('aria-valuenow', String(val));
+  };
+
+  // Harmonic mixing toggle. Same anchor-reset semantics as BPM
+  // continuity: turning OFF clears the locked Camelot anchor so the
+  // next ON-cycle re-locks on the current song.
+  document.getElementById('dj-harmonic').onchange = (e) => {
+    const on = !!e.target.checked;
+    AUTODJ.setState({ harmonicMixing: on });
+    if (!on) { AUTODJ.clearCamelotAnchor(); }
+  };
+
+  // ── Keyword filter ─────────────────────────────────────────────
+  //
+  // Re-renders ONLY the tag chip list so the user's typed-but-
+  // unsubmitted input stays in the field. Full panel re-render
+  // would also lose focus, which is jarring when the user is
+  // adding multiple words in a row.
+  const filterTagsEl = document.getElementById('dj-filter-tags');
+  const filterInpEl  = document.getElementById('dj-filter-input');
+  function _renderFilterTags() {
+    const words = AUTODJ.getFilterWords();
+    filterTagsEl.innerHTML = words.map(w => `
+      <span class="dj-filter-tag" role="listitem">
+        ${escapeHtml(w)}<button type="button" class="dj-filter-tag-rm" data-word="${escapeHtml(w)}" aria-label="${escapeHtml(t('autoDJ.keywordFilterTagRemove', { word: w }))}">×</button>
+      </span>
+    `).join('');
+  }
+
+  // Toggle controls just the filter on/off; the word list survives
+  // toggling so the user can keep their list and flip the feature
+  // on/off without rebuilding.
+  document.getElementById('dj-filter-on').onchange = (e) => {
+    const on = !!e.target.checked;
+    AUTODJ.setState({ djFilterEnabled: on });
+    filterInpEl.disabled = !on;
+  };
+
+  // Enter OR comma commits the typed word. Comma lets users paste a
+  // CSV-shaped list and have each piece chip-ify as they go.
+  filterInpEl.onkeydown = (e) => {
+    if (e.key !== 'Enter' && e.key !== ',') { return; }
+    e.preventDefault();
+    const raw = filterInpEl.value;
+    const added = AUTODJ.addFilterWord(raw);
+    if (added) {
+      filterInpEl.value = '';
+      _renderFilterTags();
+    }
+    // On dup / empty / cap-hit, leave the input alone so the user
+    // can edit and retry. No toast — the silent no-op matches
+    // velvet's behaviour and avoids spam on rapid-fire input.
+  };
+
+  // Event-delegation on the chip container so we don't have to re-
+  // bind individual × buttons after each re-render.
+  filterTagsEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('.dj-filter-tag-rm');
+    if (!btn) { return; }
+    AUTODJ.removeFilterWord(btn.dataset.word);
+    _renderFilterTags();
+  }, { signal: _autoDjPanelSignal });
+
+  // ── Genre filter ───────────────────────────────────────────────
+  //
+  // Three pieces of state, three handlers + a fourth handler for the
+  // suggestion dropdown:
+  //
+  //   • Toggle (#dj-genre-on)   — onchange flips djGenreEnabled, also
+  //                               toggles input + suggestion enablement.
+  //   • Mode buttons (.dj-genre-mode-btn) — click flips
+  //                               aria-pressed on both buttons + writes
+  //                               djGenreMode via AUTODJ.setGenreMode.
+  //   • Input (#dj-genre-input) — input event filters the suggestion
+  //                               dropdown; keydown handles Enter /
+  //                               Comma / Esc / Arrow keys.
+  //   • Chips (#dj-genre-tags)  — same event-delegated × pattern as
+  //                               the keyword filter.
+  const genreTagsEl  = document.getElementById('dj-genre-tags');
+  const genreInpEl   = document.getElementById('dj-genre-input');
+  const genreOnEl    = document.getElementById('dj-genre-on');
+  const genreSuggEl  = document.getElementById('dj-genre-suggest');
+  const genreModeBtns = document.querySelectorAll('.dj-genre-mode-btn');
+
+  // Re-render the chip list only (same surgical-update rationale as
+  // _renderFilterTags). Also reused after the suggestion dropdown's
+  // "click to add" handler.
+  function _renderGenreTags() {
+    const gs = AUTODJ.getGenres();
+    genreTagsEl.innerHTML = gs.map(g => `
+      <span class="dj-filter-tag" role="listitem">
+        ${escapeHtml(g)}<button type="button" class="dj-filter-tag-rm" data-genre="${escapeHtml(g)}" aria-label="${escapeHtml(t('autoDJ.genreTagRemove', { genre: g }))}">×</button>
+      </span>
+    `).join('');
+  }
+
+  // Render the suggestion dropdown. Filters the cached genres list
+  // case-insensitively by the input's current value; excludes genres
+  // already in the user's list; caps at 50 visible rows with a
+  // "+N more" footer so the dropdown never grows unwieldy on huge
+  // libraries.
+  const SUGGEST_VISIBLE_LIMIT = 50;
+  function _renderGenreSuggest() {
+    if (!genreSuggEl || !genreInpEl) { return; }
+    // Read live DOM state, not the closure variable. `genreInputDisabled`
+    // was captured at panel-render time as `!djGenreEnabled` — when the
+    // user later flipped the toggle ON, the toggle handler enabled the
+    // input element but the closure stayed stale at `true`, so this
+    // function early-returned and the dropdown never showed. Reading
+    // `genreInpEl.disabled` reflects the live state the toggle handler
+    // mutates, so a typed character after toggle-on now surfaces matches.
+    if (genreInpEl.disabled) {
+      genreSuggEl.setAttribute('hidden', '');
+      return;
+    }
+    const q = String(genreInpEl.value || '').trim().toLowerCase();
+    if (!q) {
+      genreSuggEl.setAttribute('hidden', '');
+      genreSuggEl.innerHTML = '';
+      return;
+    }
+    const selected = new Set(AUTODJ.getGenres().map(g => g.toLowerCase()));
+    const matches = cachedGenresList
+      .filter(g => g.toLowerCase().includes(q) && !selected.has(g.toLowerCase()));
+    if (matches.length === 0) {
+      genreSuggEl.innerHTML = `<div class="dj-genre-suggest-empty">${t('autoDJ.genreNoMatchesHint')}</div>`;
+      genreSuggEl.removeAttribute('hidden');
+      return;
+    }
+    const visible = matches.slice(0, SUGGEST_VISIBLE_LIMIT);
+    const extra   = matches.length - visible.length;
+    genreSuggEl.innerHTML = visible.map((g, i) => `
+      <div class="dj-genre-suggest-row" role="option" data-genre="${escapeHtml(g)}" id="dj-genre-suggest-row-${i}">${escapeHtml(g)}</div>
+    `).join('') + (extra > 0
+      ? `<div class="dj-genre-suggest-more">${t('autoDJ.genreMoreSuggestions', { n: extra })}</div>`
+      : '');
+    genreSuggEl.removeAttribute('hidden');
+  }
+
+  // Outer toggle: flips djGenreEnabled. The toggle itself may be
+  // disabled (no library genres / auth error / load error) — in
+  // those states this handler doesn't fire.
+  if (genreOnEl) {
+    genreOnEl.onchange = (e) => {
+      const on = !!e.target.checked;
+      AUTODJ.setState({ djGenreEnabled: on });
+      // Input + suggestion enablement tracks the toggle.
+      if (genreInpEl) {
+        genreInpEl.disabled = !on;
+      }
+      if (!on && genreSuggEl) {
+        genreSuggEl.setAttribute('hidden', '');
+      }
+    };
+  }
+
+  // Mode buttons: click flips djGenreMode and updates aria-pressed
+  // on both buttons. Disabled state inherited from the disabled
+  // attribute on the buttons themselves (set in markup).
+  genreModeBtns.forEach((btn) => {
+    btn.onclick = () => {
+      if (btn.disabled) { return; }
+      const mode = btn.dataset.mode;
+      if (!AUTODJ.setGenreMode(mode)) { return; }
+      genreModeBtns.forEach((b) => {
+        b.setAttribute('aria-pressed', b.dataset.mode === mode ? 'true' : 'false');
+      });
+    };
+  });
+
+  if (genreInpEl) {
+    // Filter the dropdown on each keystroke.
+    genreInpEl.oninput = () => { _renderGenreSuggest(); };
+
+    // Enter / comma commit; Esc closes the dropdown; Tab / blur lets
+    // the browser handle focus normally. Up/Down arrow navigation
+    // through the dropdown isn't wired here — keeping the keyboard
+    // surface minimal to match the keyword filter's UX. (Future
+    // enhancement: aria-activedescendant + ↑/↓ if usability feedback
+    // asks for it.)
+    genreInpEl.onkeydown = (e) => {
+      if (e.key === 'Escape') {
+        if (genreSuggEl) { genreSuggEl.setAttribute('hidden', ''); }
+        return;
+      }
+      if (e.key !== 'Enter' && e.key !== ',') { return; }
+      e.preventDefault();
+      const raw = genreInpEl.value;
+      const added = AUTODJ.addGenre(raw);
+      if (added) {
+        genreInpEl.value = '';
+        _renderGenreTags();
+        _renderGenreSuggest();
+      }
+      // Silent no-op on dup / empty / cap-hit — same UX as keyword.
+    };
+
+    // Click on a suggestion row → add it.
+    if (genreSuggEl) {
+      genreSuggEl.addEventListener('mousedown', (e) => {
+        // Use mousedown not click so the blur handler doesn't fire
+        // first (the suggestion dropdown disappears on blur otherwise
+        // and the click never lands).
+        const row = e.target.closest('.dj-genre-suggest-row');
+        if (!row) { return; }
+        e.preventDefault();
+        AUTODJ.addGenre(row.dataset.genre);
+        genreInpEl.value = '';
+        _renderGenreTags();
+        _renderGenreSuggest();
+        genreInpEl.focus();
+      }, { signal: _autoDjPanelSignal });
+      // Blur the input → hide the dropdown. 150ms grace lets the
+      // mousedown handler above fire before the dropdown vanishes.
+      genreInpEl.onblur = () => {
+        setTimeout(() => { genreSuggEl.setAttribute('hidden', ''); }, 150);
+      };
+    }
+  }
+
+  // Chip remove — event-delegated, same pattern as keyword.
+  genreTagsEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('.dj-filter-tag-rm');
+    if (!btn) { return; }
+    AUTODJ.removeGenre(btn.dataset.genre);
+    _renderGenreTags();
+  }, { signal: _autoDjPanelSignal });
+
+  // Initial sync — the `ignoreVPaths` legacy global IS still read by
+  // every browse/search panel in m.js, so we keep it in lockstep with
+  // AUTODJ.state.djVpaths. (The minRating legacy global is dead — see
+  // the comment block above _syncMinRatingToLegacy's removed position.)
+  _syncVpathsToLegacy();
 }
 
 ////////////// Jukebox

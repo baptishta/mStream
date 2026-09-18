@@ -15,6 +15,8 @@ import { extractLyrics, sidecarMtime as probeLyricsSidecarMtime } from './lyrics
 import { computeHashes } from './audio-hash.js';
 import { extractArtists, chooseAlbumArtistId } from './artist-extraction.js';
 import { migrateAlbumStars } from './album-migration.js';
+import { cleanupOrphans } from './orphan-cleanup.js';
+import { detectSource } from './source-detect.js';
 
 // ── Parse CLI input ─────────────────────────────────────────────────────────
 
@@ -40,11 +42,26 @@ const schema = Joi.object({
   ).required(),
   scanCommitInterval: Joi.number().integer().min(1).default(25),
   forceRescan: Joi.boolean().default(false),
+  // Accepted but ignored by the JS fallback scanner — only the Rust
+  // scanner actually parallelises. Listed here so task-queue.js can
+  // pass the same jsonLoad to either scanner without a Joi validation
+  // failure.
+  scanThreads: Joi.number().integer().min(0).default(0),
+  // The JS fallback scanner doesn't generate waveforms anyway (Rust
+  // binary handles that path). Accept the field for schema parity
+  // with task-queue.js's jsonLoad.
+  generateWaveforms: Joi.boolean().default(true),
   // Per-library flag from the libraries row (V21). false (default)
   // = use lstatSync and skip symlink entries; true = use statSync
   // (follows symlinks to their target, matching pre-v6.5 JS-scanner
   // behaviour). Resolved in task-queue.js from `library.follow_symlinks`.
   followSymlinks: Joi.boolean().default(false),
+  // Accepted but ignored by the JS fallback scanner — stratum-dsp
+  // is a Rust crate, only the Rust scanner runs the BPM/key
+  // analysis. Listed here so task-queue.js can pass the same
+  // jsonLoad to either scanner without a Joi validation failure
+  // (same pattern as scanThreads / generateWaveforms above).
+  analyzeBpm: Joi.boolean().default(true),
 });
 
 const { error: validationError } = schema.validate(loadJson);
@@ -63,6 +80,11 @@ db.exec('PRAGMA foreign_keys = ON');
 // main server's shared-playlist cleanup or any API-triggered write).
 // Without this, the scanner fails immediately with "database is locked".
 db.exec('PRAGMA busy_timeout = 5000');
+// V31 AFTER triggers on tracks/artists/albums maintain the FTS5
+// index. Not strictly required for V31's design (the triggers don't
+// recursively fire other user triggers), but set on as defence-in-
+// depth to match initDB() in manager.js. Cheap.
+db.exec('PRAGMA recursive_triggers = ON');
 
 // ── Prepared statements ─────────────────────────────────────────────────────
 
@@ -100,13 +122,20 @@ const stmts = {
             compilation  = ?
       WHERE id = ?`
   ),
+  // V34 dropped tracks.genre — the canonical store is the track_genres
+  // M2M (populated below via setTrackGenres at L470). Keep the column
+  // list in lock-step with the schema.js V1+V24 definitions.
+  // V36: tracks.source records provenance (e.g. 'ytdl'). Extracted from
+  // embedded tags by detectSource() in parseMyFile. NULL when no marker
+  // is present.
   insertTrack: db.prepare(
     `INSERT OR REPLACE INTO tracks (filepath, library_id, title, artist_id, album_id, track_number,
-     disc_number, year, duration, format, file_hash, audio_hash, album_art_file, genre,
+     disc_number, year, duration, format, file_hash, audio_hash, album_art_file,
      replaygain_track_db, sample_rate, channels, bit_depth,
      lyrics_embedded, lyrics_synced_lrc, lyrics_lang, lyrics_sidecar_mtime,
-     modified, scan_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     bpm, musical_key, bpm_source,
+     modified, scan_id, source)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ),
   // V17: M2M artist-link maintenance. Album-artists use INSERT OR IGNORE
   // so the same album getting re-walked by multiple tracks doesn't pile
@@ -181,9 +210,24 @@ function findOrCreateAlbum(name, artistId, year, albumArtFile, albumArtistDispla
   return Number(result.lastInsertRowid);
 }
 
-function setTrackGenres(trackId, genreStr) {
-  if (!genreStr) { return; }
-  const genres = genreStr.split(/[,;\/]/).map(g => g.trim()).filter(g => g.length > 0);
+function setTrackGenres(trackId, genreInput) {
+  if (!genreInput) { return; }
+  // music-metadata returns common.genre as `string[]` always — even for a
+  // single-value TCON / Vorbis GENRE tag, it's wrapped in a one-element
+  // array. The Rust scanner sees a single concatenated string from
+  // Lofty's tag.genre(), so it splits on `[,;/]` directly. Normalise to
+  // a joined string here so both scanners produce the same track_genres
+  // rows from the same input — joining with `;` keeps multi-value
+  // arrays (e.g. ["Rock", "Jazz"]) round-trippable through the same
+  // splitter that handles legacy single-string tags written by older
+  // taggers (e.g. "Rock;Jazz" / "Rock/Jazz" / "Rock,Jazz").
+  //
+  // Without this normalisation a multi-genre track from music-metadata
+  // would throw `genreStr.split is not a function` and the whole file
+  // would log a per-file processing warning, dropping all genre rows
+  // for that track silently.
+  const text = Array.isArray(genreInput) ? genreInput.join(';') : String(genreInput);
+  const genres = text.split(/[,;\/]/).map(g => g.trim()).filter(g => g.length > 0);
   for (const name of genres) {
     let row = stmts.findGenre.get(name);
     if (!row) {
@@ -193,6 +237,10 @@ function setTrackGenres(trackId, genreStr) {
     stmts.insertTrackGenre.run(trackId, row.id);
   }
 }
+
+// V36 provenance detection moved to src/db/source-detect.js so the
+// readback helper can be imported by tests without spinning up the
+// scanner's CLI-arg parser.
 
 // File hashing moved to src/db/audio-hash.js (returns both file_hash and
 // audio_hash in a single pass).
@@ -299,8 +347,10 @@ function getFileType(filename) {
 
 async function parseMyFile(absolutePath, modified) {
   let songInfo;
+  let parsedNative = null;
   try {
     const parsed = await parseFile(absolutePath, { skipCovers: loadJson.skipImg });
+    parsedNative = parsed.native;
     songInfo = parsed.common;
     songInfo.duration = parsed.format?.duration || null;
     // OpenSubsonic extended audio-format fields. music-metadata exposes
@@ -310,6 +360,26 @@ async function parseMyFile(absolutePath, modified) {
     songInfo.sampleRate = Number.isFinite(parsed.format?.sampleRate) ? parsed.format.sampleRate : null;
     songInfo.channels   = Number.isFinite(parsed.format?.numberOfChannels) ? parsed.format.numberOfChannels : null;
     songInfo.bitDepth   = Number.isFinite(parsed.format?.bitsPerSample) ? parsed.format.bitsPerSample : null;
+    // V32: BPM + musical key from embedded tags. music-metadata exposes
+    // TBPM / Vorbis BPM / MP4 tmpo as common.bpm (number) and TKEY /
+    // INITIALKEY as common.key (string). The Rust scanner mirrors this
+    // via Lofty's ItemKey::Bpm / ItemKey::InitialKey — both code paths
+    // must produce the same column values for the parity test.
+    songInfo.bpm = (() => {
+      if (parsed.common?.bpm == null) { return null; }
+      const n = Math.round(Number(parsed.common.bpm));
+      // Range matches velvet's tag-extraction window. < 20 / > 300 are
+      // almost certainly malformed; storing them just pollutes the
+      // future BPM-continuity filter.
+      return Number.isFinite(n) && n >= 20 && n <= 300 ? n : null;
+    })();
+    songInfo.musicalKey = (() => {
+      const k = parsed.common?.key;
+      if (typeof k !== 'string') { return null; }
+      const trimmed = k.trim().slice(0, 12);
+      return trimmed.length > 0 ? trimmed : null;
+    })();
+    songInfo.bpmSource = (songInfo.bpm != null || songInfo.musicalKey != null) ? 'tag' : null;
     // Multi-artist / compilation extraction — see src/db/artist-extraction.js
     // for the rules. Stored as a sub-object so `insertTrack` can pull it
     // without re-parsing.
@@ -338,6 +408,12 @@ async function parseMyFile(absolutePath, modified) {
   if (!songInfo.lyricsInfo) {
     songInfo.lyricsInfo = extractLyrics(songInfo, absolutePath);
   }
+
+  // V36: provenance from embedded tags. Detected from the native tag
+  // namespace (TXXX / Vorbis comments / MP4 freeform atoms), which sits
+  // outside the music-metadata 'common' mapping. NULL when no marker is
+  // present.
+  songInfo.source = detectSource({ native: parsedNative });
 
   songInfo.modified = modified;
   songInfo.filePath = path.relative(loadJson.directory, absolutePath).replace(/\\/g, '/');
@@ -414,7 +490,7 @@ function insertTrack(song) {
     song.hash,
     song.audioHash || null,
     song.aaFile || null,
-    song.genre || null,
+    // V34: tracks.genre dropped — setTrackGenres at L470 populates the M2M.
     song.replaygain_track_gain?.dB || null,
     song.sampleRate || null,
     song.channels || null,
@@ -423,8 +499,12 @@ function insertTrack(song) {
     li.lyricsSyncedLrc,
     li.lyricsLang,
     li.lyricsSidecarMtime,
+    song.bpm ?? null,
+    song.musicalKey ?? null,
+    song.bpmSource ?? null,
     song.modified,
-    loadJson.scanId
+    loadJson.scanId,
+    song.source ?? null
   );
   const trackId = Number(result.lastInsertRowid);
 
@@ -625,26 +705,27 @@ async function run() {
     // Remove tracks that weren't seen in this scan (deleted files)
     const deleted = stmts.deleteOldTracks.run(loadJson.libraryId, loadJson.scanId);
     // Structured end-of-scan event — parsed by task-queue.js to decide whether
-    // to run the waveform post-processor.
+    // to run the waveform post-processor and to print a human-readable summary.
+    // Field shapes mirror the rust-parser's emitter:
+    //   filesProcessed       New / modified rows actually written.
+    //   filesUnchanged       Cache-hit fast-path skips (file existed in DB and
+    //                        mtime matched; only scan_id was bumped).
+    //   filesScanned         Total supported files visited (processed +
+    //                        unchanged + per-file errors).
+    //   staleEntriesRemoved  Tracks deleted because the file disappeared.
     console.log(JSON.stringify({
       event: 'scanComplete',
       filesProcessed: fileCount,
+      filesUnchanged: Math.max(0, totalProcessed - fileCount),
+      filesScanned: totalProcessed,
       staleEntriesRemoved: deleted.changes
     }));
 
-    // Clean up orphaned artists, albums, and genres. Keep artists referenced by
-    // tracks.artist_id, albums.artist_id, OR either M2M table (track_artists,
-    // album_artists). Without the M2M checks, featured/co-credited artists
-    // (V17) whose only reference is the M2M row would be deleted, and
-    // CASCADE on artist_id would drop the M2M row too — silently eating
-    // the second entry of a "A feat. B" split.
-    db.exec('DELETE FROM albums WHERE id NOT IN (SELECT DISTINCT album_id FROM tracks WHERE album_id IS NOT NULL)');
-    db.exec(`DELETE FROM artists
-             WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks         WHERE artist_id IS NOT NULL)
-               AND id NOT IN (SELECT DISTINCT artist_id FROM albums         WHERE artist_id IS NOT NULL)
-               AND id NOT IN (SELECT DISTINCT artist_id FROM track_artists)
-               AND id NOT IN (SELECT DISTINCT artist_id FROM album_artists)`);
-    db.exec('DELETE FROM genres WHERE id NOT IN (SELECT DISTINCT genre_id FROM track_genres)');
+    // Clean up orphaned artists, albums, and genres. The chunked-delete
+    // strategy + the NOT-IN-M2M clauses (so V18 featured / co-credited
+    // artists aren't dropped) live in src/db/orphan-cleanup.js — same
+    // helper is used by src/util/admin.js after a vpath delete.
+    cleanupOrphans(db);
   } catch (err) {
     console.error('Scan failed');
     console.error(err.stack);

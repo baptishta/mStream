@@ -28,6 +28,25 @@ const MAX_BROWSE_COUNT = 10000;
 // repeatedly without UNSUBSCRIBEing.
 const MAX_SUBSCRIBERS = 256;
 
+// V34 dropped the legacy `tracks.genre` flat TEXT column — the canonical
+// store is now the track_genres + genres M2M. DLNA's item DIDL schema and
+// the sort/search criteria allow a single `upnp:genre` per item, so for
+// per-track SELECTs we resolve "the primary genre" via a correlated
+// subquery against the M2M, picking the row with the lowest `tg.rowid`
+// — which is the genre that appeared FIRST in the track's source tag
+// string. Honours the widespread tagger convention that the leading
+// genre is the user's intended primary.
+//
+// See the matching TRACK_PRIMARY_GENRE_SQL in
+// src/api/subsonic/handlers.js for the full rationale (including why
+// `g.id` and alphabetical were rejected).
+//
+// Inline this constant via template-literal interpolation inside SELECT
+// lists and the sort/search maps. Outer alias for the tracks table is
+// always `t`; the subquery aliases `tg` and `g` to avoid collisions.
+const TRACK_PRIMARY_GENRE_SQL =
+  '(SELECT g.name FROM track_genres tg JOIN genres g ON g.id = tg.genre_id WHERE tg.track_id = t.id ORDER BY tg.rowid LIMIT 1)';
+
 // Build a Map<library_id, library> for O(1) lookups inside track loops.
 function libraryIndex(libraries) {
   const m = new Map();
@@ -44,10 +63,21 @@ function libraryIndex(libraries) {
 // eslint-disable-next-line no-control-regex
 const XML_INVALID_CTRL = /[\x00-\x08\x0B\x0C\x0E-\x1F]/g;
 
+// XML 1.0 also forbids lone surrogate halves (U+D800–U+DFFF that aren't part
+// of a valid pair) and the two non-characters U+FFFE / U+FFFF. JS strings are
+// UTF-16, so a mojibake-ridden ID3 tag can easily contain a stray 0xD800 that
+// would produce `&#xD800;` downstream and crash strict parsers. We drop them.
+const XML_LONE_HIGH_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g;
+const XML_LONE_LOW_SURROGATE = /(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+const XML_NONCHARS = /[\uFFFE\uFFFF]/g;
+
 function xmlEscape(str) {
   if (str == null) { return ''; }
   return String(str)
     .replace(XML_INVALID_CTRL, '')
+    .replace(XML_LONE_HIGH_SURROGATE, '')
+    .replace(XML_LONE_LOW_SURROGATE, '')
+    .replace(XML_NONCHARS, '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -164,10 +194,19 @@ function containerArtXml(albumArtFile) {
 }
 
 function libraryContainer(lib, parentId, childCount) {
+  // Libraries of type `audio-books` advertise as
+  // `object.container.album.audioBook` so bookmark-capable renderers
+  // (Plex, Sonos, some TVs) light up their resume-playback UI. Music
+  // libraries stay on `storageFolder` — promoting them to album.audioBook
+  // would make every library look like a single book, which breaks nested
+  // browsing on strict renderers.
+  const cls = lib.type === 'audio-books'
+    ? 'object.container.album.audioBook'
+    : 'object.container.storageFolder';
   return `
   <container id="lib-${lib.id}" parentID="${xmlEscape(parentId)}" restricted="1" childCount="${childCount}">
     <dc:title>${xmlEscape(lib.name)}</dc:title>
-    <upnp:class>object.container.storageFolder</upnp:class>
+    <upnp:class>${cls}</upnp:class>
   </container>`;
 }
 
@@ -313,9 +352,12 @@ function yearContainer(year, childCount) {
   </container>`;
 }
 
-function trackItem(track, libName, parentId) {
+// `lib` is a library-descriptor with at least `{name, type}`. Callers either
+// pass the full libraries row or a lightweight `{name: ..., type: ...}` blob
+// (e.g. playlist rows where we only joined the two columns).
+function trackItem(track, lib, parentId) {
   const base = getBaseUrl();
-  const mediaUrl = `${base}/media/${encodeURIComponent(libName)}/${filePathToUrlPath(track.filepath)}`;
+  const mediaUrl = `${base}/media/${encodeURIComponent(lib.name)}/${filePathToUrlPath(track.filepath)}`;
 
   let artXml = '';
   if (track.album_art_file) {
@@ -332,13 +374,22 @@ function trackItem(track, libName, parentId) {
     ? `\n    <dc:date>${track.year}-01-01</dc:date>\n    <upnp:originalYear>${track.year}</upnp:originalYear>`
     : '';
 
+  // Tracks from `type: 'audio-books'` libraries advertise as
+  // `object.item.audioItem.audioBook` so resume-playback-capable renderers
+  // (Plex, Sonos, some TVs) actually enable the resume UI. Advertising it
+  // only on the parent container (which we do) isn't enough for most
+  // renderers — they key their bookmark tracking off the track class.
+  const itemClass = lib.type === 'audio-books'
+    ? 'object.item.audioItem.audioBook'
+    : 'object.item.audioItem.musicTrack';
+
   return `
   <item id="track-${track.id}" parentID="${xmlEscape(parentId)}" restricted="1">
     <dc:title>${xmlEscape(track.title || path.basename(track.filepath))}</dc:title>
     <dc:creator>${xmlEscape(track.artist_name)}</dc:creator>
     <upnp:artist>${xmlEscape(track.artist_name)}</upnp:artist>
     <upnp:album>${xmlEscape(track.album_name)}</upnp:album>${track.track_number ? `\n    <upnp:originalTrackNumber>${track.track_number}</upnp:originalTrackNumber>` : ''}${track.genre ? `\n    <upnp:genre>${xmlEscape(track.genre)}</upnp:genre>` : ''}${yearXml}${artXml}
-    <upnp:class>object.item.audioItem.musicTrack</upnp:class>
+    <upnp:class>${itemClass}</upnp:class>
     <res protocolInfo="${xmlEscape(protocolInfo(track.format))}"${durationAttr}${sizeAttr}>${xmlEscape(mediaUrl)}</res>
   </item>`;
 }
@@ -356,7 +407,7 @@ function getLibraryTracks(libraryId, start, count, orderBy = 'al.name, t.disc_nu
   const limit = count > 0 ? count : -1; // SQLite: -1 = no limit
   return db.getDB().prepare(`
     SELECT t.id, t.filepath, t.title, t.track_number, t.duration, t.format,
-           t.file_size, t.genre, t.album_art_file, t.year,
+           t.file_size, ${TRACK_PRIMARY_GENRE_SQL} AS genre, t.album_art_file, t.year,
            a.name AS artist_name,
            al.name AS album_name
     FROM tracks t
@@ -371,7 +422,7 @@ function getLibraryTracks(libraryId, start, count, orderBy = 'al.name, t.disc_nu
 function getAllLibraryTracks(libraryId) {
   return db.getDB().prepare(`
     SELECT t.id, t.filepath, t.title, t.track_number, t.duration, t.format,
-           t.file_size, t.genre, t.album_art_file, t.year,
+           t.file_size, ${TRACK_PRIMARY_GENRE_SQL} AS genre, t.album_art_file, t.year,
            a.name AS artist_name,
            al.name AS album_name
     FROM tracks t
@@ -449,7 +500,7 @@ function getAlbumTracks(libraryId, albumId) {
   if (albumId === 0) {
     return db.getDB().prepare(`
       SELECT t.id, t.filepath, t.title, t.track_number, t.duration, t.format,
-             t.file_size, t.genre, t.album_art_file, t.year,
+             t.file_size, ${TRACK_PRIMARY_GENRE_SQL} AS genre, t.album_art_file, t.year,
              a.name AS artist_name, al.name AS album_name
       FROM tracks t
       LEFT JOIN artists a  ON t.artist_id = a.id
@@ -460,7 +511,7 @@ function getAlbumTracks(libraryId, albumId) {
   }
   return db.getDB().prepare(`
     SELECT t.id, t.filepath, t.title, t.track_number, t.duration, t.format,
-           t.file_size, t.genre, t.album_art_file, t.year,
+           t.file_size, ${TRACK_PRIMARY_GENRE_SQL} AS genre, t.album_art_file, t.year,
            a.name AS artist_name, al.name AS album_name
     FROM tracks t
     LEFT JOIN artists a  ON t.artist_id = a.id
@@ -484,37 +535,100 @@ function getLibraryAlbums(libraryId) {
   `).all(libraryId);
 }
 
+// V34 helper: build the WHERE-clause condition for "track matches this
+// genre selection". Two semantically distinct cases:
+//
+//   genre === ''  → "Unknown Genre" sentinel: tracks with NO entry in
+//                   track_genres at all. The DLNA browse surface keeps
+//                   the historical empty-string convention because
+//                   DLNA object IDs encode it that way (genre-N-),
+//                   and the on-disk DLNA cache URLs would break if
+//                   we changed the wire format here.
+//
+//   non-empty     → tracks where the M2M JOIN finds at least one
+//                   matching genre name. Comparison is case-
+//                   insensitive (COLLATE NOCASE) so the surface
+//                   matches the post-V34 case-folded vocabulary
+//                   getLibraryGenres now produces.
+//
+// Returns `{ sql, params }`. The outer query must alias the tracks
+// table as `t`.
+function trackGenreCondition(genre) {
+  if (genre === '') {
+    return {
+      sql: 'NOT EXISTS (SELECT 1 FROM track_genres tg WHERE tg.track_id = t.id)',
+      params: [],
+    };
+  }
+  return {
+    sql: `EXISTS (SELECT 1 FROM track_genres tg JOIN genres g ON g.id = tg.genre_id
+                  WHERE tg.track_id = t.id AND g.name COLLATE NOCASE = ?)`,
+    params: [genre],
+  };
+}
+
 function getLibraryGenres(libraryId) {
-  return db.getDB().prepare(`
-    SELECT genre AS name,
+  // V34: read tagged genres via the M2M JOIN, plus a separate query
+  // for the "Unknown Genre" bucket (tracks with no track_genres row).
+  // The DLNA browse historically surfaced an empty-name entry for
+  // untagged tracks; preserve that.
+  const tagged = db.getDB().prepare(`
+    SELECT g.name AS name,
            COUNT(DISTINCT COALESCE(t.artist_id, 0)) AS artist_count,
            MIN(t.album_art_file) AS album_art_file
     FROM tracks t
-    WHERE library_id = ?
-    GROUP BY genre
-    ORDER BY COALESCE(genre, '') COLLATE NOCASE
+    JOIN track_genres tg ON tg.track_id = t.id
+    JOIN genres g ON g.id = tg.genre_id
+    WHERE t.library_id = ?
+    GROUP BY g.id
+    ORDER BY g.name COLLATE NOCASE
   `).all(libraryId);
+  const untagged = db.getDB().prepare(`
+    SELECT COUNT(*) AS _n,
+           COUNT(DISTINCT COALESCE(t.artist_id, 0)) AS artist_count,
+           MIN(t.album_art_file) AS album_art_file
+    FROM tracks t
+    WHERE t.library_id = ?
+      AND NOT EXISTS (SELECT 1 FROM track_genres tg WHERE tg.track_id = t.id)
+  `).get(libraryId);
+  // Surface "Unknown Genre" only when there ARE untagged tracks —
+  // matches the pre-V34 GROUP BY behaviour (empty group → no row).
+  // Place it at the start of the list so the DLNA browse order
+  // matches the pre-V34 `ORDER BY COALESCE(genre, '') COLLATE NOCASE`
+  // (NULL-genre sorted before all real names).
+  if (untagged && untagged._n > 0) {
+    return [
+      { name: null, artist_count: untagged.artist_count, album_art_file: untagged.album_art_file },
+      ...tagged,
+    ];
+  }
+  return tagged;
 }
 
-// genre='' means "Unknown Genre" (tracks with NULL genre).
+// genre='' means "Unknown Genre" (tracks with no track_genres row).
 function getGenreByName(libraryId, genre) {
-  const cond = genre === '' ? 't.genre IS NULL' : 't.genre = ?';
-  const params = genre === '' ? [libraryId] : [libraryId, genre];
+  const cond = trackGenreCondition(genre);
+  // `genre` parameter passed twice: once to populate the response's
+  // `name` field (the canonical-cased label from the genres table is
+  // less stable across edits than what the caller asked for), once
+  // for the WHERE filter inside cond.sql. Pass NULL for the unknown
+  // case so the response shape is consistent with the pre-V34
+  // SELECT t.genre AS name path (which returned NULL there).
   const row = db.getDB().prepare(`
-    SELECT t.genre AS name,
+    SELECT ? AS name,
            COUNT(DISTINCT COALESCE(t.artist_id, 0)) AS artist_count,
            MIN(t.album_art_file) AS album_art_file,
            COUNT(*) AS _n
     FROM tracks t
-    WHERE t.library_id = ? AND ${cond}
-  `).get(...params);
+    WHERE t.library_id = ? AND ${cond.sql}
+  `).get(genre === '' ? null : genre, libraryId, ...cond.params);
   if (!row || row._n === 0) return null;
   delete row._n;
   return row;
 }
 
 function getGenreArtists(libraryId, genre) {
-  const isUnknown = genre === '';
+  const cond = trackGenreCondition(genre);
   return db.getDB().prepare(`
     SELECT COALESCE(t.artist_id, 0) AS id,
            COALESCE(a.name, 'Unknown Artist') AS name,
@@ -522,17 +636,16 @@ function getGenreArtists(libraryId, genre) {
            MIN(t.album_art_file) AS album_art_file
     FROM tracks t
     LEFT JOIN artists a ON t.artist_id = a.id
-    WHERE t.library_id = ? AND ${isUnknown ? 't.genre IS NULL' : 't.genre = ?'}
+    WHERE t.library_id = ? AND ${cond.sql}
     GROUP BY COALESCE(t.artist_id, 0)
     ORDER BY COALESCE(a.name, '') COLLATE NOCASE
-  `).all(...(isUnknown ? [libraryId] : [libraryId, genre]));
+  `).all(libraryId, ...cond.params);
 }
 
 function getGenreArtistById(libraryId, genre, artistId) {
-  const genreCond  = genre === '' ? 't.genre IS NULL' : 't.genre = ?';
+  const gCond = trackGenreCondition(genre);
   const artistCond = artistId === 0 ? 't.artist_id IS NULL' : 't.artist_id = ?';
-  const params = [libraryId];
-  if (genre !== '') params.push(genre);
+  const params = [libraryId, ...gCond.params];
   if (artistId !== 0) params.push(artistId);
   const row = db.getDB().prepare(`
     SELECT COALESCE(t.artist_id, 0) AS id,
@@ -542,7 +655,7 @@ function getGenreArtistById(libraryId, genre, artistId) {
            COUNT(*) AS _n
     FROM tracks t
     LEFT JOIN artists a ON t.artist_id = a.id
-    WHERE t.library_id = ? AND ${genreCond} AND ${artistCond}
+    WHERE t.library_id = ? AND ${gCond.sql} AND ${artistCond}
   `).get(...params);
   if (!row || row._n === 0) return null;
   delete row._n;
@@ -550,11 +663,10 @@ function getGenreArtistById(libraryId, genre, artistId) {
 }
 
 function getGenreArtistAlbums(libraryId, genre, artistId) {
-  const genreCond  = genre === '' ? 't.genre IS NULL'    : 't.genre = ?';
+  const gCond = trackGenreCondition(genre);
   const artistCond = artistId === 0 ? 't.artist_id IS NULL' : 't.artist_id = ?';
-  const params = [libraryId];
-  if (genre !== '') params.push(genre);
-  if (artistId !== 0)            params.push(artistId);
+  const params = [libraryId, ...gCond.params];
+  if (artistId !== 0) params.push(artistId);
   return db.getDB().prepare(`
     SELECT COALESCE(t.album_id, 0) AS id,
            COALESCE(al.name, 'Unknown Album') AS name,
@@ -562,7 +674,7 @@ function getGenreArtistAlbums(libraryId, genre, artistId) {
            COALESCE(al.album_art_file, MIN(t.album_art_file)) AS album_art_file
     FROM tracks t
     LEFT JOIN albums al ON t.album_id = al.id
-    WHERE t.library_id = ? AND ${genreCond} AND ${artistCond}
+    WHERE t.library_id = ? AND ${gCond.sql} AND ${artistCond}
     GROUP BY COALESCE(t.album_id, 0)
     ORDER BY COALESCE(al.name, '') COLLATE NOCASE
   `).all(...params);
@@ -622,7 +734,7 @@ function getAlbumArtistAlbums(libraryId, artistId) {
 
 const SMART_TRACK_COLS = `
   t.id, t.filepath, t.title, t.track_number, t.duration, t.format,
-  t.file_size, t.genre, t.album_art_file, t.year, t.library_id,
+  t.file_size, ${TRACK_PRIMARY_GENRE_SQL} AS genre, t.album_art_file, t.year, t.library_id,
   a.name AS artist_name, al.name AS album_name
 `;
 
@@ -788,9 +900,9 @@ function getPlaylistTracks(playlistId) {
                 THEN SUBSTR(pt.filepath, INSTR(pt.filepath, '/') + 1)
                 ELSE '' END AS rel_filepath,
            t.title, t.track_number, t.duration, t.format, t.file_size,
-           t.genre, t.album_art_file, t.year,
+           ${TRACK_PRIMARY_GENRE_SQL} AS genre, t.album_art_file, t.year,
            a.name AS artist_name, al.name AS album_name,
-           l.name AS library_name
+           l.name AS library_name, l.type AS library_type
     FROM playlist_tracks pt
     JOIN libraries l ON l.name = CASE
         WHEN INSTR(pt.filepath, '/') > 0 THEN SUBSTR(pt.filepath, 1, INSTR(pt.filepath, '/') - 1)
@@ -818,7 +930,7 @@ function getRecentTracks(start, count) {
   if (limit <= 0) return [];
   return db.getDB().prepare(`
     SELECT t.id, t.filepath, t.title, t.track_number, t.duration, t.format,
-           t.file_size, t.genre, t.album_art_file, t.year, t.library_id,
+           t.file_size, ${TRACK_PRIMARY_GENRE_SQL} AS genre, t.album_art_file, t.year, t.library_id,
            a.name AS artist_name, al.name AS album_name
     FROM tracks t
     LEFT JOIN artists a  ON t.artist_id = a.id
@@ -869,7 +981,8 @@ const SORT_PROP_MAP = {
   'upnp:artist':              'a.name',
   'upnp:album':               'al.name',
   'upnp:originalTrackNumber': 't.track_number',
-  'upnp:genre':               't.genre',
+  // V34: tracks.genre dropped — sort by the M2M-derived primary genre.
+  'upnp:genre':               TRACK_PRIMARY_GENRE_SQL,
   'dc:date':                  't.year',
   'upnp:originalYear':        't.year',
   'res@duration':             't.duration',
@@ -988,7 +1101,7 @@ function handleBrowse(body, res) {
     const tracks = getRecentTracks(startIdx, reqCount);
     const items = tracks.map(t => {
       const lib = libById.get(t.library_id);
-      return lib ? trackItem(t, lib.name, 'recent') : '';
+      return lib ? trackItem(t, lib, 'recent') : '';
     }).filter(Boolean);
     return sendBrowseResponse(res, didlWrapper(items.join('')), items.length, totalRecent);
   }
@@ -1003,7 +1116,7 @@ function handleBrowse(body, res) {
     const rows = getRows(startIdx, reqCount);
     const items = rows.map(t => {
       const lib = libById.get(t.library_id);
-      return lib ? trackItem(t, lib.name, id) : '';
+      return lib ? trackItem(t, lib, id) : '';
     }).filter(Boolean);
     return sendBrowseResponse(res, didlWrapper(items.join('')), items.length, total);
   }
@@ -1034,7 +1147,7 @@ function handleBrowse(body, res) {
     const tracks = getYearTracks(year, startIdx, reqCount);
     const items = tracks.map(t => {
       const lib = libById.get(t.library_id);
-      return lib ? trackItem(t, lib.name, objectId) : '';
+      return lib ? trackItem(t, lib, objectId) : '';
     }).filter(Boolean);
     return sendBrowseResponse(res, didlWrapper(items.join('')), items.length, total);
   }
@@ -1071,7 +1184,7 @@ function handleBrowse(body, res) {
 
     const children = [
       ...dirs.map(d => dirContainer(libId, d, objectId, dirChildCount(allTracks, d))),
-      ...items.map(t => trackItem(t, lib.name, objectId)),
+      ...items.map(t => trackItem(t, lib, objectId)),
     ];
     const slice = paginate(children, startIdx, reqCount);
     return sendBrowseResponse(res, didlWrapper(slice.join('')), slice.length, children.length);
@@ -1191,7 +1304,7 @@ function handleBrowse(body, res) {
 
     const orderBy = buildOrderBy(sortTerms, 'al.name, t.disc_number, t.track_number, t.title');
     const tracks = getLibraryTracks(libId, startIdx, reqCount, orderBy);
-    return sendBrowseResponse(res, didlWrapper(tracks.map(t => trackItem(t, lib.name, objectId)).join('')), tracks.length, total);
+    return sendBrowseResponse(res, didlWrapper(tracks.map(t => trackItem(t, lib, objectId)).join('')), tracks.length, total);
   }
 
   // ── Directory container (dirs mode) ──────────────────────────────────────
@@ -1217,7 +1330,7 @@ function handleBrowse(body, res) {
         const full = relPath + '/' + d;
         return dirContainer(libId, full, objectId, dirChildCount(allTracks, full));
       }),
-      ...items.map(t => trackItem(t, lib.name, objectId)),
+      ...items.map(t => trackItem(t, lib, objectId)),
     ];
     const slice = paginate(children, startIdx, reqCount);
     return sendBrowseResponse(res, didlWrapper(slice.join('')), slice.length, children.length);
@@ -1259,7 +1372,7 @@ function handleBrowse(body, res) {
     }
 
     const slice = paginate(tracks, startIdx, reqCount);
-    return sendBrowseResponse(res, didlWrapper(slice.map(t => trackItem(t, lib.name, objectId)).join('')), slice.length, tracks.length);
+    return sendBrowseResponse(res, didlWrapper(slice.map(t => trackItem(t, lib, objectId)).join('')), slice.length, tracks.length);
   }
 
   // ── Genre container (genre mode) ─────────────────────────────────────────
@@ -1320,7 +1433,7 @@ function handleBrowse(body, res) {
       duration: row.duration, format: row.format, file_size: row.file_size,
       genre: row.genre, album_art_file: row.album_art_file,
       artist_name: row.artist_name, album_name: row.album_name,
-    }, row.library_name, objectId)).join('');
+    }, { name: row.library_name, type: row.library_type }, objectId)).join('');
     return sendBrowseResponse(res, didlWrapper(items), slice.length, rows.length);
   }
 
@@ -1330,7 +1443,7 @@ function handleBrowse(body, res) {
     const trackId = parseInt(trackMatch[1], 10);
     const row = db.getDB().prepare(`
       SELECT t.id, t.filepath, t.title, t.track_number, t.duration, t.format,
-             t.file_size, t.genre, t.album_art_file, t.year, t.library_id,
+             t.file_size, ${TRACK_PRIMARY_GENRE_SQL} AS genre, t.album_art_file, t.year, t.library_id,
              a.name AS artist_name, al.name AS album_name
       FROM tracks t
       LEFT JOIN artists a  ON t.artist_id = a.id
@@ -1345,7 +1458,7 @@ function handleBrowse(body, res) {
     if (browseFlag === 'BrowseDirectChildren') {
       return sendBrowseResponse(res, didlWrapper(''), 0, 0);
     }
-    return sendBrowseResponse(res, didlWrapper(trackItem(row, lib.name, `tracks-${lib.id}`)), 1, 1);
+    return sendBrowseResponse(res, didlWrapper(trackItem(row, lib, `tracks-${lib.id}`)), 1, 1);
   }
 
   sendXml(res, soapError('701', 'No Such Object'), 500);
@@ -1405,7 +1518,10 @@ const SEARCH_PROP_MAP = {
   'dc:creator':               "COALESCE(a.name, '')",
   'upnp:artist':              "COALESCE(a.name, '')",
   'upnp:album':               "COALESCE(al.name, '')",
-  'upnp:genre':               "COALESCE(t.genre, '')",
+  // V34: tracks.genre dropped — search against the M2M-derived primary
+  // genre. COALESCE wrap matches the pre-V34 behaviour (empty string
+  // when no genres are tagged on the track).
+  'upnp:genre':               `COALESCE(${TRACK_PRIMARY_GENRE_SQL}, '')`,
   'upnp:originalTrackNumber': 't.track_number',
 };
 
@@ -1477,7 +1593,7 @@ function handleSearch(body, res) {
   const limit = reqCount > 0 ? reqCount : -1;
   const rows = d.prepare(`
     SELECT t.id, t.filepath, t.title, t.track_number, t.duration, t.format,
-           t.file_size, t.genre, t.album_art_file, t.year, t.library_id,
+           t.file_size, ${TRACK_PRIMARY_GENRE_SQL} AS genre, t.album_art_file, t.year, t.library_id,
            a.name AS artist_name, al.name AS album_name
     FROM tracks t
     LEFT JOIN artists a  ON t.artist_id = a.id
@@ -1489,7 +1605,7 @@ function handleSearch(body, res) {
 
   const items = rows.map(row => {
     const lib = libById.get(row.library_id);
-    return lib ? trackItem(row, lib.name, objectId) : '';
+    return lib ? trackItem(row, lib, objectId) : '';
   }).filter(Boolean).join('');
 
   const escapedDidl = xmlEscape(didlWrapper(items));

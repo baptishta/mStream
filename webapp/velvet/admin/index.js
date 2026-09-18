@@ -1161,9 +1161,9 @@ const dbView = Vue.component('db-view', {
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Max Concurrent Scans:</b> {{dbParams.maxConcurrentTasks}}</td>
+                      <td><b>Generate waveforms during scan:</b> {{dbParams.generateWaveforms}}</td>
                       <td>
-                        [<a v-on:click="openModal('edit-max-scan-modal')">edit</a>]
+                        [<a v-on:click="toggleGenerateWaveforms()">edit</a>]
                       </td>
                     </tr>
                   </tbody>
@@ -1522,6 +1522,51 @@ const dbView = Vue.component('db-view', {
               // update fronted data
               Vue.set(ADMINDATA.dbParams, 'compressImage', !this.dbParams.compressImage);
 
+              iziToast.success({
+                title: 'Updated Successfully',
+                position: 'topCenter',
+                timeout: 3500
+              });
+            }).catch(() => {
+              iziToast.error({
+                title: 'Failed',
+                position: 'topCenter',
+                timeout: 3500
+              });
+            });
+          }, true],
+          ['<button>Go Back</button>', (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+          }],
+        ]
+      });
+    },
+    toggleGenerateWaveforms: function() {
+      // Disabling waveform generation roughly 10×s scan throughput —
+      // symphonia decode dominates per-file work. Waveforms still
+      // appear in the UI, generated on-demand via ffmpeg on first
+      // playback by the /api/v1/db/waveform endpoint.
+      iziToast.question({
+        timeout: 20000,
+        close: false,
+        overlayClose: true,
+        overlay: true,
+        displayMode: 'once',
+        id: 'question',
+        zindex: 99999,
+        layout: 2,
+        maxWidth: 600,
+        title: `<b>${this.dbParams.generateWaveforms === true ? 'Disable' : 'Enable'} scan-time waveform generation?</b>`,
+        position: 'center',
+        buttons: [
+          [`<button><b>${this.dbParams.generateWaveforms === true ? 'Disable' : 'Enable'}</b></button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+            API.axios({
+              method: 'POST',
+              url: `${API.url()}/api/v1/admin/db/params/generate-waveforms`,
+              data: { generateWaveforms: !this.dbParams.generateWaveforms }
+            }).then(() => {
+              Vue.set(ADMINDATA.dbParams, 'generateWaveforms', !this.dbParams.generateWaveforms);
               iziToast.success({
                 title: 'Updated Successfully',
                 position: 'topCenter',
@@ -2961,71 +3006,6 @@ const editAddressModal = Vue.component('edit-address-modal', {
   }
 });
 
-const editMaxScanModal = Vue.component('edit-max-scans-modal', {
-  data() {
-    return {
-      params: ADMINDATA.dbParams,
-      submitPending: false,
-      editValue: ADMINDATA.dbParams.maxConcurrentTasks
-    };
-  },
-  template: `
-    <form @submit.prevent="updateParam">
-      <div class="modal-content">
-        <h4>Max Concurrent Scans</h4>
-        <div class="input-field">
-          <input v-model="editValue" id="edit-max-scans" required type="number" min="1">
-          <label for="edit-max-scans">Edit Max Scans</label>
-        </div>
-        <blockquote>
-          <b>Using a value more than '1' is experimental</b>
-        </blockquote>
-      </div>
-      <div class="modal-footer">
-        <a href="#!" class="modal-close waves-effect waves-green btn-flat">Go Back</a>
-        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
-          {{submitPending === false ? 'Update' : 'Updating...'}}
-        </button>
-      </div>
-    </form>`,
-  mounted: function () {
-    M.updateTextFields();
-  },
-  methods: {
-    updateParam: async function() {
-      try {
-        this.submitPending = true;
-
-        await API.axios({
-          method: 'POST',
-          url: `${API.url()}/api/v1/admin/db/params/max-concurrent-scans`,
-          data: { maxConcurrentTasks: this.editValue }
-        });
-
-        // update fronted data
-        Vue.set(ADMINDATA.dbParams, 'maxConcurrentTasks', this.editValue);
-  
-        // close & reset the modal
-        M.Modal.getInstance(document.getElementById('admin-modal')).close();
-
-        iziToast.success({
-          title: 'Updated Successfully',
-          position: 'topCenter',
-          timeout: 3500
-        });
-      } catch(err) {
-        iziToast.error({
-          title: 'Update Failed',
-          position: 'topCenter',
-          timeout: 3500
-        });
-      }finally {
-        this.submitPending = false;
-      }
-    }
-  }
-});
-
 const editBootScanView = Vue.component('edit-boot-scan-delay-modal', {
   data() {
     return {
@@ -3593,7 +3573,6 @@ const modVM = new Vue({
     'edit-boot-scan-delay-modal': editBootScanView,
     'edit-select-codec-modal': editTranscodeCodecModal,
     'edit-transcode-bitrate-modal': editTranscodeDefaultBitrate,
-    'edit-max-scan-modal': editMaxScanModal,
     'edit-ssl-modal': editSslModal,
     'lastfm-modal': lastFMModal,
     'federation-generate-invite-modal': federationGenerateInvite,

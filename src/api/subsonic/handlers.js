@@ -32,11 +32,141 @@ import * as nowPlaying from './now-playing.js';
 import { parseLrc, linesToPlainText, plainTextToLines } from './lrc-parser.js';
 import * as lrclib from '../lyrics-lrclib.js';
 import { identiconFor } from './identicon.js';
+import { parseSearchQuery, buildFtsExpression } from '../../util/search-query.js';
 
 // ── Common helpers ──────────────────────────────────────────────────────────
 
 // Comma-separated list of leading articles Subsonic sorting ignores.
 const IGNORED_ARTICLES = 'The An A Die Das Ein Eine Les Le La';
+
+// V34 dropped the legacy `tracks.genre` flat TEXT column — the canonical
+// store is now the track_genres + genres M2M. Subsonic's Song/Album
+// schemas expect a single `genre` string per row, so for the per-track
+// SELECTs we resolve "the primary genre" via a correlated subquery
+// against the M2M, picking the row with the lowest `tg.rowid` — which
+// is the genre that appeared FIRST in the track's source tag string.
+//
+// Why first-in-tag-string (via tg.rowid):
+//   • Honours the widespread convention that the leading genre in a
+//     "Rock, Pop" style ID3 tag is the user's intended primary; tools
+//     like MusicBrainz Picard and beets preserve this order.
+//   • Per-track stable: setTrackGenres iterates the split list
+//     left-to-right and INSERT OR IGNORE assigns rowids
+//     monotonically. Different worker threads scan different tracks,
+//     so a given track's M2M rows always end up in the order its own
+//     setTrackGenres saw them — independent of cross-track race
+//     scheduling.
+//   • Stable across rescans + tag edits: the scanner deletes the
+//     parent track (cascading to track_genres) and re-INSERTs in
+//     current tag order; replaceTrackGenres in the tag-edit handler
+//     does DELETE + ordered re-INSERT inside a transaction. Both
+//     produce fresh rowids in the new tag-string order.
+//   • Stable across VACUUM: SQLite preserves rowids on regular
+//     (non-WITHOUT-ROWID) tables since 3.1.0.
+//
+// `ORDER BY g.id` (the prior implementation) was REJECTED because it
+// resolves against the global `genres` table insertion order, not the
+// per-track tag order. A track tagged "Jazz, Fusion" could yield
+// "Fusion" if the library had already seen "Fusion" via an earlier
+// track, putting it at a lower id. Confusing and non-tag-faithful.
+//
+// `ORDER BY g.name COLLATE NOCASE` (an intermediate proposal) was
+// REJECTED because it ignored tagger intent entirely — "Jazz, Fusion"
+// would surface as "Fusion" (F < J) even on a fresh scan.
+//
+// Multi-genre tracks lose the secondary genres for now; if/when we
+// want to surface them, the OpenSubsonic `genres[]` extension is the
+// right place.
+//
+// Performance note: this is a per-row correlated subquery. Empirically
+// negligible because `idx_track_genres_track` (V2) makes the inner
+// `WHERE tg.track_id = t.id` an index-seek. The ORDER BY then sorts
+// the small per-track result set (typically 1-3 genres) by rowid,
+// which is the table's natural order — effectively free.
+const TRACK_PRIMARY_GENRE_SQL =
+  '(SELECT g.name FROM track_genres tg JOIN genres g ON g.id = tg.genre_id WHERE tg.track_id = t.id ORDER BY tg.rowid LIMIT 1) AS genre';
+
+// Album-level companion of TRACK_PRIMARY_GENRE_SQL. Picks the
+// first-by-rowid genre across all tracks in this album. Approximates
+// "the first genre on the first-scanned track of the album" since
+// rowids in track_genres are globally monotonic. Pre-V34 used
+// `MIN(t.genre)` (alphabetically-first flat string) — different
+// semantics, but album-level genre fields are minor wire-shape
+// items and few clients render them prominently.
+//
+// Uses aliases `tg2` / `t2` to avoid collisions with the outer
+// query's `t` and any existing `tg` it may use. Expects the outer
+// query to expose `al.id` (album id).
+const ALBUM_PRIMARY_GENRE_SQL =
+  '(SELECT g.name FROM track_genres tg2 JOIN tracks t2 ON t2.id = tg2.track_id JOIN genres g ON g.id = tg2.genre_id WHERE t2.album_id = al.id ORDER BY tg2.rowid LIMIT 1) AS genre';
+
+// OpenSubsonic `genres[]` extension — full multi-genre list as an
+// ordered array of ItemGenre objects (`{ name: "Rock" }`). Co-exists
+// with the legacy `genre` string field: legacy clients keep working
+// because we still emit the singular primary; OpenSubsonic-aware
+// clients (Symfonium, play:Sub, Feishin, recent Subsonic Web UI
+// builds, …) get the full list and can render genre chips properly.
+//
+// Order matches tg.rowid (= tag-string order from the scanner), so
+// `genres[0].name === genre`. Producing the JSON in SQL via
+// `json_group_array(json_object(...))` keeps the per-row cost low
+// (no extra round trip + no JSON.stringify in JS for the common
+// case of single-genre tracks where the array materialisation is
+// trivial). songFromRow parses the string into a real array.
+//
+// Empty result for untagged tracks: `json_group_array` of zero rows
+// returns the literal string `"[]"` — songFromRow checks for empty
+// after parse and omits the field entirely (response: no `genres`
+// key, matches the "absent" convention for other optional fields).
+//
+// The inner subquery aliases tg/g afresh; outer correlated reference
+// is `t.id`. Inner ORDER BY tg.rowid preserves tag-string order in
+// the materialised array.
+const TRACK_GENRES_JSON_SQL =
+  '(SELECT json_group_array(json_object(\'name\', name)) FROM (' +
+    'SELECT g.name FROM track_genres tg JOIN genres g ON g.id = tg.genre_id ' +
+    'WHERE tg.track_id = t.id ORDER BY tg.rowid' +
+  ')) AS genres_json';
+
+// Album-level OpenSubsonic `genres[]`. DISTINCT genre names across
+// the album's tracks (a multi-genre album where every track shares
+// the same two genres should surface those two genres once, not
+// twice-per-track). Ordering is "by when the genre first appeared
+// in the album's M2M" (MIN(tg2.rowid)) — keeps the primary
+// (ALBUM_PRIMARY_GENRE_SQL's pick) first, with secondaries trailing
+// in scan-time order. Inner GROUP BY g.id collapses dupes.
+//
+// Aliases tg2/t2 to avoid collisions with the outer query's tg/t
+// (and to mirror ALBUM_PRIMARY_GENRE_SQL's alias choice).
+const ALBUM_GENRES_JSON_SQL =
+  '(SELECT json_group_array(json_object(\'name\', name)) FROM (' +
+    'SELECT g.name, MIN(tg2.rowid) AS first_seen ' +
+    'FROM track_genres tg2 ' +
+    'JOIN tracks t2 ON t2.id = tg2.track_id ' +
+    'JOIN genres g ON g.id = tg2.genre_id ' +
+    'WHERE t2.album_id = al.id ' +
+    'GROUP BY g.id ' +
+    'ORDER BY first_seen' +
+  ')) AS genres_json';
+
+// Shared parser for the `genres_json` column populated by either
+// TRACK_GENRES_JSON_SQL or ALBUM_GENRES_JSON_SQL. Returns the parsed
+// array of ItemGenre objects, or `undefined` for empty / missing /
+// malformed input. Used in songFromRow and the album response
+// shapers so both paths converge on identical "absent vs. present"
+// semantics (absent → no field in response, present → ItemGenre[]).
+function parseGenresJson(genresJson) {
+  if (!genresJson) { return undefined; }
+  try {
+    const parsed = JSON.parse(genresJson);
+    if (Array.isArray(parsed) && parsed.length > 0) { return parsed; }
+  } catch (_) {
+    // json_group_array shouldn't produce malformed output; defensive
+    // swallow so a bizarre corrupted row doesn't kill the whole
+    // response.
+  }
+  return undefined;
+}
 
 // ── ID encoding ─────────────────────────────────────────────────────────────
 // Containers get type-prefixed opaque IDs so getMusicDirectory and getCoverArt
@@ -217,7 +347,11 @@ function arrayParam(v) {
 
 // Build a Subsonic Song object from a DB row. The query supplying `row` must
 // include at minimum: t.id, t.filepath, t.title, t.track_number, t.disc_number,
-// t.duration, t.format, t.file_size, t.bitrate, t.year, t.genre,
+// t.duration, t.format, t.file_size, t.bitrate, t.year,
+// ${TRACK_PRIMARY_GENRE_SQL} (provides `genre` via the track_genres M2M
+// correlated subquery — see the helper constant above),
+// ${TRACK_GENRES_JSON_SQL} (provides `genres_json` for the OpenSubsonic
+// `genres[]` array — optional, see emit-when-non-empty below),
 // t.album_art_file, t.created_at, t.library_id, a.name AS artist_name,
 // a.id AS artist_id, al.name AS album_name, al.id AS album_id.
 //
@@ -260,6 +394,15 @@ function songFromRow(row) {
     // Album gain would need a second column — deferred.
     out.replayGain = { trackGain: row.replaygain_track_db };
   }
+  // OpenSubsonic `genres[]` — full multi-genre list as
+  // [{name: 'Rock'}, {name: 'Pop'}], ordered by tag-string position.
+  // The legacy `genre` field above carries the primary (genres[0]);
+  // the array gives clients that support OpenSubsonic the complete
+  // set. Untagged tracks: TRACK_GENRES_JSON_SQL returns "[]" which
+  // the helper treats as absent (matches the "no field in response"
+  // convention).
+  const genres = parseGenresJson(row.genres_json);
+  if (genres) { out.genres = genres; }
   return out;
 }
 
@@ -365,8 +508,16 @@ export function getIndexes(req, res) {
 }
 
 export function getArtist(req, res) {
+  // Distinguish "param absent" (Subsonic error 10) from "param present
+  // but doesn't decode to a known artist-shape ID" (Subsonic error 70 —
+  // data not found). Conflating them as MISSING_PARAM was a regression
+  // some clients react to badly: code 10 reads as "I sent a malformed
+  // request, give up" while code 70 reads as "this entity went away,
+  // refresh the cache". Caught by the cross-server conformance harness
+  // diffing against Navidrome.
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const parsed = decodeId(req.query.id, 'artist');
-  if (!parsed) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  if (!parsed) { return SubErr.NOT_FOUND(req, res, 'Artist'); }
   const id = parsed.id;
   const { clause, params } = libraryScope(req);
 
@@ -382,7 +533,7 @@ export function getArtist(req, res) {
   const albums = db.getDB().prepare(`
     SELECT al.id, al.name, al.year, al.album_art_file AS coverArt,
            COUNT(t.id) AS songCount, SUM(t.duration) AS duration,
-           MIN(t.genre) AS genre
+           ${ALBUM_PRIMARY_GENRE_SQL}, ${ALBUM_GENRES_JSON_SQL}
     FROM albums al
     JOIN tracks t ON t.album_id = al.id
     WHERE (al.artist_id = ?
@@ -415,6 +566,10 @@ export function getArtist(req, res) {
         artistId:  encArtist(artist.id),
         year:      al.year || undefined,
         genre:     al.genre || undefined,
+        // OpenSubsonic `genres[]` — DISTINCT names across the album's
+        // tracks, ordered by when each genre first appeared in the
+        // M2M (MIN(tg2.rowid)). Absent when the album is untagged.
+        genres:    parseGenresJson(al.genres_json),
         coverArt:  al.coverArt ? encAlbum(al.id) : undefined,
         songCount: al.songCount,
         duration:  al.duration != null ? Math.round(al.duration) : undefined,
@@ -426,8 +581,9 @@ export function getArtist(req, res) {
 }
 
 export function getAlbum(req, res) {
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const parsed = decodeId(req.query.id, 'album');
-  if (!parsed) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  if (!parsed) { return SubErr.NOT_FOUND(req, res, 'Album'); }
   const id = parsed.id;
   const { clause, params } = libraryScope(req);
 
@@ -452,7 +608,7 @@ export function getAlbum(req, res) {
 
   const songs = db.getDB().prepare(`
     SELECT t.id, t.filepath, t.title, t.track_number, t.disc_number, t.duration,
-           t.format, t.file_size, t.bitrate, t.year, t.genre, t.album_art_file,
+           t.format, t.file_size, t.bitrate, t.year, ${TRACK_PRIMARY_GENRE_SQL}, ${TRACK_GENRES_JSON_SQL}, t.album_art_file,
            t.created_at, t.library_id,
            t.replaygain_track_db, t.sample_rate, t.channels, t.bit_depth,
            a.id AS artist_id, a.name AS artist_name,
@@ -492,13 +648,14 @@ export function getAlbum(req, res) {
 }
 
 export function getSong(req, res) {
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const parsed = decodeId(req.query.id, 'song');
-  if (!parsed) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  if (!parsed) { return SubErr.NOT_FOUND(req, res, 'Song'); }
   const id = parsed.id;
   const { clause, params } = libraryScope(req);
   const row = db.getDB().prepare(`
     SELECT t.id, t.filepath, t.title, t.track_number, t.disc_number, t.duration,
-           t.format, t.file_size, t.bitrate, t.year, t.genre, t.album_art_file,
+           t.format, t.file_size, t.bitrate, t.year, ${TRACK_PRIMARY_GENRE_SQL}, ${TRACK_GENRES_JSON_SQL}, t.album_art_file,
            t.created_at, t.library_id,
            t.replaygain_track_db, t.sample_rate, t.channels, t.bit_depth,
            a.id AS artist_id, a.name AS artist_name,
@@ -515,14 +672,25 @@ export function getSong(req, res) {
 
 export function getGenres(req, res) {
   const { clause, params } = libraryScope(req);
+  // V34: read from the track_genres M2M instead of the (now-dropped)
+  // tracks.genre flat column. COUNT(DISTINCT t.id) is load-bearing —
+  // a track tagged "Jazz, Fusion" appears as TWO rows in the join, and
+  // a raw COUNT(*) would double-count it. Don't regress to COUNT(*).
+  // Same applies to COUNT(DISTINCT t.album_id) — already DISTINCT in
+  // the pre-V34 query, kept for the same reason.
+  //
+  // GROUP BY g.id (not g.name) gives stable identity even when case
+  // variants exist in the genres table.
   const rows = db.getDB().prepare(`
-    SELECT COALESCE(t.genre, '') AS value,
-           COUNT(*) AS songCount,
+    SELECT g.name AS value,
+           COUNT(DISTINCT t.id) AS songCount,
            COUNT(DISTINCT t.album_id) AS albumCount
-    FROM tracks t
-    WHERE ${clause} AND t.genre IS NOT NULL AND t.genre <> ''
-    GROUP BY t.genre
-    ORDER BY t.genre COLLATE NOCASE
+    FROM genres g
+    JOIN track_genres tg ON tg.genre_id = g.id
+    JOIN tracks t ON t.id = tg.track_id
+    WHERE ${clause}
+    GROUP BY g.id
+    ORDER BY g.name COLLATE NOCASE
   `).all(...params);
   sendOk(req, res, { genres: { genre: rows } });
 }
@@ -531,8 +699,9 @@ export function getGenres(req, res) {
 // id tells us whether it's a music folder (mf-N), artist (ar-N) or album
 // (al-N) — bare numerics are song ids, which can't be drilled into.
 export function getMusicDirectory(req, res) {
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const parsed = decodeId(req.query.id);
-  if (!parsed) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  if (!parsed) { return SubErr.NOT_FOUND(req, res); }
   const n = parsed.id;
 
   if (parsed.type === 'folder') {
@@ -606,7 +775,7 @@ export function getMusicDirectory(req, res) {
     const { clause, params } = libraryScope(req);
     const songs = db.getDB().prepare(`
       SELECT t.id, t.filepath, t.title, t.track_number, t.disc_number, t.duration,
-             t.format, t.file_size, t.bitrate, t.year, t.genre, t.album_art_file,
+             t.format, t.file_size, t.bitrate, t.year, ${TRACK_PRIMARY_GENRE_SQL}, ${TRACK_GENRES_JSON_SQL}, t.album_art_file,
              t.created_at, t.library_id,
            t.replaygain_track_db, t.sample_rate, t.channels, t.bit_depth,
              a.id AS artist_id, a.name AS artist_name,
@@ -635,8 +804,13 @@ export function getMusicDirectory(req, res) {
 // getCoverArt — accepts any of: song (bare numeric), album (al-N), artist
 // (ar-N). Delegates to the shared album-art handler for byte serving.
 export function getCoverArt(req, res) {
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const parsed = decodeId(req.query.id);
-  if (!parsed) { return res.status(400).end(); }
+  // Binary endpoint: replace the prior `res.status(400).end()` with a
+  // proper Subsonic error envelope so clients can distinguish "you
+  // gave me garbage" from "I crashed". Matches what every other
+  // mStream Subsonic handler already does post the PR #592 cleanup.
+  if (!parsed) { return SubErr.NOT_FOUND(req, res); }
   const size = parseInt(req.query.size, 10);
 
   const d = db.getDB();
@@ -765,8 +939,9 @@ function streamTranscoded(req, res, track, codec, bitrateK, timeOffsetSec, estim
 }
 
 export function stream(req, res) {
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const parsed = decodeId(req.query.id, 'song');
-  if (!parsed) { return res.status(400).end(); }
+  if (!parsed) { return SubErr.NOT_FOUND(req, res, 'Song'); }
   const track = resolveTrackForPlayback(req, parsed.id);
   if (!track) { return res.status(404).end(); }
 
@@ -810,8 +985,9 @@ export function stream(req, res) {
 }
 
 export function download(req, res) {
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const parsed = decodeId(req.query.id, 'song');
-  if (!parsed) { return res.status(400).end(); }
+  if (!parsed) { return SubErr.NOT_FOUND(req, res, 'Song'); }
   const track = resolveTrackForPlayback(req, parsed.id);
   if (!track) { return res.status(404).end(); }
   if (!fs.existsSync(track.absPath)) { return res.status(404).end(); }
@@ -819,67 +995,125 @@ export function download(req, res) {
 }
 
 // ── Search ──────────────────────────────────────────────────────────────────
+//
+// Subsonic endpoints internally use the `combo` algorithm (FTS5 primary
+// with per-category LIKE fallback). The strict `fts5` mode and the
+// `algorithm` request param are webapp-only — Subsonic clients send a
+// fixed param set and want results, not pedantry. If FTS5 isn't compiled
+// in, the same global override (db.FTS5_AVAILABLE) demotes Subsonic
+// search to LIKE-only.
 
 function normalizeQueryFragment(q) {
-  // Subsonic clients typically send `"foo"` (Lucene-ish) or bare `foo`. Strip
-  // quotes and wildcards — we do simple LIKE matches.
-  return String(q || '').trim().replace(/[*"%_]/g, '').toLowerCase();
+  // SQL wildcards (% _) survived from the pre-FTS5 era when the search
+  // path was straight LIKE — stripping them prevented users from
+  // injecting wildcards into the LIKE pattern. Even though FTS5 doesn't
+  // honour those characters, the LIKE fallback for combo mode still
+  // does, so we keep the strip. Lowercase is harmless: unicode61
+  // tokenizes case-insensitively. We DO NOT strip * or " here any more
+  // — buildFtsExpression handles them safely via escapeFts, and the FTS
+  // parser's syntax doesn't expose them to user input directly.
+  return String(q || '').trim().replace(/[%_]/g, '').toLowerCase();
 }
 
-// Core search — shared by search2 and search3. Returns the assembled
-// {artist, album, song} payload; callers wrap it in the envelope name
-// their spec variant wants (searchResult2 vs searchResult3). Clients
-// dispatch on that wrapper name, so emitting the wrong one makes
-// results invisible to the caller — search2 used to forward to
-// search3 and returned a searchResult3 envelope that older clients
-// (DSub, Subsonic 6.x desktop, Airsonic classic) silently ignored.
-function buildSearchPayload(req) {
-  const q = normalizeQueryFragment(req.query.query);
-  const artistCount = Math.max(0, parseInt(req.query.artistCount, 10) || 20);
-  const albumCount  = Math.max(0, parseInt(req.query.albumCount,  10) || 20);
-  const songCount   = Math.max(0, parseInt(req.query.songCount,   10) || 20);
-  const artistOffset = Math.max(0, parseInt(req.query.artistOffset, 10) || 0);
-  const albumOffset  = Math.max(0, parseInt(req.query.albumOffset,  10) || 0);
-  const songOffset   = Math.max(0, parseInt(req.query.songOffset,   10) || 0);
+// Latch + log so a misconfigured server (FTS5 not compiled in) doesn't
+// spam the warning stream on every search request. The boot-time ERROR
+// in db/manager.js fires once at startup; this is the runtime echo for
+// operators tailing logs.
+let _fts5UnavailableLoggedSubsonic = false;
+function _logFts5UnavailableOnceSubsonic() {
+  if (_fts5UnavailableLoggedSubsonic) return;
+  _fts5UnavailableLoggedSubsonic = true;
+  winston.warn(
+    '[subsonic-search] FTS5 not available — Subsonic search downgraded to LIKE for this process.'
+  );
+}
 
-  if (!q) { return { empty: true }; }
-
-  const { clause, params } = libraryScope(req);
-  // Optional `musicFolderId` narrows the search to a single library the
-  // user can see. Unknown or inaccessible folder id → return empty (the
-  // spec doesn't mandate an error code here).
-  const folder = decodeId(req.query.musicFolderId, 'folder');
-  let scope = clause;
-  const scopeParams = [...params];
-  if (folder) {
-    if (!req.user.vpaths.some(name => db.getAllLibraries().some(l => l.id === folder.id && l.name === name))) {
-      return { empty: true };
-    }
-    scope = `${clause} AND t.library_id = ?`;
-    scopeParams.push(folder.id);
+// Per-category combo-mode runner: try the FTS5 path, fall back to the
+// LIKE path on parse failure (builder returned null) or SQLITE_ERROR.
+// Same semantics as runCategory in src/api/db.js but lives here because
+// the Subsonic SELECTs use a different column set (DB ids, full track
+// rows for songFromRow).
+function _subsonicCategory(name, ftsBuilder, likeBuilder) {
+  let rows;
+  try {
+    rows = ftsBuilder();
+  } catch (err) {
+    if (err?.code !== 'ERR_SQLITE_ERROR') throw err;
+    winston.debug(`[subsonic-search] ${name} fell back to LIKE on MATCH error: ${err.message}`);
+    return likeBuilder();
   }
-  const like = `%${q}%`;
+  if (rows === null) return likeBuilder();
+  return rows;
+}
+
+// Resolve the optional musicFolderId param into a scope clause + params.
+// Returns null when the param refers to a folder the user can't see
+// (caller treats that as an empty payload, matching pre-PR3 behaviour).
+function _searchScope(req) {
+  const { clause, params } = libraryScope(req);
+  const folder = decodeId(req.query.musicFolderId, 'folder');
+  if (!folder) return { clause, params: [...params] };
+  if (!req.user.vpaths.some(name => db.getAllLibraries().some(l => l.id === folder.id && l.name === name))) {
+    return null;
+  }
+  return { clause: `${clause} AND t.library_id = ?`, params: [...params, folder.id] };
+}
+
+// Parse a Subsonic count/offset query param. `parseInt(x, 10) || N` is
+// NOT a valid "default if absent" idiom: the `||` swallows a legitimate
+// `0` and substitutes the default. For count params (artistCount,
+// albumCount, songCount) `0` is a meaningful "return zero of these"
+// signal — Navidrome and other reference servers respect it — so we
+// need an explicit NaN check.
+function parseCount(value, defaultValue) {
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) && n >= 0 ? n : defaultValue;
+}
+
+// Empty-query OpenSubsonic listing — search3 only. Returns the same
+// {artist, album, song} payload shape buildSearchPayload produces for a
+// non-empty query, just with name-ordered rows and no MATCH involved.
+// The spec says "A blank query will return everything"; we paginate
+// via the existing artistCount/albumCount/songCount/Offset params.
+function _buildEmptyListingPayload(req) {
+  const artistCount  = parseCount(req.query.artistCount,  20);
+  const albumCount   = parseCount(req.query.albumCount,   20);
+  const songCount    = parseCount(req.query.songCount,    20);
+  const artistOffset = parseCount(req.query.artistOffset,  0);
+  const albumOffset  = parseCount(req.query.albumOffset,   0);
+  const songOffset   = parseCount(req.query.songOffset,    0);
+
+  const scope = _searchScope(req);
+  if (!scope) return { empty: true };
 
   const d = db.getDB();
-  // V17: match artist name against every artist reachable via either
-  // track_artists or album_artists — compilation album-artists (VA)
-  // and featured-track collaborators are now in-scope.
+  // ── Widening parity with buildSearchPayload's populated query ────────
+  //
+  // Use the same V17/V18 widening as the populated path: an artist
+  // surfaces here iff they have at least one row in track_artists OR
+  // album_artists scoped to a track the user can see. We INTENTIONALLY
+  // do NOT add a third OR-clause against `tracks.artist_id` directly —
+  // that would let an artist seeded only as a primary FK (no
+  // track_artists row) appear in the empty listing while staying
+  // invisible to named search3?query=... requests, which is the kind
+  // of asymmetry that drove the PR3 audit. The scanner is the source
+  // of truth and always writes a 'main' track_artists row for every
+  // track's primary artist, so any path that bypasses that invariant
+  // (DB-direct bulk import, hand-edits) gets the same "invisible
+  // artist" behaviour on both surfaces — easier to diagnose than two
+  // surfaces disagreeing about the library's contents.
+  //
+  // Qualify artist_id in each subquery: track_artists and album_artists
+  // and tracks all have an artist_id column, so SQLite errors with
+  // "ambiguous column name: artist_id" if the qualifier is dropped.
   const artists = d.prepare(`
     SELECT DISTINCT a.id, a.name
     FROM artists a
-    WHERE LOWER(a.name) LIKE ?
-      AND (
-        a.id IN (SELECT aa.artist_id FROM album_artists aa
-                 JOIN albums al ON al.id = aa.album_id
-                 JOIN tracks t  ON t.album_id = al.id
-                 WHERE ${scope})
-        OR a.id IN (SELECT ta.artist_id FROM track_artists ta
-                    JOIN tracks t ON t.id = ta.track_id
-                    WHERE ${scope})
-      )
+    WHERE a.id IN (SELECT ta.artist_id FROM track_artists ta JOIN tracks t ON t.id = ta.track_id WHERE ${scope.clause})
+       OR a.id IN (SELECT aa.artist_id FROM album_artists aa JOIN albums al ON al.id = aa.album_id JOIN tracks t ON t.album_id = al.id WHERE ${scope.clause})
     ORDER BY a.name COLLATE NOCASE
     LIMIT ? OFFSET ?
-  `).all(like, ...scopeParams, ...scopeParams, artistCount, artistOffset);
+  `).all(...scope.params, ...scope.params, artistCount, artistOffset);
 
   const albums = d.prepare(`
     SELECT DISTINCT al.id, al.name, al.year, al.album_art_file, al.artist_id,
@@ -887,15 +1121,15 @@ function buildSearchPayload(req) {
     FROM albums al
     LEFT JOIN artists a ON a.id = al.artist_id
     JOIN tracks t ON t.album_id = al.id
-    WHERE ${scope} AND LOWER(al.name) LIKE ?
+    WHERE ${scope.clause}
     GROUP BY al.id
     ORDER BY al.name COLLATE NOCASE
     LIMIT ? OFFSET ?
-  `).all(...scopeParams, like, albumCount, albumOffset);
+  `).all(...scope.params, albumCount, albumOffset);
 
   const songs = d.prepare(`
     SELECT t.id, t.filepath, t.title, t.track_number, t.disc_number, t.duration,
-           t.format, t.file_size, t.bitrate, t.year, t.genre, t.album_art_file,
+           t.format, t.file_size, t.bitrate, t.year, ${TRACK_PRIMARY_GENRE_SQL}, ${TRACK_GENRES_JSON_SQL}, t.album_art_file,
            t.created_at, t.library_id,
            t.replaygain_track_db, t.sample_rate, t.channels, t.bit_depth,
            a.id AS artist_id, a.name AS artist_name,
@@ -903,11 +1137,18 @@ function buildSearchPayload(req) {
     FROM tracks t
     LEFT JOIN artists a  ON a.id = t.artist_id
     LEFT JOIN albums  al ON al.id = t.album_id
-    WHERE ${scope} AND LOWER(t.title) LIKE ?
+    WHERE ${scope.clause}
     ORDER BY t.title COLLATE NOCASE
     LIMIT ? OFFSET ?
-  `).all(...scopeParams, like, songCount, songOffset);
+  `).all(...scope.params, songCount, songOffset);
 
+  return _shapePayload(req, artists, albums, songs);
+}
+
+// Final payload assembly — shared by both the populated-query and the
+// empty-query OpenSubsonic listing paths. Encodes IDs and runs songs
+// through the user-meta enrichment used elsewhere in this file.
+function _shapePayload(req, artists, albums, songs) {
   return {
     artist: artists.map(a => ({
       id: encArtist(a.id), name: a.name, coverArt: encArtist(a.id),
@@ -925,8 +1166,232 @@ function buildSearchPayload(req) {
   };
 }
 
+// Core search — shared by search2 and search3. Returns the assembled
+// {artist, album, song} payload; callers wrap it in the envelope name
+// their spec variant wants (searchResult2 vs searchResult3). Clients
+// dispatch on that wrapper name, so emitting the wrong one makes
+// results invisible to the caller — search2 used to forward to
+// search3 and returned a searchResult3 envelope that older clients
+// (DSub, Subsonic 6.x desktop, Airsonic classic) silently ignored.
+//
+// `listOnEmpty=true` (passed by search3) honours the OpenSubsonic
+// "blank query returns everything" convention and routes empty queries
+// through _buildEmptyListingPayload. search2 and search (v1) preserve
+// pre-PR3 behaviour: empty query → empty envelope.
+function buildSearchPayload(req, { listOnEmpty = false } = {}) {
+  const q = normalizeQueryFragment(req.query.query);
+  const artistCount  = parseCount(req.query.artistCount,  20);
+  const albumCount   = parseCount(req.query.albumCount,   20);
+  const songCount    = parseCount(req.query.songCount,    20);
+  const artistOffset = parseCount(req.query.artistOffset,  0);
+  const albumOffset  = parseCount(req.query.albumOffset,   0);
+  const songOffset   = parseCount(req.query.songOffset,    0);
+
+  if (!q) {
+    return listOnEmpty ? _buildEmptyListingPayload(req) : { empty: true };
+  }
+
+  const scope = _searchScope(req);
+  if (!scope) return { empty: true };
+
+  // FTS5 availability override: if SQLite wasn't compiled with FTS5,
+  // the fts_* tables don't exist and any MATCH would 500. Fall through
+  // to the LIKE path for the entire request. Same latch model as the
+  // webapp route in src/api/db.js.
+  if (!db.FTS5_AVAILABLE) {
+    _logFts5UnavailableOnceSubsonic();
+    return _shapePayload(req,
+      _likeArtistsRowsSubsonic(scope, q, artistCount, artistOffset),
+      _likeAlbumsRowsSubsonic(scope, q, albumCount, albumOffset),
+      _likeSongsRowsSubsonic(scope, q, songCount, songOffset),
+    );
+  }
+
+  const parsed = parseSearchQuery(q);
+
+  // Per-category combo runners. Each FTS builder may return null
+  // (parse-time refusal) or throw SQLITE_ERROR (a query that survived
+  // the JS parser but tripped FTS5 syntax); _subsonicCategory falls back
+  // to LIKE in either case. BM25 ranks results within each category.
+  const artists = _subsonicCategory('artists',
+    () => _ftsArtistsRowsSubsonic(scope, parsed, artistCount, artistOffset),
+    () => _likeArtistsRowsSubsonic(scope, q, artistCount, artistOffset),
+  );
+  const albums = _subsonicCategory('albums',
+    () => _ftsAlbumsRowsSubsonic(scope, parsed, albumCount, albumOffset),
+    () => _likeAlbumsRowsSubsonic(scope, q, albumCount, albumOffset),
+  );
+  const songs = _subsonicCategory('songs',
+    () => _ftsSongsRowsSubsonic(scope, parsed, songCount, songOffset),
+    () => _likeSongsRowsSubsonic(scope, q, songCount, songOffset),
+  );
+
+  return _shapePayload(req, artists, albums, songs);
+}
+
+// ── Subsonic-side FTS5 builders ─────────────────────────────────────────────
+//
+// Distinct from the webapp builders in src/api/db.js because Subsonic
+// needs DB ids (a.id, al.id, full track row for songFromRow) instead of
+// the slim envelope columns the webapp uses.
+//
+// The artist match preserves the V18 M2M-aware widening so featured
+// track collaborators and compilation album-artists surface even when
+// they're not the primary artist_id on any track. FTS5 narrows the
+// candidate artists; the M2M IN-clauses then filter to the user's
+// visible library set.
+
+function _ftsArtistsRowsSubsonic(scope, parsed, limit, offset) {
+  const expr = buildFtsExpression({
+    column: 'name',
+    positive: parsed.positive,
+    negative: parsed.negative,
+  });
+  if (expr === null) return null;
+  const d = db.getDB();
+  // fts_artists is the driving table so SQLite uses the FTS5 index scan
+  // and we can ORDER BY rank (BM25) cheaply. The widening IN-clauses
+  // are existence checks against scoped tracks, mirroring the pre-PR3
+  // V17/V18 SQL.
+  return d.prepare(`
+    SELECT a.id, a.name
+    FROM fts_artists fa
+    JOIN artists a ON a.id = fa.rowid
+    WHERE fa.fts_artists MATCH ?
+      AND (
+        a.id IN (SELECT aa.artist_id FROM album_artists aa
+                 JOIN albums al ON al.id = aa.album_id
+                 JOIN tracks t  ON t.album_id = al.id
+                 WHERE ${scope.clause})
+        OR a.id IN (SELECT ta.artist_id FROM track_artists ta
+                    JOIN tracks t ON t.id = ta.track_id
+                    WHERE ${scope.clause})
+      )
+    ORDER BY rank
+    LIMIT ? OFFSET ?
+  `).all(expr, ...scope.params, ...scope.params, limit, offset);
+}
+
+function _ftsAlbumsRowsSubsonic(scope, parsed, limit, offset) {
+  const expr = buildFtsExpression({
+    column: 'name',
+    positive: parsed.positive,
+    negative: parsed.negative,
+  });
+  if (expr === null) return null;
+  const d = db.getDB();
+  return d.prepare(`
+    SELECT al.id, al.name, al.year, al.album_art_file, al.artist_id,
+           a.name AS artist_name
+    FROM fts_albums fa
+    JOIN albums al ON al.id = fa.rowid
+    LEFT JOIN artists a ON a.id = al.artist_id
+    WHERE fa.fts_albums MATCH ?
+      AND al.id IN (SELECT t.album_id FROM tracks t WHERE ${scope.clause} AND t.album_id IS NOT NULL)
+    ORDER BY rank
+    LIMIT ? OFFSET ?
+  `).all(expr, ...scope.params, limit, offset);
+}
+
+// Song match scopes to fts_tracks.{title}. The cross-field denormalised
+// columns (artist_name, album_name) are also indexed by V31; we could
+// expose an unscoped multi-word search here, but the per-category UI
+// in Subsonic clients (artists tab + songs tab + albums tab) means
+// users expect "songs" results to be title-keyed. Cross-field smart
+// search lands in PR3's webapp /api/v1/db/search instead.
+function _ftsSongsRowsSubsonic(scope, parsed, limit, offset) {
+  const expr = buildFtsExpression({
+    column: 'title',
+    positive: parsed.positive,
+    negative: parsed.negative,
+  });
+  if (expr === null) return null;
+  const d = db.getDB();
+  return d.prepare(`
+    SELECT t.id, t.filepath, t.title, t.track_number, t.disc_number, t.duration,
+           t.format, t.file_size, t.bitrate, t.year, ${TRACK_PRIMARY_GENRE_SQL}, ${TRACK_GENRES_JSON_SQL}, t.album_art_file,
+           t.created_at, t.library_id,
+           t.replaygain_track_db, t.sample_rate, t.channels, t.bit_depth,
+           a.id AS artist_id, a.name AS artist_name,
+           al.id AS album_id, al.name AS album_name
+    FROM fts_tracks ft
+    JOIN tracks t ON t.id = ft.rowid
+    LEFT JOIN artists a  ON a.id = t.artist_id
+    LEFT JOIN albums  al ON al.id = t.album_id
+    WHERE ft.fts_tracks MATCH ?
+      AND ${scope.clause}
+    ORDER BY rank
+    LIMIT ? OFFSET ?
+  `).all(expr, ...scope.params, limit, offset);
+}
+
+// ── Subsonic-side LIKE builders (fallback path) ─────────────────────────────
+//
+// Used when:
+//   - FTS5 isn't compiled in (process-wide fallback).
+//   - A per-category MATCH threw SQLITE_ERROR or refused to parse.
+// Same SQL the pre-PR3 buildSearchPayload used inline; preserved
+// verbatim including the V18 M2M widening on the artists query.
+
+function _likeArtistsRowsSubsonic(scope, q, limit, offset) {
+  const like = `%${q}%`;
+  const d = db.getDB();
+  return d.prepare(`
+    SELECT DISTINCT a.id, a.name
+    FROM artists a
+    WHERE LOWER(a.name) LIKE ?
+      AND (
+        a.id IN (SELECT aa.artist_id FROM album_artists aa
+                 JOIN albums al ON al.id = aa.album_id
+                 JOIN tracks t  ON t.album_id = al.id
+                 WHERE ${scope.clause})
+        OR a.id IN (SELECT ta.artist_id FROM track_artists ta
+                    JOIN tracks t ON t.id = ta.track_id
+                    WHERE ${scope.clause})
+      )
+    ORDER BY a.name COLLATE NOCASE
+    LIMIT ? OFFSET ?
+  `).all(like, ...scope.params, ...scope.params, limit, offset);
+}
+
+function _likeAlbumsRowsSubsonic(scope, q, limit, offset) {
+  const like = `%${q}%`;
+  const d = db.getDB();
+  return d.prepare(`
+    SELECT DISTINCT al.id, al.name, al.year, al.album_art_file, al.artist_id,
+                    a.name AS artist_name
+    FROM albums al
+    LEFT JOIN artists a ON a.id = al.artist_id
+    JOIN tracks t ON t.album_id = al.id
+    WHERE ${scope.clause} AND LOWER(al.name) LIKE ?
+    GROUP BY al.id
+    ORDER BY al.name COLLATE NOCASE
+    LIMIT ? OFFSET ?
+  `).all(...scope.params, like, limit, offset);
+}
+
+function _likeSongsRowsSubsonic(scope, q, limit, offset) {
+  const like = `%${q}%`;
+  const d = db.getDB();
+  return d.prepare(`
+    SELECT t.id, t.filepath, t.title, t.track_number, t.disc_number, t.duration,
+           t.format, t.file_size, t.bitrate, t.year, ${TRACK_PRIMARY_GENRE_SQL}, ${TRACK_GENRES_JSON_SQL}, t.album_art_file,
+           t.created_at, t.library_id,
+           t.replaygain_track_db, t.sample_rate, t.channels, t.bit_depth,
+           a.id AS artist_id, a.name AS artist_name,
+           al.id AS album_id, al.name AS album_name
+    FROM tracks t
+    LEFT JOIN artists a  ON a.id = t.artist_id
+    LEFT JOIN albums  al ON al.id = t.album_id
+    WHERE ${scope.clause} AND LOWER(t.title) LIKE ?
+    ORDER BY t.title COLLATE NOCASE
+    LIMIT ? OFFSET ?
+  `).all(...scope.params, like, limit, offset);
+}
+
 export function search3(req, res) {
-  const p = buildSearchPayload(req);
+  // OpenSubsonic spec: blank query returns everything (paginated).
+  const p = buildSearchPayload(req, { listOnEmpty: true });
   sendOk(req, res, { searchResult3: p.empty ? {} : p });
 }
 
@@ -935,6 +1400,9 @@ export function search3(req, res) {
 // responses invisible to the caller. Every remaining search2 user
 // (DSub, older Airsonic/Subsonic desktop, Jamstash) will accept the
 // search3 artist shape (id/name/coverArt) inside a searchResult2 wrapper.
+//
+// Pre-PR3 behaviour preserved: blank query returns the empty envelope,
+// not the OpenSubsonic listing — the listing semantics are search3-only.
 export function search2(req, res) {
   const p = buildSearchPayload(req);
   sendOk(req, res, { searchResult2: p.empty ? {} : p });
@@ -962,10 +1430,13 @@ export function scrobble(req, res) {
   // `time` is shorter than `id` (or missing entirely), unmatched entries
   // fall back to "now". submission=false is the "now playing" hint and
   // never bumps play counts.
-  const songIds = arrayParam(req.query.id)
-    .map(v => decodeId(v, 'song')?.id)
-    .filter(Number.isFinite);
-  if (!songIds.length) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  const rawIds = arrayParam(req.query.id);
+  if (!rawIds.length) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  const songIds = rawIds.map(v => decodeId(v, 'song')?.id).filter(Number.isFinite);
+  // All ids were present but none decoded to an mStream song — same
+  // distinction we make in getArtist/getAlbum/etc (param present but
+  // not found vs param absent).
+  if (!songIds.length) { return SubErr.NOT_FOUND(req, res, 'Song'); }
 
   const times = arrayParam(req.query.time).map(v => parseInt(v, 10));
   const submission = req.query.submission !== 'false';
@@ -1063,10 +1534,24 @@ function unstarArtists(userId, artistIds) {
   for (const id of artistIds) { stmt.run(userId, id); }
 }
 
+// Returns true iff none of the id-shaped query params (id / albumId /
+// artistId) were present at all. Used by star/unstar to distinguish
+// "client called us with no ids" (MISSING_PARAM) from "client gave
+// us ids but none decoded" (NOT_FOUND).
+function noIdParamsPresent(req) {
+  return !arrayParam(req.query.id).length
+      && !arrayParam(req.query.albumId).length
+      && !arrayParam(req.query.artistId).length;
+}
+
 export function star(req, res) {
+  if (noIdParamsPresent(req)) {
+    return SubErr.MISSING_PARAM(req, res, 'id / albumId / artistId');
+  }
   const { songIds, albumIds, artistIds } = collectIds(req);
   if (!songIds.length && !albumIds.length && !artistIds.length) {
-    return SubErr.MISSING_PARAM(req, res, 'id / albumId / artistId');
+    // Every id we got was undecodable.
+    return SubErr.NOT_FOUND(req, res);
   }
   starSongs(req.user.id, songIds);
   starAlbums(req.user.id, albumIds);
@@ -1075,9 +1560,12 @@ export function star(req, res) {
 }
 
 export function unstar(req, res) {
+  if (noIdParamsPresent(req)) {
+    return SubErr.MISSING_PARAM(req, res, 'id / albumId / artistId');
+  }
   const { songIds, albumIds, artistIds } = collectIds(req);
   if (!songIds.length && !albumIds.length && !artistIds.length) {
-    return SubErr.MISSING_PARAM(req, res, 'id / albumId / artistId');
+    return SubErr.NOT_FOUND(req, res);
   }
   unstarSongs(req.user.id, songIds);
   unstarAlbums(req.user.id, albumIds);
@@ -1086,8 +1574,9 @@ export function unstar(req, res) {
 }
 
 export function setRating(req, res) {
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const parsed = decodeId(req.query.id, 'song');
-  if (!parsed) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  if (!parsed) { return SubErr.NOT_FOUND(req, res, 'Song'); }
   const rating = parseInt(req.query.rating, 10);
   if (!Number.isFinite(rating) || rating < 0 || rating > 5) {
     // Subsonic spec says rating must be 0..5; a value outside that range
@@ -1105,7 +1594,7 @@ function starredSongRows(req) {
   const { clause, params } = libraryScope(req);
   return db.getDB().prepare(`
     SELECT t.id, t.filepath, t.title, t.track_number, t.disc_number, t.duration,
-           t.format, t.file_size, t.bitrate, t.year, t.genre, t.album_art_file,
+           t.format, t.file_size, t.bitrate, t.year, ${TRACK_PRIMARY_GENRE_SQL}, ${TRACK_GENRES_JSON_SQL}, t.album_art_file,
            t.created_at, t.library_id,
            t.replaygain_track_db, t.sample_rate, t.channels, t.bit_depth,
            a.id AS artist_id, a.name AS artist_name,
@@ -1129,7 +1618,7 @@ function starredAlbumRows(req) {
     SELECT al.id, al.name, al.year, al.album_art_file, al.artist_id,
            a.name AS artist_name,
            COUNT(t.id) AS songCount, SUM(t.duration) AS duration,
-           MIN(t.genre) AS genre, MIN(t.created_at) AS created_at,
+           ${ALBUM_PRIMARY_GENRE_SQL}, ${ALBUM_GENRES_JSON_SQL}, MIN(t.created_at) AS created_at,
            s.starred_at AS starred_at
     FROM user_album_stars s
     JOIN albums al ON al.id = s.album_id
@@ -1206,7 +1695,7 @@ function buildAlbumListQuery(req, type, params = {}) {
     SELECT al.id, al.name, al.year, al.album_art_file, al.artist_id,
            a.name AS artist_name,
            COUNT(t.id) AS songCount, SUM(t.duration) AS duration,
-           MIN(t.genre) AS genre, MIN(t.created_at) AS created_at,
+           ${ALBUM_PRIMARY_GENRE_SQL}, ${ALBUM_GENRES_JSON_SQL}, MIN(t.created_at) AS created_at,
            uas.starred_at AS starred_at,
            MAX(um.rating) AS rating_max,
            SUM(COALESCE(um.play_count, 0)) AS plays,
@@ -1242,7 +1731,16 @@ function buildAlbumListQuery(req, type, params = {}) {
     }
     case 'byGenre': {
       if (!params.genre) { return null; }
-      where = 'AND t.genre = ?';
+      // V34: filter via M2M with case-insensitive comparison. Folds in
+      // the case-sensitivity fix flagged in the genre scout — pre-V34
+      // this query rejected case-mismatched names (Subsonic clients
+      // pass back exactly what they got from getGenres, so this was
+      // mostly cosmetic, but the fix makes the surface uniform).
+      where = `AND EXISTS (
+        SELECT 1 FROM track_genres tg
+        JOIN genres g ON g.id = tg.genre_id
+        WHERE tg.track_id = t.id AND g.name COLLATE NOCASE = ?
+      )`;
       tailParams.push(params.genre);
       // order stays at the default alphabetical
       break;
@@ -1272,6 +1770,8 @@ function albumFromListRow(al) {
     artistId:  al.artist_id != null ? encArtist(al.artist_id) : undefined,
     year:      al.year || undefined,
     genre:     al.genre || undefined,
+    // OpenSubsonic `genres[]` — see parseGenresJson + ALBUM_GENRES_JSON_SQL.
+    genres:    parseGenresJson(al.genres_json),
     coverArt:  al.album_art_file ? encAlbum(al.id) : undefined,
     songCount: al.songCount,
     duration:  al.duration != null ? Math.round(al.duration) : undefined,
@@ -1310,14 +1810,23 @@ export function getRandomSongs(req, res) {
   const { clause, params } = libraryScope(req);
   const where = [clause];
   const args  = [...params];
-  if (genre)                    { where.push('t.genre = ?'); args.push(genre); }
+  // V34: genre filter via M2M EXISTS, case-insensitive — see getGenres
+  // rewrite for the same pattern.
+  if (genre) {
+    where.push(`EXISTS (
+      SELECT 1 FROM track_genres tg
+      JOIN genres g ON g.id = tg.genre_id
+      WHERE tg.track_id = t.id AND g.name COLLATE NOCASE = ?
+    )`);
+    args.push(genre);
+  }
   if (Number.isFinite(fromY))   { where.push('t.year >= ?'); args.push(fromY); }
   if (Number.isFinite(toY))     { where.push('t.year <= ?'); args.push(toY); }
   if (folder)                   { where.push('t.library_id = ?'); args.push(folder.id); }
 
   const rows = db.getDB().prepare(`
     SELECT t.id, t.filepath, t.title, t.track_number, t.disc_number, t.duration,
-           t.format, t.file_size, t.bitrate, t.year, t.genre, t.album_art_file,
+           t.format, t.file_size, t.bitrate, t.year, ${TRACK_PRIMARY_GENRE_SQL}, ${TRACK_GENRES_JSON_SQL}, t.album_art_file,
            t.created_at, t.library_id,
            t.replaygain_track_db, t.sample_rate, t.channels, t.bit_depth,
            a.id AS artist_id, a.name AS artist_name,
@@ -1342,14 +1851,19 @@ export function getSongsByGenre(req, res) {
   const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
   const folder = decodeId(req.query.musicFolderId, 'folder');
 
+  // V34: case-insensitive genre filter via M2M.
   const { clause, params } = libraryScope(req);
-  const where = [clause, 't.genre = ?'];
+  const where = [clause, `EXISTS (
+    SELECT 1 FROM track_genres tg
+    JOIN genres g ON g.id = tg.genre_id
+    WHERE tg.track_id = t.id AND g.name COLLATE NOCASE = ?
+  )`];
   const args  = [...params, genre];
   if (folder) { where.push('t.library_id = ?'); args.push(folder.id); }
 
   const rows = db.getDB().prepare(`
     SELECT t.id, t.filepath, t.title, t.track_number, t.disc_number, t.duration,
-           t.format, t.file_size, t.bitrate, t.year, t.genre, t.album_art_file,
+           t.format, t.file_size, t.bitrate, t.year, ${TRACK_PRIMARY_GENRE_SQL}, ${TRACK_GENRES_JSON_SQL}, t.album_art_file,
            t.created_at, t.library_id,
            t.replaygain_track_db, t.sample_rate, t.channels, t.bit_depth,
            a.id AS artist_id, a.name AS artist_name,
@@ -1436,15 +1950,16 @@ export function getPlaylists(req, res) {
 }
 
 export function getPlaylist(req, res) {
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const id = decodePlaylistId(req.query.id);
-  if (id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  if (id == null) { return SubErr.NOT_FOUND(req, res, 'Playlist'); }
   const meta = playlistMeta(id, req.user.id);
   if (!meta) { return SubErr.NOT_FOUND(req, res, 'Playlist'); }
 
   // Resolve tracks by splitting pt.filepath at the first `/`.
   const tracks = db.getDB().prepare(`
     SELECT t.id, t.filepath, t.title, t.track_number, t.disc_number, t.duration,
-           t.format, t.file_size, t.bitrate, t.year, t.genre, t.album_art_file,
+           t.format, t.file_size, t.bitrate, t.year, ${TRACK_PRIMARY_GENRE_SQL}, ${TRACK_GENRES_JSON_SQL}, t.album_art_file,
            t.created_at, t.library_id,
            t.replaygain_track_db, t.sample_rate, t.channels, t.bit_depth,
            a.id AS artist_id, a.name AS artist_name,
@@ -1508,8 +2023,9 @@ export function createPlaylist(req, res) {
 }
 
 export function updatePlaylist(req, res) {
+  if (req.query.playlistId == null) { return SubErr.MISSING_PARAM(req, res, 'playlistId'); }
   const id = decodePlaylistId(req.query.playlistId);
-  if (id == null) { return SubErr.MISSING_PARAM(req, res, 'playlistId'); }
+  if (id == null) { return SubErr.NOT_FOUND(req, res, 'Playlist'); }
   const meta = playlistMeta(id, req.user.id);
   if (!meta) { return SubErr.NOT_FOUND(req, res, 'Playlist'); }
   // Public visibility doesn't grant edit rights — only the owner can mutate.
@@ -1546,8 +2062,9 @@ export function updatePlaylist(req, res) {
 }
 
 export function deletePlaylist(req, res) {
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const id = decodePlaylistId(req.query.id);
-  if (id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  if (id == null) { return SubErr.NOT_FOUND(req, res, 'Playlist'); }
   const result = db.getDB().prepare('DELETE FROM playlists WHERE id = ? AND user_id = ?').run(id, req.user.id);
   if (result.changes === 0) { return SubErr.NOT_FOUND(req, res, 'Playlist'); }
   sendOk(req, res);
@@ -1666,6 +2183,17 @@ export async function createUser(req, res) {
 
   try {
     await adminUtil.addUser(username, plainPassword, adminRole, vpaths, true, uploadRole);
+    // V35: also populate the Subsonic-specific password with the same
+    // value so the new user can immediately authenticate via Subsonic
+    // token-auth clients (Symfonium, DSub, etc). A Subsonic admin
+    // creating a user expects them to be usable via Subsonic without
+    // an out-of-band "now go set a Subsonic password too" step.
+    //
+    // TODO: revisit once we add a way to create users without write
+    // access (read-only Subsonic-only accounts). For those, setting
+    // both passwords is fine; for full users, the admin may want to
+    // distinguish the two via the mobile-clients panel later.
+    await adminUtil.setSubsonicPassword(username, plainPassword);
     sendOk(req, res);
   } catch (err) {
     return SubErr.GENERIC(req, res, err.message || 'createUser failed');
@@ -1699,6 +2227,11 @@ export async function updateUser(req, res) {
       ? Buffer.from(String(req.query.password).slice(4), 'hex').toString('utf8')
       : String(req.query.password);
     await adminUtil.editUserPassword(username, plain);
+    // V35: keep the Subsonic-specific password in sync with the main
+    // password when changed via Subsonic. Same rationale as createUser
+    // — a Subsonic admin client doesn't know about the mStream
+    // dual-password model. TODO: consider read-only-user variant.
+    await adminUtil.setSubsonicPassword(username, plain);
   }
   sendOk(req, res);
 }
@@ -1735,6 +2268,11 @@ export async function changePassword(req, res) {
     : password;
   try {
     await adminUtil.editUserPassword(username, plain);
+    // V35: same dual-password sync as createUser/updateUser. A user
+    // who runs `changePassword` via a Subsonic client and then tries
+    // to log in via that same client expects the new password to
+    // work — which requires updating the Subsonic-specific column too.
+    await adminUtil.setSubsonicPassword(username, plain);
     sendOk(req, res);
   } catch {
     return SubErr.NOT_FOUND(req, res, 'User');
@@ -1751,7 +2289,7 @@ export async function changePassword(req, res) {
 function songQueryBase() {
   return `
     SELECT t.id, t.filepath, t.title, t.track_number, t.disc_number, t.duration,
-           t.format, t.file_size, t.bitrate, t.year, t.genre, t.album_art_file,
+           t.format, t.file_size, t.bitrate, t.year, ${TRACK_PRIMARY_GENRE_SQL}, ${TRACK_GENRES_JSON_SQL}, t.album_art_file,
            t.created_at, t.library_id,
            t.replaygain_track_db, t.sample_rate, t.channels, t.bit_depth,
            a.id AS artist_id, a.name AS artist_name,
@@ -1793,18 +2331,29 @@ function similarSongsFor(req, artistId, count) {
 
   // Tier 2: tracks that share at least one genre with any of this artist's
   // tracks, excluding the artist's own tracks.
+  // V34: pull genres via M2M JOIN instead of the dropped flat column.
   const genres = db.getDB().prepare(`
-    SELECT DISTINCT t.genre FROM tracks t
-    WHERE t.artist_id = ? AND t.genre IS NOT NULL AND t.genre <> ''
-  `).all(artistId).map(r => r.genre);
+    SELECT DISTINCT g.name FROM track_genres tg
+    JOIN tracks t ON t.id = tg.track_id
+    JOIN genres g ON g.id = tg.genre_id
+    WHERE t.artist_id = ?
+  `).all(artistId).map(r => r.name);
 
   if (!genres.length) { return sameArtist; }
 
   const genrePh = genres.map(() => '?').join(',');
   const remaining = count - sameArtist.length;
+  // V34: candidate match via M2M EXISTS, case-insensitive. The genres
+  // array came from this DB so case is identical, but COLLATE NOCASE
+  // future-proofs us against case-variants creeping in (e.g. multi-
+  // tagger source files).
   const related = db.getDB().prepare(`
     ${songQueryBase()}
-    WHERE ${clause} AND t.artist_id <> ? AND t.genre IN (${genrePh})
+    WHERE ${clause} AND t.artist_id <> ? AND EXISTS (
+      SELECT 1 FROM track_genres tg
+      JOIN genres g ON g.id = tg.genre_id
+      WHERE tg.track_id = t.id AND g.name COLLATE NOCASE IN (${genrePh})
+    )
     ORDER BY RANDOM() LIMIT ?
   `).all(...params, artistId, ...genres, remaining);
 
@@ -1813,8 +2362,9 @@ function similarSongsFor(req, artistId, count) {
 
 export function getSimilarSongs(req, res) {
   // v1 accepts any id (artist / album / song) — pick the enclosing artist.
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const parsed = decodeId(req.query.id);
-  if (!parsed) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  if (!parsed) { return SubErr.NOT_FOUND(req, res); }
   const count = Math.min(Math.max(parseInt(req.query.count, 10) || 50, 1), 500);
 
   const artistId = (() => {
@@ -1831,8 +2381,9 @@ export function getSimilarSongs(req, res) {
 }
 
 export function getSimilarSongs2(req, res) {
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const parsed = decodeId(req.query.id, 'artist');
-  if (!parsed) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  if (!parsed) { return SubErr.NOT_FOUND(req, res, 'Artist'); }
   const count = Math.min(Math.max(parseInt(req.query.count, 10) || 50, 1), 500);
   const rows = similarSongsFor(req, parsed.id, count);
   sendOk(req, res, {
@@ -1900,18 +2451,26 @@ function similarArtistsFor(artistId, limit = 10) {
   const { clause: libClause, params: libParams } = { clause: '1=1', params: [] }; // libraries don't apply to artist rows
   void libClause; void libParams;
   // Artists sharing ≥1 genre with the target, scored by shared-genre count.
+  // V34: read genres via the track_genres M2M instead of the dropped
+  // flat column. The CTE materialises the target artist's genre ids
+  // (not names — using ids avoids accidental case-fold mismatches and
+  // lets the shared-count GROUP BY work without a NOCASE collation).
   return db.getDB().prepare(`
     WITH our_genres AS (
-      SELECT DISTINCT t.genre FROM tracks t
-      WHERE t.artist_id = ? AND t.genre IS NOT NULL AND t.genre <> ''
+      SELECT DISTINCT g.id AS genre_id
+      FROM track_genres tg
+      JOIN tracks t ON t.id = tg.track_id
+      JOIN genres g ON g.id = tg.genre_id
+      WHERE t.artist_id = ?
     )
     SELECT a.id, a.name,
-           COUNT(DISTINCT t.genre) AS shared,
-           COUNT(DISTINCT al.id)   AS albumCount
+           COUNT(DISTINCT tg.genre_id) AS shared,
+           COUNT(DISTINCT al.id)       AS albumCount
     FROM artists a
     JOIN albums al ON al.artist_id = a.id
     JOIN tracks t  ON t.album_id = al.id
-    WHERE a.id <> ? AND t.genre IN (SELECT genre FROM our_genres)
+    JOIN track_genres tg ON tg.track_id = t.id
+    WHERE a.id <> ? AND tg.genre_id IN (SELECT genre_id FROM our_genres)
     GROUP BY a.id
     HAVING shared > 0
     ORDER BY shared DESC, albumCount DESC
@@ -1937,8 +2496,9 @@ function artistInfoPayload(artistRow) {
 }
 
 export function getArtistInfo(req, res) {
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const parsed = decodeId(req.query.id);
-  if (!parsed) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  if (!parsed) { return SubErr.NOT_FOUND(req, res, 'Artist'); }
   const artistId = parsed.type === 'artist' ? parsed.id
     : (parsed.type === 'album' ? db.getDB().prepare('SELECT artist_id FROM albums WHERE id = ?').get(parsed.id)?.artist_id
     : db.getDB().prepare('SELECT artist_id FROM tracks WHERE id = ?').get(parsed.id)?.artist_id);
@@ -1949,8 +2509,9 @@ export function getArtistInfo(req, res) {
 }
 
 export function getArtistInfo2(req, res) {
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const parsed = decodeId(req.query.id, 'artist');
-  if (!parsed) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  if (!parsed) { return SubErr.NOT_FOUND(req, res, 'Artist'); }
   const row = db.getDB().prepare('SELECT id, name, mbz_artist_id FROM artists WHERE id = ?').get(parsed.id);
   if (!row) { return SubErr.NOT_FOUND(req, res, 'Artist'); }
   sendOk(req, res, { artistInfo2: artistInfoPayload(row) });
@@ -1968,8 +2529,9 @@ function albumInfoPayload(albumRow) {
 }
 
 export function getAlbumInfo(req, res) {
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const parsed = decodeId(req.query.id);
-  if (!parsed) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  if (!parsed) { return SubErr.NOT_FOUND(req, res, 'Album'); }
   const albumId = parsed.type === 'album' ? parsed.id
     : (parsed.type === 'song' ? db.getDB().prepare('SELECT album_id FROM tracks WHERE id = ?').get(parsed.id)?.album_id : null);
   if (!albumId) { return SubErr.NOT_FOUND(req, res, 'Album'); }
@@ -1979,8 +2541,9 @@ export function getAlbumInfo(req, res) {
 }
 
 export function getAlbumInfo2(req, res) {
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const parsed = decodeId(req.query.id, 'album');
-  if (!parsed) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  if (!parsed) { return SubErr.NOT_FOUND(req, res, 'Album'); }
   const row = db.getDB().prepare('SELECT id, mbz_album_id FROM albums WHERE id = ?').get(parsed.id);
   if (!row) { return SubErr.NOT_FOUND(req, res, 'Album'); }
   sendOk(req, res, { albumInfo2: albumInfoPayload(row) });
@@ -2015,7 +2578,7 @@ function shareRowToPayload(row, sharePrefix) {
   // emit the full Subsonic song object.
   const stmt = db.getDB().prepare(`
     SELECT t.id, t.filepath, t.title, t.track_number, t.disc_number, t.duration,
-           t.format, t.file_size, t.bitrate, t.year, t.genre, t.album_art_file,
+           t.format, t.file_size, t.bitrate, t.year, ${TRACK_PRIMARY_GENRE_SQL}, ${TRACK_GENRES_JSON_SQL}, t.album_art_file,
            t.created_at, t.library_id,
            t.replaygain_track_db, t.sample_rate, t.channels, t.bit_depth,
            a.id AS artist_id, a.name AS artist_name,
@@ -2070,8 +2633,13 @@ export function getShares(req, res) {
 }
 
 export function createShare(req, res) {
-  const songIds = arrayParam(req.query.id).map(v => decodeId(v, 'song')?.id).filter(Number.isFinite);
-  if (!songIds.length) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  // Same two-stage check as scrobble/star/unstar: distinguish "no id
+  // params at all" from "ids given but none decoded" so clients see
+  // the right Subsonic error code.
+  const rawIds = arrayParam(req.query.id);
+  if (!rawIds.length) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  const songIds = rawIds.map(v => decodeId(v, 'song')?.id).filter(Number.isFinite);
+  if (!songIds.length) { return SubErr.NOT_FOUND(req, res, 'Song'); }
 
   const filepaths = songIds.map(id => filepathForSong(id)).filter(Boolean);
   if (!filepaths.length) { return SubErr.NOT_FOUND(req, res, 'Song'); }
@@ -2209,8 +2777,9 @@ export function getBookmarks(req, res) {
 }
 
 export function createBookmark(req, res) {
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const parsed = decodeId(req.query.id, 'song');
-  if (!parsed) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  if (!parsed) { return SubErr.NOT_FOUND(req, res, 'Song'); }
   const position = parseInt(req.query.position, 10);
   if (!Number.isFinite(position) || position < 0) {
     return SubErr.MISSING_PARAM(req, res, 'position');
@@ -2232,8 +2801,9 @@ export function createBookmark(req, res) {
 }
 
 export function deleteBookmark(req, res) {
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const parsed = decodeId(req.query.id, 'song');
-  if (!parsed) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  if (!parsed) { return SubErr.NOT_FOUND(req, res, 'Song'); }
   const hash = trackFileHash(parsed.id);
   if (!hash) { return SubErr.NOT_FOUND(req, res, 'Song'); }
   db.getDB().prepare('DELETE FROM user_bookmarks WHERE user_id = ? AND track_hash = ?')
@@ -2261,7 +2831,7 @@ export function getPlayQueue(req, res) {
   const { clause, params } = libraryScope(req);
   const songRows = db.getDB().prepare(`
     SELECT t.id, t.filepath, t.title, t.track_number, t.disc_number, t.duration,
-           t.format, t.file_size, t.bitrate, t.year, t.genre, t.album_art_file,
+           t.format, t.file_size, t.bitrate, t.year, ${TRACK_PRIMARY_GENRE_SQL}, ${TRACK_GENRES_JSON_SQL}, t.album_art_file,
            t.created_at, t.library_id, t.file_hash, t.audio_hash,
            t.replaygain_track_db, t.sample_rate, t.channels, t.bit_depth,
            a.id AS artist_id, a.name AS artist_name,
@@ -2529,8 +3099,9 @@ export function getLyrics(req, res) {
 // response returns, so the second call for the same track will see
 // results (assuming LRCLib had anything for it).
 export function getLyricsBySongId(req, res) {
+  if (req.query.id == null) { return SubErr.MISSING_PARAM(req, res, 'id'); }
   const parsed = decodeId(req.query.id, 'song');
-  if (!parsed) { return SubErr.MISSING_PARAM(req, res, 'id'); }
+  if (!parsed) { return SubErr.NOT_FOUND(req, res, 'Song'); }
   const row = lyricsRowById(req, parsed.id);
   if (!row) { return SubErr.NOT_FOUND(req, res, 'Song'); }
 
@@ -2610,7 +3181,7 @@ function queueToSongEntries(req, queueVpaths) {
   // an IN (?,?,?) of tuples.
   const stmt = db.getDB().prepare(`
     SELECT t.id, t.filepath, t.title, t.track_number, t.disc_number, t.duration,
-           t.format, t.file_size, t.bitrate, t.year, t.genre, t.album_art_file,
+           t.format, t.file_size, t.bitrate, t.year, ${TRACK_PRIMARY_GENRE_SQL}, ${TRACK_GENRES_JSON_SQL}, t.album_art_file,
            t.created_at, t.library_id,
            t.replaygain_track_db, t.sample_rate, t.channels, t.bit_depth,
            a.id AS artist_id, a.name AS artist_name,

@@ -13,18 +13,76 @@ const storageJoi = Joi.object({
   dbDirectory: Joi.string().default(path.join(__dirname, '../../save/db')),
   logsDirectory: Joi.string().default(path.join(__dirname, '../../save/logs')),
   syncConfigDirectory:  Joi.string().default(path.join(__dirname, '../../save/sync')),
-  // Persistent by default — lives under save/ so Docker users who only mount
-  // save/ keep their cache across restarts instead of regenerating every scan.
-  waveformCacheDirectory: Joi.string().default(path.join(__dirname, '../../save/waveforms')),
+  waveformCacheDirectory: Joi.string().default(path.join(__dirname, '../../waveform-cache')),
 });
 
 const scanOptions = Joi.object({
   skipImg: Joi.boolean().default(false),
   scanInterval: Joi.number().min(0).default(24),
   bootScanDelay: Joi.number().default(3),
-  maxConcurrentTasks: Joi.number().integer().min(1).default(1),
   compressImage: Joi.boolean().default(true),
-  scanCommitInterval: Joi.number().integer().min(1).default(25),
+  // Tracks scanned per SQLite COMMIT — also gates how often the scanner
+  // emits progress updates. Lower = more responsive UI + shorter
+  // write-lock holds (concurrent API readers stall less); higher =
+  // fewer commits, slightly more raw throughput. Soft-capped at 1000:
+  // anything above that holds the write lock for ~10s+ at typical scan
+  // rates and starves concurrent reads without buying meaningful speed.
+  // We clamp + log rather than reject because a too-large value in the
+  // config file would otherwise prevent server boot — better to nudge
+  // the operator with a warning and keep running than to fail closed.
+  scanCommitInterval: Joi.number().integer().min(1).default(25).custom((value) => {
+    if (value > 1000) {
+      winston.warn(`scanCommitInterval=${value} exceeds the 1000 cap; clamping to 1000. Higher values hold the SQLite write lock too long without measurable throughput gain.`);
+      return 1000;
+    }
+    return value;
+  }),
+  // Number of worker threads the Rust scanner uses for parallel
+  // file extraction. 0 (default) = auto: half the available CPU
+  // cores, clamped to [1, 8]. The 8-thread cap protects against
+  // monster-core boxes spinning up dozens of workers that mostly
+  // idle on the single SQLite writer thread; explicit positive
+  // values bypass the cap for operators who really want it to rip
+  // (at the cost of higher peak memory — ~256 MB per worker for
+  // large files). The Rust binary resolves the actual count; this
+  // field just sets the policy. The JS fallback scanner
+  // (src/db/scanner.mjs) ignores it — it stays single-threaded
+  // because it's the slow-path for hosts without a Rust binary
+  // anyway.
+  scanThreads: Joi.number().integer().min(0).default(0),
+  // Generate waveform .bin files inline during scan. ~90% of scan
+  // wall-time goes into the symphonia decode for these — disabling
+  // it gives roughly a 10× scan speedup. Default true preserves the
+  // current behaviour (scan-time waveforms = instant playback bar).
+  // When false, task-queue.js sends an empty waveformCacheDir and
+  // the Rust scanner skips the decode entirely; the on-demand GET
+  // /api/v1/db/waveform endpoint still serves waveforms by
+  // generating them via ffmpeg on first playback (this is how
+  // .opus files have always worked, since symphonia 0.5 has no
+  // Opus decoder). Trade-off: a few hundred ms of latency on the
+  // first time each track's waveform is requested.
+  generateWaveforms: Joi.boolean().default(true),
+  // Run BPM + musical-key detection on each scanned track via the
+  // pure-Rust stratum-dsp analyzer, piggybacking on the existing
+  // symphonia decode pass. Default true because:
+  //   • Tag-sourced BPM/key (TBPM / TKEY etc.) is preferred when
+  //     present — those tracks skip analysis with zero overhead.
+  //   • Tracks with audiobook/spoken-word genres or duration outside
+  //     [30s, 30min] also skip — see is_audiobook_genre + the
+  //     duration gate in rust-parser's extract_track.
+  //   • Cost is bounded: per-file ~200-300ms analysis on top of an
+  //     already-running decode, and rayon parallelises it across
+  //     workers. Memory peak is ~52MB per active worker (capped at
+  //     5min of mono samples per track).
+  // Rust-only — the JS fallback scanner accepts this field but
+  // ignores it. Existing libraries on the JS path stay on
+  // tag-sourced BPM/key, same as today.
+  //
+  // To backfill BPM/key on a library that was already scanned before
+  // this feature shipped, trigger a force-rescan from the admin
+  // panel — the fast-path mtime check would otherwise skip the
+  // entire extract pass for unchanged files.
+  analyzeBpm: Joi.boolean().default(true),
   autoAlbumArt: Joi.boolean().default(true),
   albumArtWriteToFolder: Joi.boolean().default(false),
   albumArtWriteToFile: Joi.boolean().default(false),
@@ -159,6 +217,15 @@ const schema = Joi.object({
   transcode: transcodeOptions.default(transcodeOptions.validate({}).value),
   lyrics: lyricsOptions.default(lyricsOptions.validate({}).value),
   secret: Joi.string().optional(),
+  // Separate secret used to derive the AES-256-GCM key for the
+  // Subsonic-specific password column added in V35. Kept distinct from
+  // `secret` (which signs JWTs) so the two can rotate independently —
+  // rotating the JWT secret invalidates active sessions; rotating the
+  // Subsonic secret invalidates all stored Subsonic passwords (users
+  // would have to re-set them via the mobile-clients panel).
+  // Auto-generated on first boot like `secret`, persisted to the
+  // config file.
+  subsonicSecret: Joi.string().optional(),
   maxRequestSize: Joi.string().pattern(/[0-9]+(KB|MB)/i).default('1MB'),
   db: dbOptions.default(dbOptions.validate({}).value),
   folders: Joi.object().pattern(
@@ -190,6 +257,9 @@ const schema = Joi.object({
   subsonic: subsonicOptions.default(subsonicOptions.validate({}).value),
   autoBootServerAudio: Joi.boolean().default(false),
   rustPlayerPort: Joi.number().integer().min(1).max(65535).default(3333),
+  // true  - trust X-Forwarded-For header for client IP address
+  // false - default behavior
+  trustProxy: Joi.boolean().default(false),
 });
 
 export let program;
@@ -228,6 +298,16 @@ export async function setup(configFileArg) {
   if (!programData.secret) {
     winston.info('Config file does not have secret.  Generating a secret and saving');
     programData.secret = await asyncRandom(128);
+    await fs.writeFile(configFileArg, JSON.stringify(programData, null, 2), 'utf8');
+  }
+
+  // Setup the separate Subsonic-password secret. Kept independent of
+  // `secret` so a JWT-secret rotation doesn't accidentally invalidate
+  // every user's Subsonic password (HKDF derives the AES key from this
+  // secret; rotating it makes existing ciphertexts unreadable).
+  if (!programData.subsonicSecret) {
+    winston.info('Config file does not have subsonicSecret.  Generating a secret and saving');
+    programData.subsonicSecret = await asyncRandom(128);
     await fs.writeFile(configFileArg, JSON.stringify(programData, null, 2), 'utf8');
   }
 

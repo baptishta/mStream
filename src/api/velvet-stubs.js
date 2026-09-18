@@ -5,6 +5,7 @@
 import * as db from '../db/manager.js';
 import * as config from '../state/config.js';
 import { renderMetadataObj, libraryFilter, trackQuery } from './db.js';
+import { warmScrobbleUser } from './scrobbler.js';
 import { getVPathInfo } from '../util/vpath.js';
 
 const d = () => db.getDB();
@@ -77,6 +78,10 @@ export function setup(mstream) {
     const genre = req.body.genre;
     if (!genre) return res.json({ albums: [] });
     const f = libraryFilter(req.user);
+    // V34: case-insensitive name match — folds in the case-sensitivity
+    // fix flagged in the genre scout. Clients pick names from
+    // /api/v1/db/genres which canonicalises case; this guards against
+    // legacy clients that lower-case the value before sending it back.
     const rows = d().prepare(`
       SELECT DISTINCT al.name, a.name AS artist, al.year, al.album_art_file
       FROM albums al
@@ -84,7 +89,7 @@ export function setup(mstream) {
       JOIN track_genres tg ON tg.track_id = t.id
       JOIN genres g ON g.id = tg.genre_id
       LEFT JOIN artists a ON al.artist_id = a.id
-      WHERE g.name = ? AND ${f.clause}
+      WHERE g.name COLLATE NOCASE = ? AND ${f.clause}
       ORDER BY al.name COLLATE NOCASE
     `).all(genre, ...f.params);
     res.json({ albums: rows });
@@ -98,7 +103,7 @@ export function setup(mstream) {
       ${trackQuery(req.user?.id)}
       JOIN track_genres tg ON tg.track_id = t.id
       JOIN genres g ON g.id = tg.genre_id
-      WHERE g.name = ? AND ${f.clause}
+      WHERE g.name COLLATE NOCASE = ? AND ${f.clause}
       ORDER BY a.name COLLATE NOCASE, al.name COLLATE NOCASE, t.track_number
     `).all(...(req.user?.id ? [req.user.id] : []), genre, ...f.params);
     res.json(rows.map(renderMetadataObj));
@@ -166,6 +171,9 @@ export function setup(mstream) {
   });
 
   // ── Play logging ─────────────────────────────────────────────
+  // In public/no-users mode the play count hangs off the V25 anonymous
+  // sentinel — the operator's "what I've been listening to" history,
+  // same model as user_metadata.rating and the playlists table.
   mstream.post('/api/v1/db/stats/log-play', (req, res) => {
     const filePath = req.body.filePath;
     if (!filePath || !req.user?.id) return res.json({ ok: true });
@@ -227,6 +235,11 @@ export function setup(mstream) {
   });
 
   // ── Share list and delete ────────────────────────────────────
+  // In public/no-users mode the rows are scoped to the V25 anonymous
+  // sentinel. Share links are intentionally public-by-design — they
+  // carry their own access token in the URL — so listing them under
+  // the sentinel just gives the operator a "manage shares I created"
+  // surface in single-user public deployments.
   mstream.get('/api/v1/share/list', (req, res) => {
     if (!req.user?.id) return res.json([]);
     const rows = d().prepare(
@@ -257,18 +270,8 @@ export function setup(mstream) {
     res.json(libs.map(l => ({ name: l.name, root: l.root_path, type: l.type })));
   });
 
-  // ── Scan progress (reads from scan_progress table written by scanners) ──
-  mstream.get('/api/v1/admin/db/scan/progress', (req, res) => {
-    const rows = d().prepare('SELECT * FROM scan_progress').all();
-    res.json(rows.map(r => ({
-      vpath: r.vpath || 'Scanning…',
-      pct: r.expected ? Math.min(100, Math.round((r.scanned / r.expected) * 100)) : null,
-      scanned: r.scanned || 0,
-      expected: r.expected || null,
-      currentFile: r.current_file || null,
-      countingFound: 0
-    })));
-  });
+  // Scan progress moved to /api/v1/scan/progress (core API, not admin-only,
+  // vpath-filtered per caller, basenames only). See src/api/scan.js.
 
   // ══════════════════════════════════════════════════════════════
   // STUBS — features not yet implemented, return safe defaults
@@ -292,54 +295,54 @@ export function setup(mstream) {
 
   // ListenBrainz — handled by listenbrainz.js (loaded before stubs)
 
-  // Last.fm status
-  mstream.get('/api/v1/lastfm/status', (req, res) => {
-    const hasApiKey = !!(config.program.lastFM?.apiKey);
-    const linkedUser = req.user?.lastfm_user || null;
-    res.json({
-      serverEnabled: hasApiKey,
-      hasApiKey,
-      linkedUser
-    });
-  });
+  // /api/v1/lastfm/status moved to src/api/scrobbler.js — the
+  // default-UI Auto-DJ panel (PR-E client work) needs to gate the
+  // "Similar artists" toggle on whether a Last.fm API key is
+  // configured, and `velvet-stubs.js` only loads when
+  // `ui === 'velvet'`. Same reason `/api/v1/lastfm/similar-artists`
+  // was moved in PR #587.
 
-  // Last.fm connect/disconnect (update user's lastfm credentials in DB)
+  // Last.fm connect/disconnect (update user's lastfm credentials in DB).
+  //
+  // Public/no-users mode is supported: writes target the V25 anonymous
+  // sentinel via req.user.id, which auth.js's no-users branch pins for
+  // the operator. Admin-gated to prevent random viewers in adminLocked
+  // public deployments from overwriting the operator's stored Last.fm
+  // credentials. Same gate the ListenBrainz handlers use.
+  //
+  // After saving creds we warm the Scribble session map so the next
+  // /scrobble-by-filepath call doesn't need a server restart to pick
+  // them up — the boot-time pre-load only covers credentials present
+  // when scrobbler.setup() ran.
   mstream.post('/api/v1/lastfm/connect', (req, res) => {
     const { lastfmUser, lastfmPassword } = req.body;
-    if (!lastfmUser || !lastfmPassword || !req.user?.id) {
+    if (!lastfmUser || !lastfmPassword) {
       return res.status(400).json({ error: 'Username and password required' });
+    }
+    if (!req.user?.admin) {
+      return res.status(403).json({ error: 'Admin access required' });
     }
     d().prepare('UPDATE users SET lastfm_user = ?, lastfm_password = ? WHERE id = ?')
       .run(lastfmUser, lastfmPassword, req.user.id);
     db.invalidateCache();
+    warmScrobbleUser(lastfmUser, lastfmPassword);
     res.json({ ok: true });
   });
 
   mstream.post('/api/v1/lastfm/disconnect', (req, res) => {
-    if (!req.user?.id) return res.json({ ok: true });
+    if (!req.user?.admin) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
     d().prepare('UPDATE users SET lastfm_user = NULL, lastfm_password = NULL WHERE id = ?')
       .run(req.user.id);
     db.invalidateCache();
     res.json({ ok: true });
   });
 
-  // Similar artists via Last.fm API (powers Auto-DJ recommendations)
-  mstream.get('/api/v1/lastfm/similar-artists', async (req, res) => {
-    const artist = req.query.artist;
-    const apiKey = config.program.lastFM?.apiKey;
-    if (!artist || !apiKey) return res.json({ artists: [] });
-
-    try {
-      const url = `https://ws.audioscrobbler.com/2.0/?method=artist.getsimilar&artist=${encodeURIComponent(artist)}&api_key=${apiKey}&format=json&limit=15`;
-      const r = await fetch(url, { headers: { 'User-Agent': 'mStream/6.0' } });
-      if (!r.ok) return res.json({ artists: [] });
-      const data = await r.json();
-      const names = (data?.similarartists?.artist || []).map(a => a.name).filter(Boolean);
-      res.json({ artists: names });
-    } catch (_) {
-      res.json({ artists: [] });
-    }
-  });
+  // /api/v1/lastfm/similar-artists moved to src/api/scrobbler.js
+  // — the route is consumed by the core random-songs Auto-DJ route
+  // (PR D) which is available in BOTH default and velvet UI modes,
+  // so the endpoint can't be gated on `ui === 'velvet'`.
 
   // Cue points — handled by cuepoints.js (loaded before stubs)
 
@@ -347,8 +350,8 @@ export function setup(mstream) {
 
   // Discogs — handled by discogs.js (loaded before stubs)
 
-  // Subsonic password
-  mstream.post('/api/v1/admin/users/subsonic-password', (req, res) => res.status(501).json({ error: 'Not implemented' }));
+  // Subsonic password — handled by admin.js (POST /api/v1/admin/users/subsonic-password)
+  // which is registered before this file, so a 501 stub here was unreachable dead code.
 
   // ID3 tag writing — write metadata tags to audio files via ffmpeg
   mstream.post('/api/v1/admin/tags/write', async (req, res) => {
@@ -412,7 +415,15 @@ export function setup(mstream) {
       if (year !== undefined)  { updates.push('year = ?');  params.push(year ? Number(year) || null : null); }
       if (track !== undefined) { updates.push('track_number = ?'); params.push(track ? Number(track) || null : null); }
       if (disk !== undefined)  { updates.push('disc_number = ?');  params.push(disk ? Number(disk) || null : null); }
-      if (genre !== undefined) { updates.push('genre = ?'); params.push(genre || null); }
+      // V34: tracks.genre dropped — genre tag changes flow through
+      // the track_genres M2M instead. Handled after the UPDATE below
+      // (we need the track's id, which we look up by filepath+lib).
+      //
+      // Note this was also a latent bug pre-V34: the old code only
+      // updated the flat column, never the M2M, so a tag edit on a
+      // genre would silently fall out of sync with what every M2M-
+      // aware reader (alpha-UI getGenres) saw. After this PR the M2M
+      // is the only path and the bug is gone.
 
       if (artist !== undefined) {
         const artistId = db.findOrCreateArtist(artist || null);
@@ -428,6 +439,18 @@ export function setup(mstream) {
       if (updates.length > 0) {
         params.push(pathInfo.relativePath, lib.id);
         d().prepare(`UPDATE tracks SET ${updates.join(', ')} WHERE filepath = ? AND library_id = ?`).run(...params);
+      }
+
+      // V34: apply genre changes via the M2M. Look up the track id
+      // (filepath+library is unique enough to identify it) and
+      // replace its track_genres rows.
+      if (genre !== undefined) {
+        const trackRow = d().prepare(
+          'SELECT id FROM tracks WHERE filepath = ? AND library_id = ?'
+        ).get(pathInfo.relativePath, lib.id);
+        if (trackRow) {
+          db.replaceTrackGenres(trackRow.id, genre || null);
+        }
       }
 
       res.json({ ok: true });
