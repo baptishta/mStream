@@ -20,7 +20,7 @@ export let FTS5_AVAILABLE = false;
 // ── Anonymous (no-users) sentinel ────────────────────────────────────────────
 //
 // users.user_id is a NOT NULL FK on every per-user table (user_metadata,
-// playlists, cue_points, user_settings, …). When the admin hasn't created
+// playlists, shared_playlists, …). When the admin hasn't created
 // any real users — i.e. mStream is running in public read-only mode — every
 // HTTP request still needs *some* valid user_id to attribute writes to,
 // otherwise scrobbles, ratings, "save queue as playlist", etc. all crash
@@ -171,15 +171,15 @@ export function setCacheSize(mb) {
 
 // Run fn inside a single transaction (BEGIN/COMMIT, ROLLBACK on throw).
 // Collapses a loop of writes into one fsync and makes the batch atomic, so
-// callers doing bulk inserts/updates (playlist save, Subsonic star / scrobble /
+// callers doing bulk inserts/updates (playlist save, scrobble / rating /
 // playlist mutations) don't pay a per-statement commit, and a concurrent reader
 // never sees a half-applied batch. SQLite has no nested transactions — don't
 // call this inside another transaction.
 //
 // BEGIN IMMEDIATE, not a deferred BEGIN: the scanner runs as a separate
 // process that commits write batches continuously during a scan. With a
-// deferred BEGIN, a body whose FIRST statement is a read (e.g. Subsonic
-// updatePlaylist SELECTs playlist positions before writing) pins a read
+// deferred BEGIN, a body whose FIRST statement is a read (e.g. a playlist
+// update that SELECTs positions before writing) pins a read
 // snapshot; when the scanner commits before the body's first write, the
 // lock upgrade fails with SQLITE_BUSY_SNAPSHOT — which does NOT invoke the
 // busy handler, so the 5s busy_timeout above never applies and the caller
@@ -220,7 +220,23 @@ function setSchemaVersion(version) {
 function runMigrations() {
   const currentVersion = getSchemaVersion();
 
-  if (currentVersion >= SCHEMA_VERSION) {
+  // A database from this build's FUTURE: an older release opened a db a
+  // newer one already migrated — a rolled-back docker tag, a manual
+  // downgrade, a branch switch in a dev checkout. Nothing in this build
+  // knows the newer tables, columns, triggers or invariants: reads would
+  // mostly work, both scanners would refuse (their user_version check),
+  // and every write this build made is one the newer schema can't trust
+  // once the user upgrades again. Refuse to boot with the one message that
+  // says what to do instead of running half-blind. (The managed installers
+  // catch the same case BEFORE flipping a release: util/boot-probe.js.)
+  if (currentVersion > SCHEMA_VERSION) {
+    throw new Error(
+      `This database was created by a newer mStream: its schema is v${currentVersion}, ` +
+      `this build supports up to v${SCHEMA_VERSION}. Upgrade mStream to the version that ` +
+      'created it (or newer), or restore the database backup taken before that upgrade.');
+  }
+
+  if (currentVersion === SCHEMA_VERSION) {
     winston.info(`Database schema is up to date (v${currentVersion})`);
     return;
   }
@@ -402,8 +418,8 @@ export function getUserByUsername(username) {
   const row = _usersCache.get(username);
   // The sentinel is never reachable by name. Login attempts already fail
   // at PBKDF2 (its stored hash is the literal '!' which no PBKDF2 output
-  // can produce), but every other call site — admin mint-key, password
-  // change, delete-user, edit-access, Subsonic getUser/updateUser — also
+  // can produce), but every other call site — password change,
+  // delete-user, edit-access — also
   // resolves users by name, and we don't want any of those to be able
   // to address the sentinel either. The auth no-users branch resolves
   // the sentinel by id (getAnonymousUserId), not name, so it's
@@ -429,9 +445,9 @@ export function getAnonymousUserId() {
 // initDB() finishes).
 //
 // Callers: auth.js's no-users branch uses this to spread the sentinel's
-// columns (lastfm_user, lastfm_password, listenbrainz_token, …) onto
-// req.user, so public-mode requests look like a real-user request and
-// the per-user-data endpoints (LB/Last.fm scrobbling, /lastfm/status,
+// columns (lastfm_user, lastfm_password, …) onto req.user, so
+// public-mode requests look like a real-user request and the
+// per-user-data endpoints (Last.fm scrobbling, /lastfm/status,
 // etc.) work without per-endpoint special-casing.
 //
 // getUserByUsername / getAllUsers intentionally hide the sentinel from

@@ -37,6 +37,12 @@ import * as config from './config.js';
 //   'announcement' → { from, payload }   a peer's signed catalog announcement
 //                                        (signature already verified in Rust)
 //   'neighbor'     → { up, id }          gossip mesh membership changes
+//   'dm'           → { from, payload }   a direct message from a peer. `from`
+//                                        is the QUIC-authenticated endpoint
+//                                        id; payload is size-capped but
+//                                        otherwise UNVALIDATED JSON — the
+//                                        consumer (federation requests)
+//                                        owns content validation.
 // The catalog module (discovery-catalog.js) is the main subscriber.
 export const events = new EventEmitter();
 
@@ -397,10 +403,25 @@ export async function publish(filePath) {
 // Fetch a blob into outDir. Returns { hash, size, path }. Addressing is
 // either { ticket } (full self-contained address) or { hash, provider }
 // (the catalog flow — provider resolves via the sidecar's address book /
-// discovery).
-export async function fetch(addressing, outDir) {
+// discovery). Options, both understood by sidecars ≥ v1.0.4 and IGNORED by
+// older ones (the request struct tolerates unknown keys):
+//
+//   maxBytes  transfer byte ceiling — the sidecar aborts the download the
+//             moment it's crossed, so a peer that announced a small
+//             snapshot can't stream an arbitrarily large blob into the
+//             store (disk-fill DoS). Callers must keep their own
+//             post-download size check as the pre-1.0.4 fallback bound.
+//   hold      root the fetched blob in the sidecar store (persistent tag)
+//             so this server keeps SEEDING it — required for anything the
+//             holds beacon will advertise, because an unrooted blob is
+//             GC-swept within ~15min. forget() releases it. Leave off for
+//             one-off pulls where only the exported file matters.
+export async function fetch(addressing, outDir, { maxBytes, hold } = {}) {
   await start();
-  return rpc('fetch', { ...addressing, outDir }, FETCH_TIMEOUT_MS);
+  const params = { ...addressing, outDir };
+  if (Number.isFinite(maxBytes) && maxBytes > 0) { params.maxBytes = Math.floor(maxBytes); }
+  if (hold === true) { params.hold = true; }
+  return rpc('fetch', params, FETCH_TIMEOUT_MS);
 }
 
 export async function status() {
@@ -437,6 +458,31 @@ export function setHolds(hashes) {
 export function forget(hash) {
   if (!isRunning()) { return Promise.resolve({ forgotten: false, offline: true }); }
   return rpc('forget', { hash });
+}
+
+// ── Direct messages (federation requests transport) ─────────────────────────
+
+// A dm dial can take the full 25s connect budget against an offline peer.
+const DM_TIMEOUT_MS = 40 * 1000;
+
+// Send one addressed message. `to` = endpoint ticket or bare endpoint id
+// (catalog entries are bare ids; N0 discovery resolves them). Resolves
+// { delivered: true } when the peer accepted, { delivered: false, reason }
+// when the peer was reached and REFUSED (not-accepting / rate-limited /
+// too-large / malformed — terminal, don't retry), and REJECTS when the
+// peer was never reached (offline, or a build without the DM protocol).
+export async function sendDm(to, payload) {
+  await start();
+  return rpc('dm', { to, payload }, DM_TIMEOUT_MS);
+}
+
+// Inbound-DM policy: the sidecar boots fail-closed and refuses DMs at the
+// transport until this says otherwise, so senders get an immediate typed
+// refusal instead of silence. Lenient offline — the flag is re-pushed on
+// every stack start.
+export function setDmAccept(accept) {
+  if (!isRunning()) { return Promise.resolve({ set: false, offline: true }); }
+  return rpc('setDmAccept', { accept: accept === true });
 }
 
 // The blob hash of our own currently-published snapshot (null before the

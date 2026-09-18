@@ -142,11 +142,20 @@ export async function startDiscoveryP2pStack() {
     const p2p = await import('./discovery-p2p.js');
     const catalog = await import('./discovery-catalog.js');
     const seeds = await import('./discovery-seeds.js');
+    const fedRequests = await import('./federation-requests.js');
     catalog.subscribe();
+    // Federation requests ride the same event pipe (dm + announcement) —
+    // subscribed before the spawn for the same reason as the catalog, and
+    // idempotent the same way.
+    fedRequests.subscribe();
     // Armed BEFORE the spawn, so a sidecar that dies seconds into its life
     // is covered too. Idempotent — re-registering just replaces the slot.
     p2p.setUnexpectedExitHandler(scheduleRecovery);
     await p2p.start();
+    // The sidecar boots refusing DMs; push the operator's inbox policy (or
+    // the open-for-replies window) down now that it's up. A failure here
+    // only means the inbox stays closed — never a failed start.
+    await fedRequests.pushAcceptPolicy();
     // Two-phase bootstrap. Phase one joins the topic IMMEDIATELY with
     // what's known locally (baked seeds + cached list + the operator's
     // bootstrapPeers) — the subscription must never wait on a network
@@ -158,6 +167,13 @@ export async function startDiscoveryP2pStack() {
     seeds.resolveBootstrap().then((full) => p2p.join(full)).catch((err) => {
       winston.warn(`[discovery-seeds] community list refresh failed: ${err.message}`);
     });
+    // Re-root the shelf in the (fresh) sidecar store BEFORE the first
+    // holds beacon can go out — advertised holds must be servable from the
+    // first broadcast, and a new sidecar process starts with whatever its
+    // store kept (pre-v1.0.4: nothing fetched survived GC). Internally
+    // per-entry fault-tolerant, never fatal to the start.
+    const peerDbs = await import('./discovery-peer-dbs.js');
+    await peerDbs.reseedShelf();
     try {
       // Builds the export first when the collected dataset is ahead of
       // (or has never had) a snapshot — a server whose embeddings
@@ -173,7 +189,6 @@ export async function startDiscoveryP2pStack() {
     // so the /api/v1/discovery/p2p/similar surface has data to search the
     // moment users ask. Event-driven + periodic; all failures are per-peer
     // logged, never fatal.
-    const peerDbs = await import('./discovery-peer-dbs.js');
     peerDbs.startAutoFetch();
     // Retention pruning: forget catalog peers not heard from in
     // discoveryP2p.peerRetentionDays. The shelf is the pin-set — a peer

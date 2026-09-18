@@ -27,6 +27,11 @@ info:
     - **Shared-playlist tokens** (`shareToken: true`) restrict file access to the tracks in one specific shared playlist.
     - **Federation keys** (`x-federation-key: fedk_…` header, not a JWT) authenticate a paired peer server as a
       synthetic read-only user scoped to the key's granted libraries, limited to a read-route allowlist.
+    - **Federation guest tokens** (`federationGuest: true`) are short-lived JWTs this server mints for a
+      federation key on request (`POST /api/v1/federation/guest`), so a key holder's own device can reach
+      this server directly. They ride the ordinary token slots and resolve to the same read-only user as
+      the key (same grants, allowlist and bandwidth caps); revoking the key revokes its guests. See
+      docs/federation-guest-ticket.md.
 
     ## Errors
 
@@ -75,11 +80,9 @@ tags:
   - name: Search
     description: Full-text search across the library.
   - name: Stats
-    description: Play counts, ratings, recently-played, Wrapped.
+    description: Play counts, ratings, recently-played.
   - name: Playlists
     description: Saved playlists (create, load, modify).
-  - name: Smart Playlists
-    description: Rule-based dynamic playlists (Velvet UI).
   - name: Shared Playlists
     description: Public shareable playlist links.
   - name: File Explorer
@@ -96,32 +99,10 @@ tags:
     description: |
       Per-track lyrics — embedded tag (USLT / Vorbis LYRICS / MP4 ©lyr / APE Lyrics)
       or sibling `.lrc` / `.txt` sidecar files. LRC-format content is parsed into
-      line-timed entries. Optional LRCLib external fallback (opt-in via admin toggle)
-      populates a cache table for tracks with no local lyrics. Subsonic clients get
-      `/rest/getLyrics` + `/rest/getLyricsBySongId`; the Velvet UI uses this endpoint.
-  - name: Subsonic API
-    description: |
-      Subsonic 1.16.1 + OpenSubsonic REST API served at `/rest/<method>` (and the
-      historical `/rest/<method>.view` alias). 61 methods implemented — full spec
-      at <https://opensubsonic.netlify.app/docs/>. See the "Show method list" card
-      in the admin panel for the full list including per-method FULL/STUB status.
-      Auth uses Subsonic's own credential scheme (`u/p`, `u/t/s`, or `apiKey`) —
-      NOT mStream's JWT — so these endpoints are not enumerated individually here.
-  - name: User API Keys
-    description: |
-      Per-user API keys for Subsonic clients that can't send a JWT cookie
-      (DSub, Ultrasonic, Substreamer, etc.). Mint via the mStream UI; the key
-      becomes the `apiKey` query param on every `/rest/*` call.
-  - name: Cue Points
-    description: Bookmarks/markers within tracks.
-  - name: User Settings
-    description: Client-persisted preferences and queue state.
+      line-timed entries. The post-scan backfill worker (see Admin - Lyrics) fills in
+      lyrics for tracks that have none locally. The web UI uses this endpoint.
   - name: Scrobbler - Last.fm
     description: Last.fm scrobbling integration.
-  - name: Scrobbler - ListenBrainz
-    description: ListenBrainz scrobbling integration.
-  - name: Discogs
-    description: Discogs lookup for album art and metadata.
   - name: Server Playback
     description: Proxy to the bundled Rust audio player.
   - name: Jukebox
@@ -144,18 +125,24 @@ tags:
     description: SSL certificate management.
   - name: Admin - Logs
     description: Server log download.
-  - name: Admin - Discogs
-    description: Discogs API credentials.
   - name: Admin - Shared
     description: Shared-playlist administration.
   - name: Admin - File Explorer
     description: Unrestricted filesystem browsing (admin only).
-  - name: Admin - Subsonic
+  - name: Admin - Lyrics
     description: |
-      Subsonic-specific admin widgets: mode toggle (disabled / same-port /
-      separate-port), live now-playing strip, jukebox status, token-auth
-      attempts log, per-user API-key minting, lyrics-cache (LRCLib) config +
-      stats.
+      Lyrics backfill settings (config.lyrics; live, no reboot) and the
+      read-only lyrics_cache ledger the backfill worker keeps, with its
+      purge control.
+  - name: Discovery
+    description: |
+      The local sonic-similarity index built from discovery embeddings
+      (`scanOptions.collectDiscoveryData`; the analysis worker fills it in
+      after each scan). Every route here resolves file paths against the
+      caller's own libraries and answers a uniform `404 Track not found`
+      for anything it cannot resolve, so library names can't be probed;
+      `403 Discovery is disabled` when collection is off or nothing has
+      been embedded yet.
   - name: Federation
     description: |
       Ticket-paired read-only library sharing between mStream servers over a
@@ -165,6 +152,11 @@ tags:
       server's endpoint address plus the key. A peer authenticates every
       HTTP request with the `x-federation-key` header and is restricted to a
       read-route allowlist within the granted libraries.
+
+      A key holder may also fetch **guest tokens** for its own devices
+      (`POST /api/v1/federation/guest`; docs/federation-guest-ticket.md) so
+      a device dials this server directly instead of through the holder's
+      proxies — the parent side of that is `GET /api/v1/federation/peers/{id}/access`.
   - name: Torrent
     description: |
       User-facing torrent feature. Operators upload `.torrent` files or
@@ -291,8 +283,8 @@ components:
                 may be a raw key name ("A minor"), a Camelot code
                 ("8A"), or an enharmonic spelling ("Am"). Clients
                 that need canonicalisation should run the value
-                through `toCamelot()` (see the velvet helper or the
-                server-side `CAMELOT_TO_KEYS` map).
+                through `toCamelot()` (see the server-side
+                `CAMELOT_TO_KEYS` map).
 
                 Field name is kebab-case on the wire to match the
                 other multi-word fields here (`album-art`,
@@ -303,8 +295,8 @@ components:
               type: integer
               nullable: true
               description: |
-                Audio bitrate in bits per second. (The Subsonic API reports
-                this as kbps.) Populated by both scanners; null on rows
+                Audio bitrate in bits per second (divide by 1000 for the
+                kbps figure clients display). Populated by both scanners; null on rows
                 scanned before that change until a force-rescan.
             format:
               type: string
@@ -940,12 +932,40 @@ paths:
   /api:
     get:
       tags: [System]
-      summary: API version discovery
-      description: Returns the server version and the list of available API versions.
-      security: []
+      summary: Layered server info (version, capabilities, boot payload)
+      description: |
+        The authenticated server-info endpoint, layered by who is asking:
+
+        * **Base** (every authenticated response): `server` (the
+          version), `apiVersions`, and `features` — server-wide
+          capability facts (transcode, supportedAudioFiles, discovery,
+          discoveryP2p, discoveryReady).
+        * **`user`** — identity plus the CALLER-SCOPED half of the ping
+          boot payload (vpaths, permission flags, federationDiscovery,
+          federationBrowse, vpathMetaData). Unlike ping, no `playlists` (fetch those from
+          the playlist routes) and no `discoveryPath` (always identical
+          to `discovery` on servers new enough to have this endpoint).
+        * **`admin`** — cheap support/debug facts (uptime, runtime
+          versions, DB schema version). Never present for federation
+          keys or jukebox sessions — and never while the admin API is
+          locked (`lockAdmin`): an admin account then still shows
+          `user.admin: true` (identity) but no `admin` object, which is
+          how a client tells "locked" from "not an admin".
+
+        **The 401 is part of the contract**: a request with no (or an
+        invalid) token on a server that has users returns `401` — mobile
+        clients probe this endpoint tokenless to decide whether to show
+        a login form, exactly as they always have with `/api/v1/ping`.
+        On a no-users server (public-access mode) the probe returns
+        `200` with all applicable layers. Share tokens cannot call this
+        route (`401`). Federation keys reach it via their route
+        allowlist and receive the version plus their granted-library
+        view (`403` on any route off that allowlist).
+
+        Supersedes `/api/v1/ping` for new clients.
       responses:
         "200":
-          description: Version info.
+          description: Layered server info.
           content:
             application/json:
               schema:
@@ -957,17 +977,129 @@ paths:
                   apiVersions:
                     type: array
                     items: { type: string }
+                  features:
+                    type: object
+                    description: >
+                      Server-wide capability facts a client can gate UI on
+                      without an extra round-trip. Config and capability
+                      facts only: no counts, no library or content names,
+                      no identity.
+                    properties:
+                      discoveryReady:
+                        type: boolean
+                        description: >
+                          Whether a sonic-similarity query would find anything
+                          right now. Distinct from the `discovery` flag, which
+                          reports only that the feature is enabled: a server
+                          can have discovery on with an unfinished scan, in
+                          which case similarity queries fail against an empty
+                          pool. A boolean rather than a count because this
+                          layer is public.
+                      discovery:
+                        type: boolean
+                        description: Sonic-similarity collection is enabled.
+                      discoveryP2p:
+                        type: boolean
+                        description: The discovery network feature is enabled.
+                      transcode:
+                        description: >
+                          false when unavailable; otherwise the server's
+                          transcode defaults.
+                        oneOf:
+                          - type: boolean
+                            enum: [false]
+                          - type: object
+                            properties:
+                              defaultCodec: { type: string }
+                              defaultBitrate: { type: string }
+                      supportedAudioFiles:
+                        type: object
+                        description: Per-format booleans from config.
+                        additionalProperties: { type: boolean }
+                  user:
+                    type: object
+                    description: >
+                      Present only for authenticated callers. The
+                      caller-scoped half of the ping boot payload (vpaths,
+                      permission flags, federationDiscovery,
+                      federationBrowse, federationDirect, federationInbox,
+                      vpathMetaData)
+                      plus the identity fields below.
+                    properties:
+                      username: { type: string }
+                      admin: { type: boolean }
+                      federation:
+                        type: boolean
+                        description: True when authenticated by a federation key (or a guest token of one).
+                      federationGuest:
+                        type: boolean
+                        description: True when authenticated by a federation guest token rather than the key itself.
+                      federationDirect:
+                        type: boolean
+                        description: >
+                          This build offers `GET /api/v1/federation/peers/{id}/access`
+                          and there is at least one peer to reach. Same value as
+                          federationBrowse; whether a given peer cooperates is
+                          answered per peer by the access route.
+                      federationInbox:
+                        type: integer
+                        description: >
+                          Federation requests waiting on this operator: inbound
+                          rows still in the `received` state, the number the
+                          admin panel's Requests badge shows. A number only for
+                          an admin, on an unlocked admin API, of a
+                          federation-enabled server; everyone else reads 0. The
+                          key's presence says the build has the requests
+                          feature (schema V67).
+                  admin:
+                    type: object
+                    description: >
+                      Present only for admin callers, and only while the
+                      admin API is unlocked.
+                    properties:
+                      uptime:
+                        type: integer
+                        description: Server process uptime in whole seconds.
+                      nodeVersion: { type: string }
+                      platform: { type: string }
+                      dbSchemaVersion:
+                        type: integer
+                        description: The live database's PRAGMA user_version.
               example:
-                server: "6.4.2"
+                server: "6.22.0"
                 apiVersions: ["1"]
+                features:
+                  discoveryReady: true
+                  discovery: true
+                  discoveryP2p: false
+                  transcode: false
+                  supportedAudioFiles: { mp3: true, flac: true }
+        "401":
+          description: >
+            No token (on a server with users), an invalid token or
+            federation key, or a share token. The tokenless 401 is the
+            login-required signal clients probe for.
+        "403":
+          description: Valid federation key, but the route is off its allowlist.
 
   /api/v1/ping:
     get:
       tags: [System]
-      summary: Bootstrap payload
+      summary: Bootstrap payload (deprecated — use GET /api)
+      deprecated: true
       description: |
         Returns everything the webapp needs on load: the user's libraries, their playlists,
         transcode capabilities, and server-level flags. Called once after login.
+
+        **Deprecated**: new clients should use the layered `GET /api`
+        endpoint instead — this flat payload is split there into the
+        caller-scoped `user` object and the public `features` object
+        (transcode, supportedAudioFiles, discovery, discoveryP2p), and
+        two legacy fields exist only here: `playlists` (playlist-route
+        territory) and `discoveryPath` (always identical to
+        `discovery`). This route is kept indefinitely for existing
+        clients and is composed from the same builders as `GET /api`, so
+        the two cannot drift.
       responses:
         "200":
           description: Bootstrap info.
@@ -1006,6 +1138,35 @@ paths:
                       properties:
                         type: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/scan/progress:
+    get:
+      tags: [System]
+      summary: Per-library scan progress
+      description: |
+        One entry per running scan, filtered to the libraries the caller
+        can see. Admins additionally see the pre-library "counting" phase
+        (reported with `vpath: "Scanning…"`) before the scanner has
+        assigned a library. `currentFile` is a basename only — absolute
+        server paths are never exposed here. Authenticated, not admin-only.
+      responses:
+        "200":
+          description: Progress entries — one per running scan.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    vpath: { type: string }
+                    pct:
+                      type: number
+                      nullable: true
+                      description: 0–100, or null until the file count is known.
+                    scanned: { type: integer }
+                    expected: { type: integer, nullable: true }
+                    currentFile: { type: string, nullable: true }
 
   # ── Auth ─────────────────────────────────────────────────────────────────
 
@@ -1266,34 +1427,6 @@ paths:
                     items: { $ref: "#/components/schemas/Album" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
-  /api/v1/db/artists-albums-multi:
-    post:
-      tags: [Library]
-      summary: List albums across several artists
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [artists]
-              properties:
-                artists:
-                  type: array
-                  items: { type: string }
-      responses:
-        "200":
-          description: Albums.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  albums:
-                    type: array
-                    items: { $ref: "#/components/schemas/Album" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-
   /api/v1/db/albums:
     get: &albumsOp
       tags: [Library]
@@ -1410,182 +1543,14 @@ paths:
                 items: { $ref: "#/components/schemas/Metadata" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
-  /api/v1/db/genre-groups:
-    get:
-      tags: [Library]
-      summary: Genre groups (Velvet)
-      description: Alternative genre listing used by the Velvet UI.
-      responses:
-        "200":
-          description: Genres with counts.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  genres:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        genre: { type: string }
-                        count: { type: integer }
-                  groups: { type: object, nullable: true }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-
-  /api/v1/db/genre/albums:
-    post:
-      tags: [Library]
-      summary: Albums in a genre (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [genre]
-              properties:
-                genre: { type: string }
-      responses:
-        "200":
-          description: Albums.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  albums:
-                    type: array
-                    items: { $ref: "#/components/schemas/Album" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-
-  /api/v1/db/genre/songs:
-    post:
-      tags: [Library]
-      summary: Songs in a genre (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [genre]
-              properties:
-                genre: { type: string }
-      responses:
-        "200":
-          description: Tracks.
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/Metadata" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-
-  /api/v1/db/decades:
-    get:
-      tags: [Library]
-      summary: List decades (Velvet)
-      responses:
-        "200":
-          description: Decades with counts.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  decades:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        decade: { type: integer }
-                        cnt: { type: integer }
-                        albums: { type: integer }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-
-  /api/v1/db/decade/albums:
-    post:
-      tags: [Library]
-      summary: Albums in a decade (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [decade]
-              properties:
-                decade: { type: integer }
-      responses:
-        "200":
-          description: Albums.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  albums:
-                    type: array
-                    items: { $ref: "#/components/schemas/Album" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-
-  /api/v1/db/decade/songs:
-    post:
-      tags: [Library]
-      summary: Songs in a decade (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [decade]
-              properties:
-                decade: { type: integer }
-      responses:
-        "200":
-          description: Tracks.
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/Metadata" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-
-  /api/v1/db/songs-by-artists:
-    post:
-      tags: [Library]
-      summary: Random tracks by the given artists (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [artists]
-              properties:
-                artists:
-                  type: array
-                  items: { type: string }
-                limit: { type: integer }
-      responses:
-        "200":
-          description: Tracks.
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/Metadata" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-
   /api/v1/db/random-songs:
     post:
       tags: [Library]
-      summary: Get a random song (Auto-DJ)
+      summary: Get random songs (Auto-DJ)
       description: |
-        Returns one random song. With no body fields set, behaves like the
-        pre-V32 route — pick a random track from everything the user can see.
+        Returns one random song by default, or up to `limit` of them. With
+        no body fields set, behaves like the pre-V32 route — pick a random
+        track from everything the user can see.
 
         When any BPM / key / artist filter is set the server runs a
         fallback waterfall that progressively relaxes constraints until
@@ -1610,10 +1575,29 @@ paths:
           5b. similar (drop `ignoreArtists` cooldown — only if set)
           6-10. the non-similar chain above
 
-        After the SQL-side waterfall, a tier filter sorts the surviving
+        After the SQL-side waterfall, a tier ranking sorts the surviving
         rows so an in-range pick wins over an unknown-tag pick wins over
-        a known-wrong pick. The route always returns exactly one song
-        (or 400 if scope is empty).
+        a known-wrong pick. With `limit` omitted the route returns exactly
+        one song (or 400 if scope is empty).
+
+        **Batches.** `limit` (1..25, default 1) asks for several songs in
+        one call. They are distinct, served from the front of the same
+        ranking — best tier first, then songs not in the `ignoreList`
+        before repeats — and every one of them is appended to the returned
+        `ignoreList`. A batch can be SHORTER than `limit`: when fewer
+        candidates are in scope, or when the waterfall step that wins holds
+        fewer matches. The chain deliberately never pads a batch from a
+        more relaxed step, so the tail of a batch satisfies the same
+        constraints as its head. The always-on filters (`genres`, the
+        duration window, the sonic pool) apply to every song in a batch.
+
+        `genres` and the `minDuration` / `maxDuration` window are
+        ALWAYS-ON base conditions rather than waterfall steps: every
+        query the route runs carries them, including the terminal
+        unrestricted step. An over-narrow one therefore 400s instead of
+        being relaxed away — that is deliberate, since "only these
+        genres" and "nothing under two minutes" are promises a relaxed
+        pick would break.
 
         Musical keys are Camelot codes (`1A`..`12B`). The server expands
         each code to all known raw-key spellings — `8A` matches stored
@@ -1629,11 +1613,46 @@ paths:
         or `BPM` / `KEY` / `INITIALKEY` (Vorbis) tags.
 
         `ignoreList` is a round-trip cursor — the server returns an
-        updated list with the just-picked index appended, and clients
-        echo it back on the next call to deduplicate across a session.
-        The server trims older entries automatically when the list
-        exceeds ~half the candidate-pool size; clients don't need to
-        prune it themselves. Capped at 500 entries.
+        updated list with every just-served track id appended (newest
+        last), and clients echo it back on the next call to deduplicate
+        across a session. The server keeps only the newest 50 entries;
+        clients don't need to prune it themselves. Accepted up to 500
+        entries. Entries are server-issued track ids, meaningful only on
+        the server that issued them, and the cooldown is soft: once the
+        list covers every candidate (or leaves fewer than a batch needs)
+        the server fills in from the full pool again rather than
+        answering 400.
+
+        **Sonic similarity** (`similarTo` or `similarToVector`, with
+        `minSimilarity`) narrows the pool to analyzed tracks whose cosine
+        similarity to the seed is at least `minSimilarity`. The seed is
+        one to eight of the caller's own file paths, whose embeddings are
+        averaged into a session centroid, OR a raw vector in this
+        library's model space (`similarToVector`: base64 of `dim` ×
+        float32 little-endian, re-normalized server-side, with
+        `similarToModelId` naming the model it came from). The two forms
+        are mutually exclusive. The sonic pool is a HARD base condition
+        like `genres` — the BPM / key waterfall relaxes within it, never
+        past it — so an over-tight `minSimilarity` 400s with "No songs
+        within the similarity range match criteria". File-path seeds are
+        dropped from the pool; a vector seed excludes nothing, so a client
+        that must not replay what is playing keeps that guard itself (the
+        `ignoreList` cooldown is soft, see above). Requires discovery
+        (`403` otherwise); a seed path that does not resolve is a uniform
+        `404`; a seed that resolves but has no vector yet is `400 Sonic
+        seed track has not been analyzed yet`; a vector from another model
+        is `400 Sonic seed is from model 'X', this library is indexed with
+        'Y'`. Read a track's vector out with
+        `POST /api/v1/discovery/local/embeddings`. The response then
+        carries a `sonic` block with the pick's actual similarity.
+
+        On the federation read allowlist: a paired server may call this
+        with its key (the webapp reaches a peer's copy through
+        `POST /api/v1/federation/peers/{id}/api/api/v1/db/random-songs`).
+        The pool is scoped to the key's granted libraries like every other
+        `db/*` route, and `minRating` is ignored for such a caller — a
+        key has no user rows to rate against, so the clause could only
+        empty the pool.
       requestBody:
         content:
           application/json:
@@ -1641,15 +1660,27 @@ paths:
               allOf:
                 - type: object
                   properties:
+                    limit:
+                      type: integer
+                      minimum: 1
+                      maximum: 25
+                      default: 1
+                      description: |
+                        How many songs to return. Distinct, best tier
+                        first, fresh before repeats; may come back short
+                        when fewer candidates are in scope or the winning
+                        waterfall step holds fewer matches (see above).
+                        Every served song is appended to `ignoreList`.
                     minRating: { type: integer, minimum: 0, maximum: 10 }
                     ignoreList:
                       type: array
                       maxItems: 500
                       items: { type: integer, minimum: 0 }
                       description: |
-                        Indices of recently-picked tracks to skip. Echo
-                        back the `ignoreList` from the previous response
-                        unchanged; the server appends + trims.
+                        Server-issued track ids of recently served songs
+                        to skip. Echo back the `ignoreList` from the
+                        previous response unchanged; the server appends +
+                        trims.
                     bpmRanges:
                       type: array
                       maxItems: 16
@@ -1692,7 +1723,7 @@ paths:
                         Camelot codes (`1A`..`12B`). Each code is
                         expanded server-side to all spellings the DB
                         might contain ("A minor" / "Am" / "Amin" / `8A`).
-                        Sending only unrecognised codes returns 403; an
+                        Sending only unrecognised codes returns 400; an
                         empty / omitted array disables the filter.
                       items: { type: string }
                     requireMusicalKey:
@@ -1748,10 +1779,88 @@ paths:
                         `track_genres` rows are BLOCKED. `blacklist`
                         skips tracks with any matching genre; tracks
                         with no `track_genres` rows are ALLOWED.
+                    minDuration:
+                      type: number
+                      minimum: 0
+                      maximum: 86400
+                      description: |
+                        Lower bound of the track-length window, in
+                        SECONDS (the units of `tracks.duration` and of
+                        the `duration` field in the response). `0` or
+                        omitted means no lower bound. Like `genres`
+                        this is an ALWAYS-ON base condition — the
+                        waterfall never relaxes it, so an over-narrow
+                        window produces a 400 rather than a pick
+                        outside the window.
+                    maxDuration:
+                      type: number
+                      minimum: 0
+                      maximum: 86400
+                      description: |
+                        Upper bound of the track-length window, in
+                        SECONDS. `0` or omitted means no upper bound.
+                        Independent of `minDuration` — send either,
+                        both, or neither. Sending both with
+                        `minDuration` > `maxDuration` returns 400.
+                    allowUnknownDuration:
+                      type: boolean
+                      default: false
+                      description: |
+                        NULL-handling for the track-length window.
+                        Default `false` EXCLUDES tracks whose
+                        `duration` the scanner never read — a track of
+                        unknown length can't be shown to satisfy the
+                        window, the same rule the BPM/key filters and
+                        the genre whitelist already apply. Set `true`
+                        to let unknown-length tracks through alongside
+                        the in-range ones, which matters on partially
+                        scanned libraries where excluding them shrinks
+                        the pool more than intended. Ignored when
+                        neither bound is set.
+                    similarTo:
+                      type: array
+                      minItems: 1
+                      maxItems: 8
+                      description: |
+                        Sonic seed as file paths in the caller's own
+                        libraries (vpath form, e.g.
+                        `music/Artist/Album/01 - Song.mp3`). Several are
+                        averaged into one centroid. Requires
+                        `minSimilarity`; mutually exclusive with
+                        `similarToVector`. Uniform `404` when any path
+                        does not resolve.
+                      items: { type: string }
+                    similarToVector:
+                      type: string
+                      format: byte
+                      description: |
+                        Sonic seed as a raw vector: base64 of `dim` ×
+                        float32 little-endian in this library's model
+                        space — the wire form
+                        `POST /api/v1/discovery/local/embeddings` returns —
+                        re-normalized server-side. Requires
+                        `similarToModelId` and `minSimilarity`; mutually
+                        exclusive with `similarTo`. Excludes nothing from
+                        the pool by itself.
+                    similarToModelId:
+                      type: string
+                      description: |
+                        The embedding model the vector came from
+                        (`GET /api/v1/federation/health` advertises this
+                        server's as `discovery.modelId`). Must match the
+                        model this library is indexed with, else `400`.
+                    minSimilarity:
+                      type: number
+                      minimum: 0
+                      maximum: 1
+                      description: |
+                        Cosine-similarity floor of the sonic pool (raw
+                        cosine, 0..1). Required with either seed form and
+                        rejected without one.
                 - { $ref: "#/components/schemas/IgnoreVPaths" }
       responses:
         "200":
-          description: One random song that satisfies the (possibly relaxed) constraints.
+          description: Up to `limit` random songs (one by default) that satisfy the (possibly relaxed) constraints.
           content:
             application/json:
               schema:
@@ -1760,67 +1869,123 @@ paths:
                   songs:
                     type: array
                     items: { $ref: "#/components/schemas/Metadata" }
+                    description: |
+                      One entry by default, up to `limit` — possibly
+                      fewer, never more (see the batch notes above).
                   ignoreList:
                     type: array
                     items: { type: integer }
                     description: |
                       Updated cursor: previous request's `ignoreList`
-                      with the just-picked index appended, plus any
-                      server-side trimming. Echo back unchanged on the
-                      next call.
-        "400": { description: "No songs match the criteria, even after the waterfall fully drops them." }
+                      with every served track id appended (newest last),
+                      trimmed to the newest 50. Echo back unchanged on
+                      the next call.
+                  sonic:
+                    type: object
+                    description: |
+                      Present only when a sonic seed was given: how close
+                      the picks actually are, and how large the pool was
+                      before the other filters cut it down.
+                    properties:
+                      similarity:
+                        type: number
+                        nullable: true
+                        description: Cosine similarity of the first song in `songs` to the seed centroid, rounded to 4 decimals (`null` if it has no vector). Kept for single-pick callers; equals `similarities[0]`.
+                      similarities:
+                        type: array
+                        items: { type: number, nullable: true }
+                        description: One cosine similarity per entry of `songs`, in the same order, rounded to 4 decimals.
+                      poolSize:
+                        type: integer
+                        description: Analyzed tracks at or above `minSimilarity`, before rating / genre / BPM / key filtering.
+        "400":
+          description: |
+            No songs match the criteria, even after the waterfall fully
+            drops them ("No songs within the similarity range match
+            criteria" when a sonic seed is set). Also request validation
+            (e.g. bpmRange min > max, `musicalKeys` with no recognised
+            Camelot code, `minSimilarity` without a seed, both seed forms
+            at once), a seed track not analyzed yet, no tracks analyzed
+            yet, or `similarToModelId` naming a model other than the
+            library's.
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { description: "Joi validation failed on the request body (e.g. bpmRange min > max, or `musicalKeys` contained no recognised Camelot codes)." }
+        "403": { description: "A sonic seed was given but discovery is disabled on this server (or nothing has been embedded yet)." }
+        "404": { description: "A `similarTo` path does not resolve in the caller's libraries (uniform, so library names can't be probed)." }
 
-  /api/v1/albums/browse:
-    get:
-      tags: [Library]
-      summary: Browse all albums (Velvet)
+  /api/v1/discovery/local/embeddings:
+    post:
+      tags: [Discovery]
+      summary: Read tracks' embedding vectors out
+      description: |
+        The vectors behind sonic similarity, for a client that must carry a
+        seed somewhere this server can't reach: an Auto DJ session spanning
+        several servers reads the vectors of what is playing from the
+        servers that hold those tracks, averages them, and hands the result
+        to each server as `similarToVector` on
+        `POST /api/v1/db/random-songs`. Batched — one round trip per pick
+        beats eight — and capped at 8 to match `similarTo`.
+
+        A path that resolves but has no vector yet comes back with
+        `notAnalyzed: true` and a null embedding, so the caller can tell
+        "wrong path" (uniform `404`) from "wait for the analysis worker".
+
+        On the federation read allowlist: a paired server may call it with
+        its key for paths inside its granted libraries, and the webapp
+        reaches a peer's copy through
+        `POST /api/v1/federation/peers/{id}/api/api/v1/discovery/local/embeddings`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [filePaths]
+              properties:
+                filePaths:
+                  type: array
+                  minItems: 1
+                  maxItems: 8
+                  items: { type: string }
+                  description: File paths in the caller's own libraries (vpath form).
       responses:
         "200":
-          description: Albums and series.
+          description: One entry per requested path, in request order.
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  albums:
+                  model:
+                    type: object
+                    description: The model space every returned vector lives in — send it back as `similarToModelId`.
+                    properties:
+                      id: { type: string }
+                      version: { type: string, nullable: true }
+                  dim:
+                    type: integer
+                    description: float32 count per vector.
+                  tracks:
                     type: array
                     items:
-                      allOf:
-                        - { $ref: "#/components/schemas/Album" }
-                        - type: object
-                          properties:
-                            id: { type: integer }
-                            track_count: { type: integer }
-                            displayName: { type: string }
-                  series:
-                    type: array
-                    items: { type: object }
+                      type: object
+                      properties:
+                        filePath: { type: string }
+                        audioHash:
+                          type: string
+                          nullable: true
+                          description: The track's canonical content hash (audio hash, else file hash).
+                        notAnalyzed:
+                          type: boolean
+                          description: "`true` when the track resolves but the index has no vector for it yet."
+                        embedding:
+                          type: string
+                          format: byte
+                          nullable: true
+                          description: base64 of `dim` × float32 little-endian; `null` when `notAnalyzed`.
+        "400": { description: "Request validation failed (1–8 `filePaths` required)." }
         "401": { $ref: "#/components/responses/Unauthorized" }
-
-  /api/v1/files/art:
-    get:
-      tags: [Library]
-      summary: Get the album art filename for a track
-      parameters:
-        - name: fp
-          in: query
-          required: true
-          schema: { type: string }
-      responses:
-        "200":
-          description: Album art filename.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  file:
-                    type: string
-                    description: Filename in the album-art cache (serve via `/album-art/{file}`).
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "404": { $ref: "#/components/responses/NotFound" }
+        "403": { description: "Discovery is disabled on this server (or nothing has been embedded yet)." }
+        "404": { description: "A path does not resolve in the caller's libraries (uniform)." }
 
   # ── Search ───────────────────────────────────────────────────────────────
 
@@ -2060,210 +2225,6 @@ paths:
                 items: { $ref: "#/components/schemas/Metadata" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
-  /api/v1/db/stats/log-play:
-    post:
-      tags: [Stats]
-      summary: Log a play
-      description: Increments play-count and updates last-played for a track.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [filePath]
-              properties:
-                filePath: { type: string }
-      responses:
-        "200": { $ref: "#/components/responses/EmptySuccess" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-
-  /api/v1/db/stats/reset-play-counts:
-    post:
-      tags: [Stats]
-      summary: Reset play counts for all tracks
-      responses:
-        "200": { $ref: "#/components/responses/EmptySuccess" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-
-  /api/v1/db/stats/reset-recently-played:
-    post:
-      tags: [Stats]
-      summary: Clear recently-played history
-      responses:
-        "200": { $ref: "#/components/responses/EmptySuccess" }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-
-  /api/v1/user/wrapped:
-    get:
-      tags: [Stats]
-      summary: Spotify-style Wrapped stats (Velvet)
-      description: Aggregated listening statistics for a period.
-      parameters:
-        - name: period
-          in: query
-          schema:
-            type: string
-            enum: [weekly, monthly, quarterly, half-yearly, yearly]
-            default: monthly
-        - name: offset
-          in: query
-          description: 0 = current period, 1 = previous, etc.
-          schema:
-            type: integer
-            default: 0
-      responses:
-        "200":
-          description: Wrapped payload.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  period_label: { type: string }
-                  total_plays: { type: integer }
-                  total_listening_ms: { type: integer }
-                  unique_songs: { type: integer }
-                  pause_count: { type: integer }
-                  skip_rate: { type: number }
-                  library_coverage_pct: { type: number }
-                  completion_rate: { type: number }
-                  new_discoveries: { type: integer }
-                  top_songs:
-                    type: array
-                    items: { $ref: "#/components/schemas/Metadata" }
-                  top_artists:
-                    type: array
-                    items: { type: object }
-                  listening_by_hour:
-                    type: array
-                    items: { type: integer }
-                  listening_by_weekday:
-                    type: array
-                    items: { type: integer }
-                  top_listening_day: { type: string }
-                  personality: { type: string }
-                  longest_session: { type: integer }
-                  avg_session_length_ms: { type: number }
-                  fun_facts: { type: array, items: { type: string } }
-                  radio: { type: object }
-                  podcast: { type: object }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-
-  /api/v1/user/wrapped/periods:
-    get:
-      tags: [Stats]
-      summary: Available Wrapped periods (Velvet)
-      responses:
-        "200":
-          description: Periods.
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  type: object
-                  properties:
-                    period: { type: string }
-                    offset: { type: integer }
-                    label: { type: string }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-
-  /api/v1/wrapped/play-start:
-    post:
-      tags: [Stats]
-      summary: Log the start of a play (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [filePath]
-              properties:
-                filePath: { type: string }
-                sessionId: { type: string }
-                source: { type: string }
-      responses:
-        "200":
-          description: Event id (or null if not tracked).
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  eventId:
-                    type: string
-                    nullable: true
-        "401": { $ref: "#/components/responses/Unauthorized" }
-
-  /api/v1/wrapped/play-stop:
-    post:
-      tags: [Stats]
-      summary: Log a play stop (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [eventId, playedMs]
-              properties:
-                eventId: { type: string }
-                playedMs: { type: integer }
-      responses:
-        "200": { $ref: "#/components/responses/EmptySuccess" }
-
-  /api/v1/wrapped/play-end:
-    post:
-      tags: [Stats]
-      summary: Log a natural play end (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [eventId, playedMs]
-              properties:
-                eventId: { type: string }
-                playedMs: { type: integer }
-      responses:
-        "200": { $ref: "#/components/responses/EmptySuccess" }
-
-  /api/v1/wrapped/play-skip:
-    post:
-      tags: [Stats]
-      summary: Log an explicit skip (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [eventId, playedMs]
-              properties:
-                eventId: { type: string }
-                playedMs: { type: integer }
-      responses:
-        "200": { $ref: "#/components/responses/EmptySuccess" }
-
-  /api/v1/wrapped/pause:
-    post:
-      tags: [Stats]
-      summary: Increment pause count (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [eventId]
-              properties:
-                eventId: { type: string }
-      responses:
-        "200": { $ref: "#/components/responses/EmptySuccess" }
-
   # ── Playlists ────────────────────────────────────────────────────────────
 
   /api/v1/playlist/load:
@@ -2438,133 +2399,6 @@ paths:
                     name: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
-  # ── Smart Playlists ──────────────────────────────────────────────────────
-
-  /api/v1/smart-playlists:
-    get:
-      tags: [Smart Playlists]
-      summary: List smart playlists (Velvet)
-      responses:
-        "200":
-          description: Smart playlists.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  playlists:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        id: { type: integer }
-                        name: { type: string }
-                        filters: { type: object }
-                        sort: { type: string }
-                        limit_n: { type: integer, nullable: true }
-    post:
-      tags: [Smart Playlists]
-      summary: Create a smart playlist (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [name]
-              properties:
-                name: { type: string }
-                filters: { type: object }
-                sort: { type: string }
-                limit: { type: integer }
-      responses:
-        "200":
-          description: Created.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  id: { type: integer }
-
-  /api/v1/smart-playlists/{id}:
-    parameters:
-      - name: id
-        in: path
-        required: true
-        schema: { type: integer }
-    put:
-      tags: [Smart Playlists]
-      summary: Update a smart playlist (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                name: { type: string }
-                filters: { type: object }
-                sort: { type: string }
-                limit: { type: integer }
-      responses:
-        "200": { $ref: "#/components/responses/EmptySuccess" }
-    delete:
-      tags: [Smart Playlists]
-      summary: Delete a smart playlist (Velvet)
-      responses:
-        "200": { $ref: "#/components/responses/EmptySuccess" }
-
-  /api/v1/smart-playlists/run:
-    post:
-      tags: [Smart Playlists]
-      summary: Execute a smart-playlist query (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [filters]
-              properties:
-                filters: { type: object }
-                sort: { type: string }
-                limit: { type: integer }
-      responses:
-        "200":
-          description: Matching tracks.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  songs:
-                    type: array
-                    items: { $ref: "#/components/schemas/Metadata" }
-
-  /api/v1/smart-playlists/count:
-    post:
-      tags: [Smart Playlists]
-      summary: Count tracks matching a smart-playlist query (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [filters]
-              properties:
-                filters: { type: object }
-      responses:
-        "200":
-          description: Count.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  count: { type: integer }
-
   # ── Shared Playlists ─────────────────────────────────────────────────────
 
   /shared/{playlistId}:
@@ -2647,39 +2481,6 @@ paths:
                     nullable: true
                   token: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
-
-  /api/v1/share/list:
-    get:
-      tags: [Shared Playlists]
-      summary: List the user's shared playlists (Velvet)
-      responses:
-        "200":
-          description: Share records.
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  type: object
-                  properties:
-                    playlistId: { type: string }
-                    songCount: { type: integer }
-                    expires:
-                      type: integer
-                      nullable: true
-                    createdAt: { type: string }
-
-  /api/v1/share/{id}:
-    delete:
-      tags: [Shared Playlists]
-      summary: Delete a shared playlist (Velvet)
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: string }
-      responses:
-        "200": { $ref: "#/components/responses/EmptySuccess" }
 
   # ── File Explorer ────────────────────────────────────────────────────────
 
@@ -3121,8 +2922,7 @@ paths:
         preferred entry; an empty container's `lyrics` is `[]`.
 
         Scoped to the caller's accessible libraries — a `path` outside them
-        resolves to no track → 404. For the Subsonic ms-offset variant see
-        `getLyricsBySongId`.
+        resolves to no track → 404.
       parameters:
         - name: path
           in: query
@@ -3180,222 +2980,6 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
-  # ── User API Keys ───────────────────────────────────────────────────────
-
-  /api/v1/user/api-keys:
-    get:
-      tags: [User API Keys]
-      summary: List the caller's own Subsonic API keys
-      description: |
-        Returns an array (not a wrapped object) of keys the caller has
-        minted. Key strings are never returned — those are view-once at
-        creation time; after that only id/name/timestamps are visible.
-      responses:
-        "200":
-          description: Keys minted by this user. Key values NOT returned.
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  type: object
-                  properties:
-                    id:         { type: integer }
-                    name:       { type: string }
-                    created_at: { type: string, format: date-time }
-                    last_used:  { type: string, format: date-time, nullable: true }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-    post:
-      tags: [User API Keys]
-      summary: Mint a new Subsonic API key for the caller
-      description: |
-        The key value is returned exactly once in this response — after this
-        request completes, the server only stores a reference and the key
-        cannot be re-displayed. Clients that can't send a JWT cookie (DSub,
-        Ultrasonic, Substreamer, etc.) paste the key into their
-        `password`/`apiKey` field.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [name]
-              properties:
-                name:
-                  type: string
-                  minLength: 1
-                  maxLength: 100
-                  description: Free-form label so the user can tell keys apart. Required.
-      responses:
-        "200":
-          description: One-time view of the freshly-minted key.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [key, name]
-                properties:
-                  key:  { type: string }
-                  name: { type: string }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "403": { description: Validation error (missing/blank `name`). }
-
-  /api/v1/user/api-keys/{id}:
-    delete:
-      tags: [User API Keys]
-      summary: Revoke a Subsonic API key
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: integer }
-      responses:
-        "200": { description: Key revoked. }
-        "401": { $ref: "#/components/responses/Unauthorized" }
-        "404": { description: No such key (or not owned by caller). }
-
-  # ── Cue Points ───────────────────────────────────────────────────────────
-
-  /api/v1/db/cuepoints:
-    get:
-      tags: [Cue Points]
-      summary: List cue points for a track (Velvet)
-      parameters:
-        - name: fp
-          in: query
-          required: true
-          schema: { type: string }
-      responses:
-        "200":
-          description: Cue points.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  cuepoints:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        id: { type: integer }
-                        no: { type: integer }
-                        title: { type: string, nullable: true }
-                        t: { type: number, description: "Position in seconds." }
-                        color: { type: string, nullable: true }
-    post:
-      tags: [Cue Points]
-      summary: Create a cue point (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [filepath, position]
-              properties:
-                filepath: { type: string }
-                position: { type: number, description: "Seconds from start." }
-                label: { type: string }
-                color: { type: string }
-      responses:
-        "200":
-          description: Created.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  id: { type: integer }
-
-  /api/v1/db/cuepoints/{id}:
-    parameters:
-      - name: id
-        in: path
-        required: true
-        schema: { type: integer }
-    put:
-      tags: [Cue Points]
-      summary: Update a cue point (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                position: { type: number }
-                label: { type: string }
-                color: { type: string }
-      responses:
-        "200":
-          description: Success.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  ok: { type: boolean, enum: [true] }
-    delete:
-      tags: [Cue Points]
-      summary: Delete a cue point (Velvet)
-      responses:
-        "200":
-          description: Success.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  ok: { type: boolean, enum: [true] }
-
-  # ── User Settings ────────────────────────────────────────────────────────
-
-  /api/v1/user/settings:
-    get:
-      tags: [User Settings]
-      summary: Get the user's UI preferences (Velvet)
-      responses:
-        "200":
-          description: Prefs and optional queue.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  prefs:
-                    type: object
-                    additionalProperties: { type: string }
-                  queue:
-                    type: array
-                    items: { type: string }
-    post:
-      tags: [User Settings]
-      summary: Save UI preferences / queue (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                prefs:
-                  type: object
-                  additionalProperties: { type: string }
-                queue:
-                  type: array
-                  items: { type: string }
-      responses:
-        "200":
-          description: Success.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  ok: { type: boolean, enum: [true] }
-
   # ── Last.fm ──────────────────────────────────────────────────────────────
 
   /api/v1/lastfm/status:
@@ -3427,11 +3011,6 @@ paths:
                       this, `similar-artists` returns empty and the
                       webapp Auto-DJ "Similar artists" toggle should
                       be disabled.
-                  hasApiKey:
-                    type: boolean
-                    description: |
-                      Duplicate of `serverEnabled` kept for clients
-                      reading the original velvet shape.
                   linkedUser:
                     type: string
                     nullable: true
@@ -3441,44 +3020,6 @@ paths:
                       `POST /api/v1/lastfm/connect`. Used only for
                       personal scrobbling — Auto-DJ similar-artists
                       doesn't depend on this.
-
-  /api/v1/lastfm/connect:
-    post:
-      tags: [Scrobbler - Last.fm]
-      summary: Link Last.fm account (Velvet)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [lastfmUser, lastfmPassword]
-              properties:
-                lastfmUser: { type: string }
-                lastfmPassword: { type: string }
-      responses:
-        "200":
-          description: Linked.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  ok: { type: boolean, enum: [true] }
-
-  /api/v1/lastfm/disconnect:
-    post:
-      tags: [Scrobbler - Last.fm]
-      summary: Unlink Last.fm account
-      responses:
-        "200":
-          description: Unlinked.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  ok: { type: boolean, enum: [true] }
 
   /api/v1/lastfm/test-login:
     post:
@@ -3598,190 +3139,6 @@ paths:
                   scrobble:
                     type: boolean
                     nullable: true
-
-  # ── ListenBrainz ─────────────────────────────────────────────────────────
-
-  /api/v1/listenbrainz/status:
-    get:
-      tags: [Scrobbler - ListenBrainz]
-      summary: ListenBrainz integration status
-      responses:
-        "200":
-          description: Status.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  serverEnabled: { type: boolean }
-                  linked: { type: boolean }
-
-  /api/v1/listenbrainz/connect:
-    post:
-      tags: [Scrobbler - ListenBrainz]
-      summary: Link a ListenBrainz account
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [lbToken]
-              properties:
-                lbToken: { type: string }
-      responses:
-        "200":
-          description: Linked.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  ok: { type: boolean, enum: [true] }
-
-  /api/v1/listenbrainz/disconnect:
-    post:
-      tags: [Scrobbler - ListenBrainz]
-      summary: Unlink ListenBrainz
-      responses:
-        "200":
-          description: Unlinked.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  ok: { type: boolean, enum: [true] }
-
-  /api/v1/listenbrainz/playing-now:
-    post:
-      tags: [Scrobbler - ListenBrainz]
-      summary: Announce now-playing to ListenBrainz
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [filePath]
-              properties:
-                filePath: { type: string }
-      responses:
-        "200":
-          description: Success.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  ok: { type: boolean, enum: [true] }
-
-  /api/v1/listenbrainz/scrobble-by-filepath:
-    post:
-      tags: [Scrobbler - ListenBrainz]
-      summary: Scrobble a completed track to ListenBrainz
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [filePath]
-              properties:
-                filePath: { type: string }
-      responses:
-        "200":
-          description: Success.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  ok: { type: boolean, enum: [true] }
-
-  # ── Discogs ──────────────────────────────────────────────────────────────
-
-  /api/v1/discogs/coverart:
-    get:
-      tags: [Discogs]
-      summary: Search Discogs for album art
-      parameters:
-        - name: artist
-          in: query
-          schema: { type: string }
-        - name: title
-          in: query
-          schema: { type: string }
-        - name: album
-          in: query
-          schema: { type: string }
-        - name: year
-          in: query
-          schema: { type: integer }
-      responses:
-        "200":
-          description: Choices.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  choices:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        releaseId: { type: string }
-                        releaseTitle: { type: string }
-                        year: { type: integer }
-                        thumbB64: { type: string }
-                        coverImage: { type: string }
-
-  /api/v1/deezer/search:
-    get:
-      tags: [Discogs]
-      summary: Search Deezer (part of the Discogs art-lookup flow)
-      parameters:
-        - name: q
-          in: query
-          required: true
-          schema: { type: string }
-      responses:
-        "200":
-          description: Deezer response.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  data:
-                    type: array
-                    items: { type: object }
-
-  /api/v1/discogs/embed:
-    post:
-      tags: [Discogs]
-      summary: Embed album art from Discogs / Deezer / URL
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [filepath]
-              properties:
-                filepath: { type: string }
-                releaseId: { type: string }
-                coverUrl: { type: string }
-      responses:
-        "200":
-          description: Success.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  aaFile: { type: string, description: "Filename of the cached art." }
 
   # ── Server Playback (Rust audio proxy) ───────────────────────────────────
 
@@ -4181,28 +3538,6 @@ paths:
                   year: { type: integer, nullable: true }
                   thumbnail: { type: string, nullable: true }
 
-  /api/v1/ytdl/info:
-    get:
-      tags: [YouTube DL]
-      summary: Velvet-adapter for metadata fetch
-      parameters:
-        - name: url
-          in: query
-          required: true
-          schema: { type: string, format: uri }
-      responses:
-        "200":
-          description: Metadata (field `thumb` not `thumbnail`).
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  title: { type: string, nullable: true }
-                  artist: { type: string, nullable: true }
-                  album: { type: string, nullable: true }
-                  thumb: { type: string, nullable: true }
-
   /api/v1/ytdl/downloads:
     get:
       tags: [YouTube DL]
@@ -4226,37 +3561,6 @@ paths:
                         outputCodec: { type: string }
                         status: { type: string }
                         startTime: { type: integer }
-
-  /api/v1/ytdl/download:
-    post:
-      tags: [YouTube DL]
-      summary: Synchronous YouTube download (Velvet)
-      description: Blocks up to 5 minutes waiting for the download to finish.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [url]
-              properties:
-                url: { type: string, format: uri }
-                title: { type: string }
-                artist: { type: string }
-                album: { type: string }
-                format:
-                  type: string
-                  enum: [mp3, opus, aac]
-      responses:
-        "200":
-          description: Download complete.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  filePath: { type: string }
-                  vpath: { type: string }
 
   # ── Admin - Scanner ──────────────────────────────────────────────────────
 
@@ -4564,7 +3868,6 @@ paths:
                   started: { type: boolean }
         "405": { $ref: "#/components/responses/AdminLocked" }
 
-
   /api/v1/admin/db/scan/all:
     post:
       tags: [Admin - Scanner]
@@ -4594,28 +3897,6 @@ paths:
                 type: object
                 properties:
                   fileCount: { type: integer }
-        "405": { $ref: "#/components/responses/AdminLocked" }
-
-  /api/v1/admin/db/scan/progress:
-    get:
-      tags: [Admin - Scanner]
-      summary: Per-library scan progress (Velvet)
-      responses:
-        "200":
-          description: Progress entries — one per running scan.
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  type: object
-                  properties:
-                    vpath: { type: string }
-                    pct: { type: number }
-                    scanned: { type: integer }
-                    expected: { type: integer, nullable: true }
-                    currentFile: { type: string, nullable: true }
-                    countingFound: { type: boolean }
         "405": { $ref: "#/components/responses/AdminLocked" }
 
   # ── Admin - Users ────────────────────────────────────────────────────────
@@ -4757,24 +4038,23 @@ paths:
       tags: [Admin - Libraries]
       summary: List all libraries
       description: |
-        Returns one of two shapes depending on caller:
-        - Legacy (admin UI): `{ [vpath]: { root, type } }`
-        - Velvet UI: array of `{ name, root, type }` when fetched via the Velvet route.
+        Map keyed by vpath: `{ [vpath]: { id, root, type, followSymlinks } }`.
+        `id` is the numeric `libraries.id`, for flows that address a
+        library by id (e.g. the backup routes).
       responses:
         "200":
           description: Libraries.
           content:
             application/json:
               schema:
-                oneOf:
-                  - type: object
-                    additionalProperties:
-                      type: object
-                      properties:
-                        root: { type: string }
-                        type: { type: string }
-                  - type: array
-                    items: { $ref: "#/components/schemas/Library" }
+                type: object
+                additionalProperties:
+                  type: object
+                  properties:
+                    id: { type: integer }
+                    root: { type: string }
+                    type: { type: string }
+                    followSymlinks: { type: boolean }
         "405": { $ref: "#/components/responses/AdminLocked" }
 
   /api/v1/admin/directory:
@@ -4826,26 +4106,6 @@ paths:
 
   # ── Admin - Config ───────────────────────────────────────────────────────
 
-  /api/v1/admin/lock-api:
-    post:
-      tags: [Admin - Config]
-      summary: Lock or unlock the admin API
-      deprecated: true
-      description: >-
-        Superseded by POST /api/v1/admin/config/admin-access.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [lock]
-              properties:
-                lock: { type: boolean }
-      responses:
-        "200": { $ref: "#/components/responses/EmptySuccess" }
-        "405": { $ref: "#/components/responses/AdminLocked" }
-
   /api/v1/admin/config:
     get:
       tags: [Admin - Config]
@@ -4873,7 +4133,6 @@ paths:
                   maxRequestSize: { type: string }
                   autoBootServerAudio: { type: boolean }
                   rustPlayerPort: { type: integer }
-                  ui: { type: string, enum: [default, velvet] }
                   adminAccess:
                     type: object
                     properties:
@@ -4933,25 +4192,6 @@ paths:
                   type: string
                   pattern: "[0-9]+(KB|MB)"
                   example: "50MB"
-      responses:
-        "200": { $ref: "#/components/responses/EmptySuccess" }
-        "405": { $ref: "#/components/responses/AdminLocked" }
-
-  /api/v1/admin/config/ui:
-    post:
-      tags: [Admin - Config]
-      summary: Switch UI
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [ui]
-              properties:
-                ui:
-                  type: string
-                  enum: [default, velvet]
       responses:
         "200": { $ref: "#/components/responses/EmptySuccess" }
         "405": { $ref: "#/components/responses/AdminLocked" }
@@ -5455,239 +4695,103 @@ paths:
         "404": { description: Library not found. }
         "405": { $ref: "#/components/responses/AdminLocked" }
 
-  # ── Admin - Subsonic ────────────────────────────────────────────────────
-
-  /api/v1/admin/subsonic:
+  # ── Admin - Lyrics ───────────────────────────────────────────────────────
+  /api/v1/admin/lyrics:
     get:
-      tags: [Admin - Subsonic]
-      summary: Current Subsonic config snapshot
+      tags: [Admin - Lyrics]
+      summary: Lyrics backfill settings + cache ledger counters
       responses:
         "200":
-          description: Subsonic mode + port.
+          description: Current config.lyrics values plus the lyrics_cache ledger counters.
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  mode: { type: string, enum: [disabled, same-port, separate-port] }
-                  port: { type: integer }
-        "405": { $ref: "#/components/responses/AdminLocked" }
-
-  /api/v1/admin/subsonic/mode:
-    post:
-      tags: [Admin - Subsonic]
-      summary: Change Subsonic mode (hot-reload)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [mode]
-              properties:
-                mode: { type: string, enum: [disabled, same-port, separate-port] }
-                port: { type: integer, description: "Only required for separate-port." }
-      responses:
-        "200": { description: Updated. Server reboots to apply. }
-        "403": { description: Validation error. }
-        "405": { $ref: "#/components/responses/AdminLocked" }
-
-  /api/v1/admin/subsonic/stats:
-    get:
-      tags: [Admin - Subsonic]
-      summary: Implemented methods, now-playing, lyrics-cache stats
-      responses:
-        "200":
-          description: Stats for the admin panel card.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  methodsImplemented: { type: integer }
-                  methods:
+                  backfill:     { type: boolean, description: Post-scan proactive lookup on/off. }
+                  providers:
                     type: array
-                    items: { type: string }
-                  methodStatuses:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        name:   { type: string }
-                        status: { type: string, enum: [full, stub] }
-                  fullCount: { type: integer }
-                  stubCount: { type: integer }
-                  nowPlaying:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        username: { type: string }
-                        trackId:  { type: integer }
-                        title:    { type: string, nullable: true }
-                        artist:   { type: string, nullable: true }
-                        album:    { type: string, nullable: true }
-                        sinceMs:  { type: integer }
-                  lyrics:
+                    items: { type: string, enum: [lrclib, netease, kugou] }
+                    description: Providers in priority order; the first match wins.
+                  writeSidecar: { type: boolean, description: Also write fetched lyrics to a sibling .lrc / .txt. }
+                  cache:
                     type: object
-                    description: LRCLib cache state + toggles.
+                    description: |
+                      Read-only counters over the lyrics_cache ledger the backfill
+                      worker keeps (one row per looked-up track hash). `total` is
+                      always the sum of the named buckets; `other` catches any
+                      status value the UI doesn't know yet.
                     properties:
-                      lrclibEnabled:       { type: boolean }
-                      writeSidecarEnabled: { type: boolean }
-                      cache:
-                        type: object
-                        properties:
-                          hit:     { type: integer }
-                          miss:    { type: integer }
-                          error:   { type: integer }
-                          pending: { type: integer }
-                          other:   { type: integer }
-                          total:   { type: integer }
-        "405": { $ref: "#/components/responses/AdminLocked" }
+                      hit:     { type: integer }
+                      miss:    { type: integer }
+                      error:   { type: integer }
+                      pending: { type: integer }
+                      other:   { type: integer }
+                      total:   { type: integer }
 
-  /api/v1/admin/subsonic/test:
-    get:
-      tags: [Admin - Subsonic]
-      summary: Ping self via the configured Subsonic endpoint
-      description: |
-        Mints a throwaway API key, hits `/rest/ping` over HTTP, revokes the
-        key, returns the round-trip result. Useful for the "test connection"
-        button in the admin panel.
-      responses:
-        "200":
-          description: Result of the probe.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  ok:             { type: boolean }
-                  latencyMs:      { type: integer }
-                  serverVersion:  { type: string }
-                  reason:         { type: string, description: "Only on failure." }
-                  url:            { type: string }
-
-  /api/v1/admin/subsonic/jukebox:
-    get:
-      tags: [Admin - Subsonic]
-      summary: Live jukebox status (Rust audio backend)
-      description: |
-        Proxies to the bundled mstream-player process for its `/status` and
-        `/queue` endpoints. Returns `{available:false, reason}` if the
-        backend isn't running (autoBootServerAudio disabled or boot failed).
-      responses:
-        "200":
-          description: Status snapshot.
-          content:
-            application/json:
-              schema:
-                oneOf:
-                  - type: object
-                    required: [available]
-                    properties:
-                      available: { type: boolean, enum: [false] }
-                      reason:    { type: string }
-                  - type: object
-                    required: [available]
-                    properties:
-                      available:   { type: boolean, enum: [true] }
-                      playing:     { type: boolean }
-                      paused:      { type: boolean }
-                      position:    { type: number, description: "Seconds." }
-                      duration:    { type: number, description: "Seconds." }
-                      volume:      { type: number, minimum: 0, maximum: 1 }
-                      currentFile: { type: string }
-                      queueLength: { type: integer }
-                      queueIndex:  { type: integer }
-                      shuffle:     { type: boolean }
-                      loopMode:    { type: string, enum: [none, one, all] }
-
-  /api/v1/admin/subsonic/token-auth-attempts:
-    get:
-      tags: [Admin - Subsonic]
-      summary: Recent token-auth rejects
-      description: |
-        mStream stores PBKDF2 hashes so can't support Subsonic token auth
-        (`t=md5(password+salt)`). Clients that try it get an explicit error;
-        each attempt is logged to a ring buffer (process-local, max 50) so
-        the admin can see "DSub at 10.0.0.5 keeps trying, mint them a key."
-      responses:
-        "200":
-          description: Recent attempts, most recent first.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  attempts:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        username: { type: string, nullable: true }
-                        client:   { type: string, nullable: true }
-                        at:       { type: integer, description: ms epoch. }
-                        ua:       { type: string, nullable: true }
-    delete:
-      tags: [Admin - Subsonic]
-      summary: Clear the token-auth-attempts ring buffer
-      responses:
-        "200": { description: Cleared. }
-
-  /api/v1/admin/subsonic/mint-key:
+  /api/v1/admin/lyrics/backfill:
     post:
-      tags: [Admin - Subsonic]
-      summary: Create a Subsonic API key on behalf of another user
+      tags: [Admin - Lyrics]
+      summary: Toggle the post-scan lyrics backfill
+      description: Enabling kicks an immediate pass so the operator sees results without waiting for the next scan.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [username, name]
+              required: [backfill]
               properties:
-                username: { type: string }
-                name:
-                  type: string
-                  minLength: 1
-                  maxLength: 100
-                  description: Key label. Required; distinguishes multiple keys on the same user.
+                backfill: { type: boolean }
       responses:
-        "200":
-          description: The freshly-minted key (view-once).
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [key, name, username]
-                properties:
-                  key:      { type: string }
-                  username: { type: string }
-                  name:     { type: string }
-        "404": { description: User not found. }
-        "403": { description: Validation error (missing `username` or `name`). }
+        "200": { description: Persisted. }
+        "400": { description: Validation error. }
 
-  /api/v1/admin/users/subsonic-password:
+  /api/v1/admin/lyrics/providers:
     post:
-      tags: [Admin - Subsonic]
-      summary: Overwrite a user's password (admin-driven password reset for Subsonic clients)
+      tags: [Admin - Lyrics]
+      summary: Set the lyrics providers, in priority order
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [username, password]
+              required: [providers]
               properties:
-                username: { type: string }
-                password: { type: string, minLength: 1 }
+                providers:
+                  type: array
+                  minItems: 1
+                  items: { type: string, enum: [lrclib, netease, kugou] }
       responses:
-        "200": { description: Password updated. }
+        "200": { description: Persisted. }
+        "400": { description: Validation error (empty list or unknown provider). }
 
-  /api/v1/admin/subsonic/lyrics-cache/purge:
+  /api/v1/admin/lyrics/write-sidecar:
     post:
-      tags: [Admin - Subsonic]
-      summary: Purge the lyrics_cache table
+      tags: [Admin - Lyrics]
+      summary: Toggle writing fetched lyrics to sidecar files
+      description: |
+        When enabled, a successful lookup ALSO writes a sibling `.lrc`
+        (synced) or `.txt` (plain) next to the audio file. Never clobbers an
+        existing sibling. Silent no-op on read-only filesystems.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [writeSidecar]
+              properties:
+                writeSidecar: { type: boolean }
+      responses:
+        "200": { description: Persisted. }
+        "400": { description: Validation error. }
+
+  /api/v1/admin/lyrics/cache/purge:
+    post:
+      tags: [Admin - Lyrics]
+      summary: Purge the lyrics_cache ledger
       requestBody:
         content:
           application/json:
@@ -5711,170 +4815,7 @@ paths:
                 properties:
                   removed: { type: integer }
                   mode:    { type: string }
-        "403": { description: Validation error (invalid mode). }
-
-  /api/v1/admin/subsonic/lyrics-cache/enabled:
-    post:
-      tags: [Admin - Subsonic]
-      summary: Toggle LRCLib external-lookup fallback
-      description: |
-        When disabled, no new LRCLib fetches fire (existing cached hits keep
-        serving — clear them via `/purge`). On the enabled→disabled edge
-        queued-but-not-yet-running jobs are cancelled; in-flight requests
-        complete but their result is dropped.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [enabled]
-              properties:
-                enabled: { type: boolean }
-      responses:
-        "200":
-          description: Toggle persisted; cache rows untouched.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  enabled:       { type: boolean }
-                  cancelledJobs: { type: integer, description: Queue drops when disabling. }
-
-  /api/v1/admin/subsonic/lyrics-cache/write-sidecar:
-    post:
-      tags: [Admin - Subsonic]
-      summary: Toggle LRCLib→sidecar write-back
-      description: |
-        When enabled, a successful LRCLib hit ALSO writes a sibling `.lrc`
-        (synced) or `.txt` (plain) next to the audio file. Never clobbers an
-        existing sibling. Silent no-op on read-only filesystems.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [enabled]
-              properties:
-                enabled: { type: boolean }
-      responses:
-        "200":
-          description: Toggle persisted.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  writeSidecar: { type: boolean }
-
-  # ── Subsonic REST API (handled under /rest/*) ────────────────────────────
-  # The Subsonic API uses its own auth scheme (u/p, u/t/s, or apiKey) and
-  # its own envelope format, so the 61 methods aren't enumerated as mStream
-  # JSON paths here. Spec:
-  #   https://opensubsonic.netlify.app/docs/endpoints/
-  # See the admin panel "API Surface" card for the live list of implemented
-  # methods with FULL/STUB status per method.
-
-  /rest/{method}:
-    get:
-      tags: [Subsonic API]
-      summary: Subsonic / OpenSubsonic dispatch
-      description: |
-        Dispatch on `method` (e.g. `ping`, `getArtists`, `getAlbumList2`,
-        `stream`, `getLyricsBySongId`). Full list at
-        <https://opensubsonic.netlify.app/docs/endpoints/>.
-
-        **Auth is Subsonic-native, NOT mStream JWT**: pass `u=<username>` and
-        one of (`p=<plaintext|enc:HEX>`, `t=<md5(pw+salt)>` + `s=<salt>`, or
-        `apiKey=<opaque>`). JWT cookies are ignored on `/rest/*`.
-
-        `.view` suffix (e.g. `/rest/ping.view`) is also accepted for
-        pre-1.4.0 compatibility.
-      parameters:
-        - name: method
-          in: path
-          required: true
-          schema: { type: string }
-        - name: f
-          in: query
-          schema: { type: string, enum: [json, xml, jsonp], default: xml }
-        - name: u
-          in: query
-          schema: { type: string }
-        - name: p
-          in: query
-          schema: { type: string }
-        - name: t
-          in: query
-          schema: { type: string }
-        - name: s
-          in: query
-          schema: { type: string }
-        - name: apiKey
-          in: query
-          schema: { type: string }
-      responses:
-        "200":
-          description: Subsonic envelope (see `subsonic-response` schema in upstream spec).
-      security: []   # uses its own auth params
-    post:
-      tags: [Subsonic API]
-      summary: Same as GET (Subsonic allows either method on every endpoint)
-      parameters:
-        - name: method
-          in: path
-          required: true
-          schema: { type: string }
-      responses:
-        "200": { description: Subsonic envelope. }
-      security: []
-
-  # ── Admin - Discogs ──────────────────────────────────────────────────────
-
-  /api/v1/admin/discogs/config:
-    get:
-      tags: [Admin - Discogs]
-      summary: Get Discogs configuration
-      responses:
-        "200":
-          description: Config.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  enabled: { type: boolean }
-                  allowArtUpdate: { type: boolean }
-                  allowId3Edit: { type: boolean }
-                  apiKey: { type: string }
-                  apiSecret: { type: string, description: "Masked." }
-        "405": { $ref: "#/components/responses/AdminLocked" }
-    post:
-      tags: [Admin - Discogs]
-      summary: Update Discogs configuration
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                enabled: { type: boolean }
-                allowArtUpdate: { type: boolean }
-                apiKey: { type: string }
-                apiSecret: { type: string }
-      responses:
-        "200":
-          description: Success.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  ok: { type: boolean, enum: [true] }
-        "405": { $ref: "#/components/responses/AdminLocked" }
+        "400": { description: Validation error (invalid mode). }
 
   # ── Federation ───────────────────────────────────────────────────────────
 
@@ -5914,6 +4855,45 @@ paths:
                       modelVersion: { type: string, nullable: true }
                       dim: { type: integer, description: Embedding dimension (float32 count per vector) }
                       analyzedCount: { type: integer, description: Embedded tracks in the index }
+                  guestAccess:
+                    type: boolean
+                    description: This build mints guest tokens (`POST /api/v1/federation/guest`).
+
+  /api/v1/federation/guest:
+    post:
+      tags: [Federation]
+      summary: Mint a guest token for the caller's federation key
+      description: |
+        Called by a paired server (with its `x-federation-key`) over the
+        federation bridge to get a short-lived JWT one of its OWN devices —
+        the mobile app — can dial this server with directly, so the device's
+        bytes stop crossing the holder's home link twice. The standing key
+        never leaves the holder; the device only ever holds the token.
+
+        The token resolves here to the same synthetic read-only user as the
+        key: same library grants, same route allowlist, same bandwidth caps
+        (guests share the key's pool). No TOFU binding — a device dials from
+        an ephemeral endpoint — so expiry (24 h) is the bound; revoking or
+        expiring the key rejects its guests at their next handshake and
+        request and severs their live pipes. See docs/federation-guest-ticket.md.
+
+        Refused (403) for a local user (no key to mint for), for a guest
+        (guests cannot mint guests), and for a key that has never completed
+        the federation handshake (unbound).
+      responses:
+        "200":
+          description: A signed guest token and its expiry.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string, description: "JWT — claims { federationGuest: true, federationKeyId, iat, exp }" }
+                  expiresAt: { type: string, format: date-time }
+        "401":
+          description: Federation is disabled, or the key is unknown or expired.
+        "403":
+          description: Not a federation key, a guest credential, or an unbound key.
 
   /api/v1/federation/discovery/similar:
     post:
@@ -5977,6 +4957,212 @@ paths:
           description: Malformed vector (wrong length for the model space, non-finite values, zero vector, bad base64).
         "403":
           description: Discovery data collection is disabled on this server.
+
+  /api/v1/federation/peers:
+    get:
+      tags: [Federation]
+      summary: Peers this user can browse
+      description: |
+        The read-only projection of the paired servers, for the webapp's
+        Peers panel and the peer roots in the file explorer. Deliberately
+        NOT the admin route's payload: `api_key` and `endpoint_ticket` are
+        credentials and never appear here. Any logged-in user may call it —
+        browsing a peer is not an admin action. Nothing dials, so listing is
+        free; `lastSeen`/`lastStatus` are whatever the last admin
+        test-connection left on the row.
+
+        The ping's `federationBrowse` flag tells a client whether to offer
+        any of this (federation on, at least one peer), so clients never
+        probe.
+      responses:
+        "200":
+          description: The peers, oldest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  peers:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        name: { type: string }
+                        lastSeen: { type: string, nullable: true, description: "Last successful contact (SQLite datetime), or null" }
+                        lastStatus: { type: string, nullable: true, description: "'ok' or an error string from the last test-connection" }
+                        useDiscovery: { type: boolean, description: Whether this server sends the peer similarity queries }
+                        endpointId:
+                          type: string
+                          nullable: true
+                          description: >
+                            The peer's iroh endpoint id (a public key, not a
+                            credential) — lets a client tell that two parents
+                            list the same server. Null when this build cannot
+                            read tickets.
+        "403":
+          description: Federation is disabled on this server.
+
+  /api/v1/federation/peers/{id}/api/{path}:
+    post:
+      tags: [Federation]
+      summary: Run one allowlisted read on a peer
+      description: |
+        The browsing half of federation: executes ONE read against a peer
+        and pipes its answer back, so the webapp can call `db/albums`,
+        `db/artists`, `db/genres`, `db/search`, `db/album-songs`,
+        `db/genre-songs`, `db/recent/added`, `file-explorer`,
+        `db/random-songs` or `discovery/local/embeddings` (the
+        cross-server Auto DJ's pick and seed-vector reads) against a peer
+        with exactly the shapes it uses locally — and `federation/health`
+        to learn the peer's discovery model before asking.
+
+        The requested route is screened against the SHARED inbound allowlist
+        (`api/federation-auth.js`) before anything is dialed — the same
+        table that decides what a peer may ask of US, so the two directions
+        cannot drift. That screen is not the security boundary: the peer
+        re-checks its own copy, and the peer's auth wall plus the grants on
+        our key decide what is actually readable. A path segment of `.` or
+        `..` is rejected outright (400) before the screen or any dial, so a
+        traversal attempt cannot slip past a prefix-allowlisted route.
+
+        Method and path address the PEER's API (e.g.
+        `/api/v1/federation/peers/3/api/api/v1/db/albums`). Query strings
+        are NOT forwarded — the webapp appends this server's `?token=` to
+        its URLs, and that token must never reach a peer. Bodies are
+        re-serialized from the parsed JSON request.
+
+        Takes normal local-user auth and is NOT callable with a federation
+        key, so a peer can never chain proxies through this server.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer }, description: Peer row id }
+        - name: path
+          in: path
+          required: true
+          schema: { type: string }
+          description: "The route ON THE PEER, spanning multiple segments (e.g. api/v1/db/albums)"
+      requestBody:
+        required: false
+        description: Forwarded to the peer as JSON — whatever the target route expects.
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: "The peer's response, status and content-type forwarded verbatim."
+        "400":
+          description: "The path contains a '.' or '..' segment."
+        "403":
+          description: "Federation is disabled, or the route is not on the federation allowlist."
+        "404":
+          description: "Unknown peer id (or the peer answered 404)."
+        "502":
+          description: "Peer unreachable — the dial + response deadline (15s) was exceeded."
+    get:
+      tags: [Federation]
+      summary: Run one allowlisted GET read on a peer
+      description: |
+        The GET half of the browse proxy — the route mirrors the peer's own
+        verb, so GET routes like `db/status` or `federation/health` come
+        through here. Same screening, auth, and error contract as the POST
+        form above.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer }, description: Peer row id }
+        - { name: path, in: path, required: true, schema: { type: string }, description: "The GET route ON THE PEER (e.g. api/v1/federation/health)" }
+      responses:
+        "200":
+          description: "The peer's response, status and content-type forwarded verbatim."
+        "400":
+          description: "The path contains a '.' or '..' segment."
+        "403":
+          description: "Federation is disabled, or the route is not on the federation allowlist."
+        "404":
+          description: "Unknown peer id (or the peer answered 404)."
+        "502":
+          description: "Peer unreachable — the dial + response deadline (15s) was exceeded."
+
+  /api/v1/federation/peers/{id}/art/{path}:
+    get:
+      tags: [Federation]
+      summary: A peer's album art
+      description: |
+        Serves cover art from a peer's `/album-art/<file>`, so rows in a
+        peer view render their real covers instead of the placeholder.
+        `compress` is forwarded (the only query param that is); the local
+        `?token=` authenticates the caller here and is stripped before the
+        dial. Conditional request headers are forwarded, so a cached cover
+        still revalidates with a 304.
+
+        `content-length` is deliberately not copied back: the peer gzips
+        its responses and fetch decompresses them, so the peer's length
+        would describe bytes this server is no longer sending.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer }, description: Peer row id }
+        - { name: path, in: path, required: true, schema: { type: string }, description: Art filename in the PEER's art store }
+        - { name: compress, in: query, required: false, schema: { type: string, enum: [s, m, l] }, description: Forwarded to the peer }
+      responses:
+        "200": { description: The image bytes from the peer. }
+        "304": { description: "Not modified — the peer's answer to a conditional request." }
+        "403": { description: Federation is disabled on this server. }
+        "404": { description: "Unknown peer id, or the peer has no such art file." }
+        "502": { description: "Peer unreachable — the 15s deadline was exceeded." }
+
+  /api/v1/federation/peers/{id}/access:
+    get:
+      tags: [Federation]
+      summary: What a device needs to reach a peer directly
+      description: |
+        Hands a logged-in user what its device needs to reach the peer
+        WITHOUT this server in the path: the peer's endpoint ticket and a
+        guest token the peer minted for this server's key
+        (`POST /api/v1/federation/guest`, called over the bridge). The
+        device dials the ticket on ALPN `mstream/federation/1`, presents
+        the token on the first bi-stream, and authenticates every request
+        inside the pipe with the same token in the ordinary token slots.
+        `directTicket` packages the two as a `mstrfedg1:` guest ticket for
+        the device's native dialer (docs/federation-guest-ticket.md).
+
+        Tokens are cached per peer and re-minted once three quarters of
+        their life is gone, or on `?refresh=1` — for a client whose token
+        the peer just refused (a refresh within seconds of a mint is served
+        from the cache). The key itself never leaves this server.
+
+        A peer that will not mint — an older build, or federation disabled
+        there — is a 200 with `direct: false`, so a client can tell "keep
+        using the proxies" from "the peer is down" (502).
+
+        Takes normal local-user auth and is NOT callable with a federation
+        key or a guest token.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer }, description: Peer row id }
+        - { name: refresh, in: query, required: false, schema: { type: string, enum: ["1", "true"] }, description: Force a fresh mint }
+      responses:
+        "200":
+          description: "Direct-access material, or `direct: false`."
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [direct, endpointTicket, guestToken, expiresAt, directTicket]
+                    properties:
+                      direct: { type: boolean, enum: [true] }
+                      endpointTicket: { type: string, description: "The peer's iroh EndpointTicket" }
+                      endpointId: { type: string, nullable: true, description: "The peer's endpoint id (public key)" }
+                      guestToken: { type: string, description: "JWT the peer signed for this server's key" }
+                      expiresAt: { type: string, format: date-time }
+                      directTicket: { type: string, description: "`mstrfedg1:` envelope of endpointTicket + guestToken" }
+                  - type: object
+                    required: [direct, reason]
+                    properties:
+                      direct: { type: boolean, enum: [false] }
+                      reason: { type: string }
+        "403":
+          description: Federation is disabled on this server.
+        "404":
+          description: Unknown peer id.
+        "502":
+          description: "Peer unreachable — the dial + response deadline (15s) was exceeded, or it answered the mint unexpectedly."
 
   /api/v1/federation/peers/{id}/stream/{path}:
     get:
@@ -6043,6 +5229,7 @@ paths:
                       streamKbps: { type: integer }
                       dailyMb: { type: integer }
                       maxStreams: { type: integer }
+                  acceptRequests: { type: boolean, description: "Whether the federation-requests inbox is open (federation.acceptRequests)" }
         "405": { $ref: "#/components/responses/AdminLocked" }
     post:
       tags: [Federation]
@@ -6191,6 +5378,158 @@ paths:
         "404": { description: Key not found. }
         "405": { $ref: "#/components/responses/AdminLocked" }
 
+  /api/v1/admin/federation/requests:
+    get:
+      tags: [Federation]
+      summary: List federation requests (both directions)
+      description: Every tracked exchange — outbound requests this server composed and inbound ones in its opt-in inbox. `peer_name` and `message` on inbound rows are the sender's self-asserted strings; display them as untrusted (the identity anchor is `peer_endpoint_id`).
+      responses:
+        "200":
+          description: The inbox flag plus request rows, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  acceptRequests: { type: boolean }
+                  requests:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer }
+                        uuid: { type: string }
+                        direction: { type: string, enum: [in, out] }
+                        peer_endpoint_id: { type: string }
+                        peer_name: { type: string, nullable: true }
+                        message: { type: string, nullable: true }
+                        offered_libraries: { type: array, items: { type: string } }
+                        state: { type: string, description: "pending-delivery / delivered / received / accepted / granting / completed / rejected / refused / expired / cancelled / blocked" }
+                        reject_reason: { type: string, nullable: true }
+                        fail_count: { type: integer }
+                        next_attempt_at: { type: string, nullable: true }
+                        minted_key_id: { type: integer, nullable: true }
+                        created_peer_id: { type: integer, nullable: true }
+                        created_at: { type: string }
+                        expires_at: { type: string }
+        "405": { $ref: "#/components/responses/AdminLocked" }
+    post:
+      tags: [Federation]
+      summary: Send a federation request to a discovery peer
+      description: "Composes and queues the request over the discovery DM transport, retrying with backoff until delivered, refused, or expired (14-day TTL). No credential travels in the request — tickets only flow after the peer explicitly accepts. Requires the discovery network AND federation to be enabled. `offerVpaths` is what THIS server will grant back on accept (may be empty for a one-way ask)."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [endpointId]
+              properties:
+                endpointId: { type: string, description: The peer's discovery endpoint id (a catalog row) }
+                message: { type: string, maxLength: 500 }
+                offerVpaths: { type: array, maxItems: 32, items: { type: string } }
+      responses:
+        "200":
+          description: The created request row (state `pending-delivery`).
+        "404": { description: Unknown offered library. }
+        "409": { description: "Feature not enabled, peer blocked, a request to this peer is already live, or the peer already has a live request in YOUR inbox (answer it, or let that exchange finish — one exchange per relationship)." }
+        "405": { $ref: "#/components/responses/AdminLocked" }
+
+  /api/v1/admin/federation/requests/{id}/accept:
+    post:
+      tags: [Federation]
+      summary: Accept an inbox request (mints the key, sends the ticket)
+      description: "Mints a key scoped to the chosen libraries — the limit fields pre-fill from `federation.limits` exactly like a manual mint — and owes the sender a `federation-accept` DM carrying the swap-ready ticket. With `acceptTheirOffer` (default true) the exchange stays open until their grant-back arrives; declining completes it one-way. Requires the federation endpoint to be running."
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [vpaths]
+              properties:
+                vpaths: { type: array, minItems: 1, items: { type: string } }
+                streamKbps: { type: integer, minimum: 0 }
+                dailyMb: { type: integer, minimum: 0 }
+                maxStreams: { type: integer, minimum: 0 }
+                expiresAt: { type: string, format: date-time, nullable: true }
+                acceptTheirOffer: { type: boolean, default: true }
+      responses:
+        "200":
+          description: The updated request row (state `accepted`).
+        "404": { description: Request or library not found. }
+        "409": { description: "Wrong state, federation off, or its endpoint not running." }
+        "405": { $ref: "#/components/responses/AdminLocked" }
+
+  /api/v1/admin/federation/requests/{id}/reject:
+    post:
+      tags: [Federation]
+      summary: Reject an inbox request
+      description: "Marks it rejected, sends a best-effort courtesy DM (with the optional reason), and tombstones the sender for 7 days — new requests from them are dropped without troubling the inbox."
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 200 }
+      responses:
+        "200":
+          description: The updated request row.
+        "404": { description: Request not found. }
+        "409": { description: Wrong state. }
+        "405": { $ref: "#/components/responses/AdminLocked" }
+
+  /api/v1/admin/federation/requests/{id}/cancel:
+    post:
+      tags: [Federation]
+      summary: Withdraw an outbound request
+      description: Cancels a pending or delivered request; a delivered one also gets a best-effort courtesy withdraw DM so the peer's inbox can clear itself.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: The updated request row.
+        "404": { description: Request not found. }
+        "409": { description: Wrong state. }
+        "405": { $ref: "#/components/responses/AdminLocked" }
+
+  /api/v1/admin/federation/requests/{id}:
+    delete:
+      tags: [Federation]
+      summary: Dismiss a finished request record
+      description: Deletes a terminal-state row from the list. Live exchanges must be cancelled or rejected first.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { $ref: "#/components/responses/EmptySuccess" }
+        "404": { description: Request not found. }
+        "409": { description: The request is still live. }
+        "405": { $ref: "#/components/responses/AdminLocked" }
+
+  /api/v1/admin/federation/accept-requests:
+    post:
+      tags: [Federation]
+      summary: Toggle the federation-requests inbox (live)
+      description: "Persists `federation.acceptRequests` and pushes the DM-accept policy down to the discovery sidecar in the same call. Off is the default — the sidecar refuses request DMs at the transport until this opts in. Replies to this server's own outbound requests are unaffected (their window opens automatically while an exchange is live)."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+      responses:
+        "200":
+          description: The stored flag.
+        "405": { $ref: "#/components/responses/AdminLocked" }
+
   /api/v1/admin/federation/peers:
     get:
       tags: [Federation]
@@ -6283,63 +5622,6 @@ paths:
           description: "`{ ok, health?, error?, peer }` — remote failures are reported in-band, not as HTTP errors."
         "404": { description: Peer not found. }
         "405": { $ref: "#/components/responses/AdminLocked" }
-
-  # ── Velvet stubs (not yet implemented) ───────────────────────────────────
-
-  /api/v1/radio/stations:
-    get:
-      tags: [Library]
-      summary: Radio stations (stub)
-      description: Radio isn't implemented yet — always returns `[]`.
-      responses:
-        "200":
-          description: Empty.
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { type: object }
-
-  /api/v1/radio/enabled:
-    get:
-      tags: [Library]
-      summary: Radio enabled flag (stub)
-      responses:
-        "200":
-          description: Status.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  enabled: { type: boolean, enum: [false] }
-
-  /api/v1/radio/schedules:
-    get:
-      tags: [Library]
-      summary: Radio schedules (stub)
-      responses:
-        "200":
-          description: Empty.
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { type: object }
-
-  /api/v1/podcast/feeds:
-    get:
-      tags: [Library]
-      summary: Podcast feeds (stub)
-      description: Podcasts aren't implemented yet.
-      responses:
-        "200":
-          description: Empty.
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { type: object }
 
   # ──────────────────────────────────────────────────────────────────────
   # Torrent — user-facing

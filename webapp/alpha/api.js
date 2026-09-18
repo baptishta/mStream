@@ -57,7 +57,7 @@ const MSTREAMAPI = (() => {
     try {
       return await req('GET', mstreamModule.currentServer.host + 'api/v1/lastfm/status');
     } catch (_) {
-      return { hasApiKey: false, serverEnabled: false, linkedUser: null };
+      return { serverEnabled: false, linkedUser: null };
     }
   };
 
@@ -130,6 +130,14 @@ const MSTREAMAPI = (() => {
     return discoveryReq('api/v1/discovery/local/path', {
       startFilePath, endFilePath, length: length || 14,
     });
+  };
+
+  // The embeddings behind LOCAL tracks (1–8 paths): the seed a federated
+  // Auto DJ session carries to other servers as a vector, since a filepath
+  // only names a row here (mStream #929). Same degrade contract as the
+  // calls above: {disabled:true} on 403, null on any other failure.
+  mstreamModule.discoveryEmbeddings = (filePaths) => {
+    return discoveryReq('api/v1/discovery/local/embeddings', { filePaths });
   };
 
   // POST /api/v1/db/genres → { genres: [{ name, track_count }] }.
@@ -225,6 +233,60 @@ const MSTREAMAPI = (() => {
   mstreamModule.genreSongs = (postObject) => {
     return req('POST', mstreamModule.currentServer.host + 'api/v1/db/genre-songs', postObject);
   }
+
+  ///////////////////// Federation: browsing a PEER's library
+  //
+  // Every call below is the LOCAL call above it, re-pointed at one peer via
+  // the server's browse proxy (src/api/federation-browse.js). Same request
+  // bodies, same response shapes — which is the whole point: a peer view
+  // can reuse the local renderers instead of forking them.
+  //
+  // ignoreVPaths is deliberately NOT forwarded. It names vpaths in OUR
+  // library, and the peer's namespace is its own; the peer already scopes
+  // every answer to the libraries our key was granted.
+
+  function peerReq(peerId, method, apiPath, postObject) {
+    const url = `${mstreamModule.currentServer.host}api/v1/federation/peers/${encodeURIComponent(peerId)}/api/${apiPath}`;
+    return req(method, url, postObject);
+  }
+
+  // The peers this user may browse. Never carries api_key or the endpoint
+  // ticket — that projection is admin-only.
+  mstreamModule.federationPeers = () => {
+    return req('GET', mstreamModule.currentServer.host + 'api/v1/federation/peers', false);
+  };
+
+  // A peer's cover art, through the art proxy. `token` is the LOCAL token
+  // (the proxy strips it before dialing, so it never reaches the peer) —
+  // <img> tags can't set headers, same as every other art URL in the app.
+  mstreamModule.peerArtUrl = (peerId, artFile, compress) => {
+    let url = `${mstreamModule.currentServer.host}api/v1/federation/peers/${encodeURIComponent(peerId)}/art/${encodeURIComponent(artFile)}?`;
+    if (compress) { url += `compress=${encodeURIComponent(compress)}&`; }
+    return url + `token=${encodeURIComponent(mstreamModule.currentServer.token)}`;
+  };
+
+  mstreamModule.peer = {
+    dirparser: (peerId, directory) => peerReq(peerId, 'POST', 'api/v1/file-explorer', { directory }),
+    recursiveScan: (peerId, directory) => peerReq(peerId, 'POST', 'api/v1/file-explorer/recursive', { directory }),
+    search: (peerId, postObject) => peerReq(peerId, 'POST', 'api/v1/db/search', postObject),
+    artists: (peerId, postObject) => peerReq(peerId, 'POST', 'api/v1/db/artists', postObject || {}),
+    albums: (peerId, postObject) => peerReq(peerId, 'POST', 'api/v1/db/albums', postObject || {}),
+    artistAlbums: (peerId, postObject) => peerReq(peerId, 'POST', 'api/v1/db/artists-albums', postObject),
+    albumSongs: (peerId, postObject) => peerReq(peerId, 'POST', 'api/v1/db/album-songs', postObject),
+    genres: (peerId, postObject) => peerReq(peerId, 'POST', 'api/v1/db/genres', postObject || {}),
+    genreSongs: (peerId, postObject) => peerReq(peerId, 'POST', 'api/v1/db/genre-songs', postObject),
+    recentlyAdded: (peerId, limit) => peerReq(peerId, 'POST', 'api/v1/db/recent/added', { limit: limit || 100 }),
+    // Federated Auto DJ (mStream #929). health: the peer's discovery block
+    // (`discovery.modelId`, null when discovery is off there) — a vector
+    // only compares within one model space, so a session screens peers on
+    // it before asking. discoveryEmbeddings: the vectors behind the PEER's
+    // tracks, for anchors that live there. randomSongs: the peer's picker
+    // fed a vector seed; unlike the local call this rejects on a non-2xx
+    // (req()), which the player reads for the model-mismatch 400.
+    health: (peerId) => peerReq(peerId, 'GET', 'api/v1/federation/health'),
+    discoveryEmbeddings: (peerId, filePaths) => peerReq(peerId, 'POST', 'api/v1/discovery/local/embeddings', { filePaths }),
+    randomSongs: (peerId, postObject) => peerReq(peerId, 'POST', 'api/v1/db/random-songs', postObject),
+  };
 
   mstreamModule.searchAlbumArt = (postObject) => {
     return req('POST', mstreamModule.currentServer.host + 'api/v1/album-art/search', postObject);
@@ -398,34 +460,6 @@ const MSTREAMAPI = (() => {
 
   mstreamModule.ping =  () => {
     return req('GET', mstreamModule.currentServer.host + "api/v1/ping", false);
-  }
-
-  // Server info (public endpoint — version + features). Used by the
-  // mobile-clients panel to conditionally show Subsonic UI.
-  mstreamModule.serverInfo = () => {
-    return req('GET', mstreamModule.currentServer.host + "api/", false);
-  }
-
-  // ── Subsonic-specific password (V35) ────────────────────────────────
-  mstreamModule.getSubsonicPasswordStatus = () => {
-    return req('GET', mstreamModule.currentServer.host + "api/v1/user/subsonic-password", false);
-  }
-  mstreamModule.setSubsonicPassword = (password) => {
-    return req('PUT', mstreamModule.currentServer.host + "api/v1/user/subsonic-password", { password });
-  }
-  mstreamModule.clearSubsonicPassword = () => {
-    return req('DELETE', mstreamModule.currentServer.host + "api/v1/user/subsonic-password", false);
-  }
-
-  // ── Subsonic API keys (current user) ────────────────────────────────
-  mstreamModule.listSubsonicApiKeys = () => {
-    return req('GET', mstreamModule.currentServer.host + "api/v1/user/api-keys", false);
-  }
-  mstreamModule.createSubsonicApiKey = (name) => {
-    return req('POST', mstreamModule.currentServer.host + "api/v1/user/api-keys", { name });
-  }
-  mstreamModule.revokeSubsonicApiKey = (id) => {
-    return req('DELETE', mstreamModule.currentServer.host + `api/v1/user/api-keys/${id}`, false);
   }
 
   mstreamModule.logout = () => {

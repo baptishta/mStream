@@ -2,7 +2,7 @@
  * Regression test for issue #561 — public-mode (no-users) library filter.
  *
  * Background: V25 introduced an "anonymous sentinel" user row so per-user
- * tables (user_metadata, playlists, cue_points, …) which all FK NOT NULL
+ * tables (user_metadata, playlists, …) which all FK NOT NULL
  * on users(id) can accept inserts in public mode. auth.js's no-users
  * branch now pins `req.user.id = getAnonymousUserId()` instead of `null`.
  *
@@ -12,8 +12,8 @@
  * lookup `_userLibrariesCache.get(sentinelId)` returned `[]` (the sentinel
  * has no rows in user_libraries). Downstream, `libraryFilter()` emitted
  * `clause: '1=0'`, hiding every track from every track-table-driven API
- * (db/status, db/artists, db/albums, all of Subsonic's browse endpoints,
- * etc.) — which is what the issue reporter saw on 6.5.4: "database seems
+ * (db/status, db/artists, db/albums, etc.) — which is what the issue
+ * reporter saw on 6.5.4: "database seems
  * empty now... only file explorer is not empty".
  *
  * This test stands up mStream in true public/no-users mode against an
@@ -50,7 +50,10 @@ function findFreePort() {
   });
 }
 
-async function waitForReady(baseUrl, timeoutMs = 30_000) {
+// 90 s, not 30: the same loaded-CI-runner ceiling test/helpers/server.mjs
+// uses for this wait — under a full parallel `npm test` this boot competes
+// with a dozen others and 30 s was observed to cancel the whole describe.
+async function waitForReady(baseUrl, timeoutMs = 90_000) {
   const start = Date.now();
   let lastErr;
   while (Date.now() - start < timeoutMs) {
@@ -68,13 +71,8 @@ async function bootMstream(tmpDir, musicDir) {
   const config = {
     port,
     address: '127.0.0.1',
-    ui: 'default',
-    // Disable Subsonic + DLNA — we're only testing the default API path.
-    // Subsonic auth is tested separately and the sentinel guard
-    // (subsonic/auth.js excludes is_anonymous_sentinel = 1) means public
-    // mode never even reaches the Subsonic handler chain.
+    // Disable DLNA — we're only testing the default API path.
     dlna:     { mode: 'disabled' },
-    subsonic: { mode: 'disabled' },
     folders:  { testlib: { root: musicDir } },
     storage: {
       albumArtDirectory:   path.join(tmpDir, 'image-cache'),
@@ -101,7 +99,12 @@ async function bootMstream(tmpDir, musicDir) {
     },
   );
   proc.stdout.on('data', () => {});
-  proc.stderr.on('data', () => {});
+  // Keep the tail of stderr: a boot that CRASHED and one that was merely slow
+  // on a loaded runner both end in "fetch failed" at the deadline, and only
+  // the child's own output tells them apart (search-route and the shared
+  // helper in test/helpers/server.mjs do the same).
+  let stderrTail = '';
+  proc.stderr.on('data', (d) => { stderrTail = (stderrTail + d).slice(-4000); });
   const baseUrl = `http://127.0.0.1:${port}`;
   try {
     await waitForReady(baseUrl);
@@ -110,8 +113,10 @@ async function bootMstream(tmpDir, musicDir) {
     // healthy on a loaded runner, and a live orphan's stdio keeps this file's
     // event loop open — the run then hangs at exit instead of reporting the
     // timeout. test/helpers/server.mjs kills on this path for the same reason.
+    const exit = proc.exitCode != null ? `exited with code ${proc.exitCode}` : 'still running, killed';
     try { proc.kill('SIGKILL'); } catch { /* already gone */ }
-    throw err;
+    throw new Error(`${err.message}; child ${exit}; stderr tail:\n${stderrTail.trim() || '(empty)'}`,
+      { cause: err });
   }
   return { proc, baseUrl, port };
 }

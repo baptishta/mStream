@@ -16,7 +16,7 @@
 // migration. The trigger DDL lives in SCHEMA_V31 — grep there.
 // ──────────────────────────────────────────────────────────────────────────
 
-import { lrcToSearchText } from '../api/subsonic/lrc-parser.js';
+import { lrcToSearchText } from '../util/lrc-parser.js';
 import { HASH_GENERATION } from './audio-hash.js';
 
 // Bumped to 42 after rebasing onto master's V36 (tracks.source). The
@@ -81,7 +81,10 @@ import { HASH_GENERATION } from './audio-hash.js';
 // V63 indexes cue_points.library_id and play_events.library_id so the
 // library-delete cascade seeks instead of scanning. See SCHEMA_V63.
 // V64 indexes tracks.year so the DLNA By-Year browse seeks. See SCHEMA_V64.
-export const SCHEMA_VERSION = 66;
+// V69 drops the velvet-only tables (smart_playlists, user_settings,
+// cue_points, play_events) and users.listenbrainz_token — the velvet UI and
+// the API modules that existed only for it were removed. See SCHEMA_V69.
+export const SCHEMA_VERSION = 69;
 
 export const SCHEMA_V1 = `
   -- Users
@@ -1256,6 +1259,9 @@ export const SCHEMA_V34 = `
 //
 // Forward-only, no rescan required, NULL default keeps the migration
 // invisible to anyone not setting a Subsonic password.
+//
+// Dropped again by V68 after the Subsonic API was removed. Kept so a
+// database anywhere in the V35..V67 window still migrates in sequence.
 export const SCHEMA_V35 = `
   ALTER TABLE users ADD COLUMN subsonic_password_encrypted TEXT DEFAULT NULL;
 `;
@@ -2392,6 +2398,114 @@ export const SCHEMA_V66 = `
   SELECT 1;
 `;
 
+// ── Federation requests (V67) ───────────────────────────────────────────────
+//
+// In-network federation requests: an operator who found a server on the
+// public discovery network asks it for a federation pairing over the
+// sidecar's DM transport, and the whole exchange — request, accept +
+// ticket, mutual grant-back — is tracked in one table serving both roles.
+//
+// One row per request per side. `direction` says which role this server
+// plays: 'out' = we composed it (peer_endpoint_id is the recipient),
+// 'in' = it arrived in our inbox (peer_endpoint_id is the sender, and
+// peer_name/message are the sender's SELF-ASSERTED, length-capped strings —
+// display them as untrusted; the identity anchor is the endpoint id).
+//
+// States (TEXT, no CHECK — the state machine lives in
+// src/state/federation-requests.js and new states must not need a
+// migration):
+//   out: pending-delivery → delivered → granting → completed
+//        terminals: rejected | refused | expired | cancelled
+//   in:  received → accepted → granting → completed
+//        terminals: rejected | expired | cancelled (sender withdrew) | blocked
+// 'granting' is the mutual-exchange middle: an OUT row in granting OWES the
+// grant DM (retried via next_attempt_at); an IN row in granting is WAITING
+// for the peer's grant to arrive. fail_count/next_attempt_at drive the
+// retry ladder for whichever DM the row currently owes.
+//
+// offered_libraries is a JSON array of library NAMES: on an OUT row, ours
+// (what we'll grant back on accept); on an IN row, theirs (what the sender
+// says it will grant us). accept_their_offer records the accept-dialog
+// choice so a re-delivered grant after the accept knows whether it was
+// wanted. minted_key_id / created_peer_id link what the exchange produced;
+// SET NULL keeps the audit row alive when a key or peer is later revoked.
+//
+// expires_at is NOT NULL by design: every request carries its TTL from
+// birth (14 days), after which the sweep marks non-terminal rows expired.
+export const SCHEMA_V67 = `
+  CREATE TABLE IF NOT EXISTS federation_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uuid TEXT NOT NULL UNIQUE,
+    direction TEXT NOT NULL CHECK (direction IN ('in', 'out')),
+    peer_endpoint_id TEXT NOT NULL,
+    peer_name TEXT,
+    message TEXT,
+    offered_libraries TEXT NOT NULL DEFAULT '[]',
+    accept_their_offer INTEGER NOT NULL DEFAULT 1,
+    state TEXT NOT NULL,
+    reject_reason TEXT,
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    minted_key_id INTEGER REFERENCES federation_keys(id) ON DELETE SET NULL,
+    created_peer_id INTEGER REFERENCES federation_peers(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_federation_requests_peer
+    ON federation_requests(peer_endpoint_id);
+`;
+
+// V68: drop users.subsonic_password_encrypted. The Subsonic API — and with
+// it the only reader and writer of this column (the protocol's token-auth
+// path and the Subsonic password setters) — was removed, and
+// config.setup() strips `subsonicSecret`, the HKDF input for the column's
+// AES key, from config.json on first boot. What remains is
+// recoverable-password ciphertext nothing can decrypt: the one piece of
+// Subsonic-era schema worth deleting rather than leaving dormant (the
+// star / bookmark / play-queue / api-key tables are generic user state
+// and stay).
+//
+// Plain `ALTER TABLE ... DROP COLUMN` — the same shape as V34 (SQLite
+// ≥3.35; Node ≥22.5 ships ≥3.45). Nothing indexes, references or triggers
+// on the column, so no table rebuild. Forward-only, no rescan. A pre-V68
+// backup restored onto this build simply re-runs the drop.
+export const SCHEMA_V68 = `
+  ALTER TABLE users DROP COLUMN subsonic_password_encrypted;
+`;
+
+// ── V69: velvet UI retirement ──────────────────────────────────────────────
+//
+// The velvet UI (webapp/velvet/) and the API modules mounted only under
+// ui='velvet' were removed in one pass. Four tables and one users column
+// had no reader or writer outside those modules:
+//   smart_playlists          (V4)           smart-playlists.js
+//   user_settings            (V5)           user-settings.js — prefs + saved queue
+//   cue_points               (V6, V63)      cuepoints.js
+//   play_events              (V7, V63, V65) wrapped.js — the listening log
+//   users.listenbrainz_token (V4)           listenbrainz.js
+// They are dropped rather than left dormant: both scanners' move re-homing
+// and the library-delete cascade paid per-table work for them, and an
+// orphaned table is one more thing every later migration has to reason
+// about. play_events rows were real listening history — they die with the
+// feature; a future stats feature starts from an empty log. DROP TABLE
+// takes the V6/V7/V63/V65 indexes with it. DROP COLUMN is the same shape
+// as V68 (SQLite ≥ 3.35; nothing indexes, references or triggers on the
+// column). One thing it does need: SQLite re-parses EVERY trigger while
+// dropping a column, so fts_tracks must exist — always true after V59's
+// hook on a real upgrade, and why test fixtures must replay migrations via
+// applyAllMigrations (hooks included) rather than raw m.sql. Fresh
+// databases still replay V4–V7 before this drop; that is the migration
+// chain's normal shape, not a bug.
+export const SCHEMA_V69 = `
+  DROP TABLE IF EXISTS smart_playlists;
+  DROP TABLE IF EXISTS user_settings;
+  DROP TABLE IF EXISTS cue_points;
+  DROP TABLE IF EXISTS play_events;
+  ALTER TABLE users DROP COLUMN listenbrainz_token;
+`;
+
 export const SCHEMA_V58 = `
   ALTER TABLE federation_peers ADD COLUMN use_discovery INTEGER NOT NULL DEFAULT 1;
 `;
@@ -2409,7 +2523,7 @@ export const SCHEMA_V58 = `
 //
 // tracks.lyrics_search_text is the fix: the plain-words rendition of
 // lyrics_synced_lrc (stamps, header tags, and enhanced-LRC inline stamps
-// stripped by lrcToSearchText — see src/api/subsonic/lrc-parser.js).
+// stripped by lrcToSearchText — see src/util/lrc-parser.js).
 // NULL when the track has no synced lyrics. The searchable value
 // everywhere becomes COALESCE(lyrics_embedded, lyrics_search_text):
 //   - fts_tracks.lyrics (backfill INSERT + the recreated triggers below)
@@ -2619,7 +2733,7 @@ export const MIGRATIONS = [
   // Subsonic-specific password storage so token-auth Subsonic clients
   // can connect. Main PBKDF2 password unchanged. NULL default keeps
   // existing behavior for anyone who hasn't set a Subsonic password.
-  // See SCHEMA_V35 for the design rationale.
+  // See SCHEMA_V35 for the design rationale; V68 drops the column again.
   { version: 35, sql: SCHEMA_V35 },
   // V36 adds tracks.source — open-enum provenance label. The ytdl
   // handler writes 'ytdl' on insert; the scanner backfills from a
@@ -2777,4 +2891,16 @@ export const MIGRATIONS = [
   // INFO, and only a re-parse can backfill the NULLs older builds left.
   // See SCHEMA_V66.
   { version: 66, sql: SCHEMA_V66, rescanRequired: true },
+  // V67 adds the federation_requests table — in-network federation
+  // requests over the discovery DM transport. Pure new table + index, no
+  // rescan. See SCHEMA_V67.
+  { version: 67, sql: SCHEMA_V67 },
+  // V68 drops users.subsonic_password_encrypted — the Subsonic API and
+  // every reader of the column are gone, and the config key that could
+  // decrypt it is stripped on boot. Plain DROP COLUMN, no rescan. See
+  // SCHEMA_V68.
+  { version: 68, sql: SCHEMA_V68 },
+  // V69 drops the velvet-only tables + users.listenbrainz_token. Pure
+  // DROP TABLE / DROP COLUMN, no rescan. See SCHEMA_V69.
+  { version: 69, sql: SCHEMA_V69 },
 ];

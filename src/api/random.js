@@ -21,6 +21,12 @@
 //     (audit M5 — any BPM/key param used to disable bounding, and the
 //     terminal step then materialised the whole library per pick).
 //
+// Orthogonal to both modes are the ALWAYS-ON base conditions — the
+// genre filter, the sonic-similarity pool, and the duration window.
+// The waterfall relaxes BPM/key/artist constraints WITHIN them and
+// never relaxes them, so an over-narrow one 400s rather than serving
+// a pick outside the user's stated promise.
+//
 // The `ignoreList` the client round-trips holds the last-served TRACK
 // IDS (newest last). Pre-rework lists held candidate-set INDICES, which
 // pointed at different tracks on every call as filters and the library
@@ -31,23 +37,36 @@
 // match no candidate row and age out of the capped list within a few
 // picks.
 //
+// `limit` (default 1, capped at PICK_LIMIT_MAX) asks for a batch instead
+// of a single pick. A batch is served from the same bounded pool a pick
+// is: distinct rows, best tier first, fresh (not in the cooldown) before
+// repeats, and every song served advances the ignoreList. It can fall
+// short of `limit` — when fewer candidates are in scope, or when the
+// waterfall step that wins holds fewer matches. The chain deliberately
+// does NOT cascade into a more relaxed step to fill the remainder: the
+// tail of the batch would then break the constraint its head satisfied,
+// and the caller couldn't tell which songs are which.
+//
 // This is step B of the Auto-DJ velvet port. Similar-artists support
 // (the `artists` / `ignoreArtists` filters) is step D and lands in a
 // separate PR — there's no library-aware Last.fm proxy yet, so wiring
 // it here would only test the SQL path.
 
+import { createHash } from 'node:crypto';
+
 import Joi from 'joi';
 import * as db from '../db/manager.js';
 import * as sim from '../db/discovery-similarity.js';
 import { renderMetadataObj, libraryFilter, trackQuery, fetchGenresForTrack } from './db.js';
-import { requireIndex, resolveSeedTrack } from './discovery.js';
+import { requireIndex, resolveSeedTrack, decodeSeedVector } from './discovery.js';
 import { joiValidate } from '../util/validation.js';
 import WebError from '../util/web-error.js';
 
 // ── Camelot → raw-key name expansion ────────────────────────────────────────
 //
 // Clients send Camelot codes (1A, 8B, etc.) because that's what the
-// velvet UI sends and what most DJ-tagged libraries use as the user-
+// Auto-DJ panel sends (a habit inherited from the velvet fork's UI) and
+// what most DJ-tagged libraries use as the user-
 // facing key notation. The DB stores whatever the scanner found
 // verbatim — TKEY frames in the wild are a mix of Camelot codes and
 // raw key names ("A minor", "C major"), with enharmonic spellings
@@ -55,8 +74,9 @@ import WebError from '../util/web-error.js';
 // `musicalKeys: ['8A']` filter matches "A minor" / "Am" / "Amin" /
 // raw "8A" alike.
 //
-// Mirrors velvet's _CAMELOT_TO_KEYS in src/db/sqlite-backend.js — keep
-// in sync if either tree updates the table.
+// Ported from _CAMELOT_TO_KEYS in the velvet fork (aroundmyroom/mStream,
+// its src/db/sqlite-backend.js — a file this tree never had). The fork is
+// no longer tracked, so this table is the only copy to maintain.
 export const CAMELOT_TO_KEYS = Object.freeze({
   '1A':  ['1A', 'Ab minor', 'Abmin', 'G# minor', 'G#min', 'Abm', 'G#m'],
   '1B':  ['1B', 'B major',  'Bmaj',  'B'],
@@ -108,8 +128,8 @@ export function expandCamelotCodes(codes) {
 // random-songs WHERE. Each opts field can be `undefined` / `null` /
 // empty-array, which short-circuits its branch.
 //
-// Mirrors velvet's filter shape in src/db/sqlite-backend.js's
-// _buildRandomWhere — same column references (t.bpm, t.musical_key),
+// Mirrors the filter shape of the velvet fork's _buildRandomWhere (its
+// src/db/sqlite-backend.js) — same column references (t.bpm, t.musical_key),
 // same NULL-exclusion rule (any filter implicitly requires the column
 // to be non-null), same `bpmRanges` OR-fanout. The only structural
 // difference is t.* vs files.* because of the normalised schema.
@@ -192,6 +212,93 @@ export function buildGenreFilter(opts) {
   return { clauses, params };
 }
 
+// ── Duration filter (track-length window) ───────────────────────────────────
+//
+// `minDuration` / `maxDuration` are SECONDS, matching the units of
+// tracks.duration (REAL) and the `duration` field renderMetadataObj
+// puts on the wire. Both bounds are independent and optional — a
+// request can send one, both, or neither.
+//
+// Composed at the BASE-CONDITIONS layer of runRandomSongs alongside
+// the genre filter, so it applies through simple mode AND every
+// waterfall step. Like the genre filter it is "always on" — the
+// waterfall never relaxes it. That's deliberate: "don't play anything
+// under two minutes" is a hard promise (skip interludes, skit tracks,
+// silent outros) in the same way "only these genres" is, and a filter
+// that quietly lapsed on the terminal step would hand the user the
+// exact 30-second interlude they excluded. When nothing survives the
+// route 400s rather than playing out of range.
+//
+// NULL handling is the `allowUnknownDuration` axis:
+//   • false / absent (DEFAULT) — NULL-duration rows are EXCLUDED. A
+//     track whose length the scanner couldn't read can't be shown to
+//     satisfy the bound, and the same reasoning already governs
+//     buildBpmKeyFilter (any BPM/key filter implicitly requires the
+//     column non-null) and the genre whitelist (untagged tracks are
+//     blocked).
+//   • true — NULL-duration rows are ALLOWED through as a third
+//     alternative alongside the range. For libraries the scanner only
+//     partially covers, excluding unknowns can shrink the pool far
+//     more than the user intended; this opts back into "unknown is
+//     fine, just keep the ones I know are wrong out".
+//
+// Both bounds missing → no-op regardless of allowUnknownDuration (an
+// "allow unknowns" flag with no window to apply it to constrains
+// nothing).
+//
+// ── There is deliberately NO index on tracks.duration ───────────────────────
+//
+// The obvious companion to this filter is `CREATE INDEX ... ON
+// tracks(duration)`, mirroring V33's idx_tracks_bpm. It was built,
+// measured against the real route at 100k tracks, and REJECTED —
+// it makes the common case slower. Two runs, phase order reversed the
+// second time to rule out cache warming, median of 25 picks:
+//
+//   window                        with idx   without   ratio
+//   broad  2-6 min   (~86% pass)    99 ms      41 ms    0.41x  ← slower
+//   broad + allowUnknown            99 ms      40 ms    0.40x  ← slower
+//   narrow <60s      (~5% pass)      6.5 ms    15.6 ms  2.41x
+//   very narrow >20m (~1% pass)      1.8 ms    12.4 ms  6.85x
+//
+// The route ends every candidate query in `ORDER BY [tier,] RANDOM()
+// LIMIT n`, which must visit every row passing WHERE. For a selective
+// window the index skips most of the table and wins big; for a broad
+// one the planner still takes it (ANALYZE run, stats present) and pays
+// ~86k index seeks plus row lookups where a sequential scan would do.
+//
+// The trade is backwards: it optimises windows that are already fast in
+// absolute terms (12 ms → 2 ms, on a once-per-song call — worth nothing)
+// and pessimises the slowest, most likely setting. "2 to 6 minutes" is
+// the default mental model for "normal songs". 41 ms unindexed at 100k
+// tracks is fine; 99 ms indexed is a regression for no user-visible gain.
+//
+// If you are about to add that index: re-run the measurement first.
+export function buildDurationFilter(opts) {
+  const clauses = [];
+  const params = [];
+
+  const hasMin = Number.isFinite(Number(opts.minDuration)) && Number(opts.minDuration) > 0;
+  const hasMax = Number.isFinite(Number(opts.maxDuration)) && Number(opts.maxDuration) > 0;
+  if (!hasMin && !hasMax) { return { clauses, params }; }
+
+  const range = [];
+  if (hasMin) { range.push('t.duration >= ?'); }
+  if (hasMax) { range.push('t.duration <= ?'); }
+  // `t.duration IS NOT NULL AND` is redundant in front of a >=/<=
+  // comparison (NULL >= x is NULL, which WHERE treats as false), but
+  // it is kept explicit so the exclude-unknowns intent is readable in
+  // the emitted SQL and in EXPLAIN output.
+  const inRange = `t.duration IS NOT NULL AND ${range.join(' AND ')}`;
+
+  clauses.push(opts.allowUnknownDuration === true
+    ? `(t.duration IS NULL OR (${inRange}))`
+    : `(${inRange})`);
+  if (hasMin) { params.push(Number(opts.minDuration)); }
+  if (hasMax) { params.push(Number(opts.maxDuration)); }
+
+  return { clauses, params };
+}
+
 // ── Artist-scope filter (similar-artists + cooldown) ────────────────────────
 //
 // `artists` is the inclusion set — typically resolved Last.fm
@@ -202,8 +309,8 @@ export function buildGenreFilter(opts) {
 //   • an album_artists.artist_id (album credit — catches the
 //     compilation/various-artists case where tracks belong to many
 //     artists but the album is credited to one named artist)
-// This is the same widening pattern V18 introduced for the Subsonic
-// artist-search route, applied here so DJ similar-artists picks
+// This is the same widening pattern V18 introduced for artist search,
+// applied here so DJ similar-artists picks
 // include collaborations and featured-on appearances.
 //
 // `ignoreArtists` is the cooldown set — names to EXCLUDE so the
@@ -281,7 +388,10 @@ export function buildArtistFilter(opts) {
 // in JS so an in-range row wins over an unknown row wins over a wrong
 // row. Without this, "drop constraint" steps would feed garbage picks
 // to the client.
-function classifyRow(row, opts) {
+//
+// Exported for tests — the SQL twin (buildTierOrderExpr) is checked
+// row-for-row against this classifier.
+export function classifyRow(row, opts) {
   const bpmRanges = opts.bpmRanges;
   const keySet    = opts.keySet;
 
@@ -311,36 +421,37 @@ function classifyRow(row, opts) {
   return 2;
 }
 
-export function applyTierFilter(rows, opts) {
+// Stable sort by tier against the ORIGINAL request constraints: Tier 0
+// rows first, then Tier 1, then Tier 2, each keeping its input order.
+// The waterfall may have dropped the BPM/key constraint at the SQL layer,
+// so a batch is handed out from the front of this ranking — in-range
+// rows before unknown-tag rows before known-wrong rows — and a single
+// pick takes the best row present, exactly as the old best-tier-only
+// filter did. Input order carries the fresh-before-cooled priority (see
+// finalisePick), which the stable sort preserves within a tier.
+export function rankByTier(rows, opts) {
   const haveBpm = Array.isArray(opts.bpmRanges) && opts.bpmRanges.length > 0;
   const haveKey = Array.isArray(opts.musicalKeys) && opts.musicalKeys.length > 0;
-  // No active constraint → no filtering needed.
+  // No active constraint → nothing to rank on.
   if (!haveBpm && !haveKey) { return rows; }
 
   const keySet = haveKey ? new Set(expandCamelotCodes(opts.musicalKeys)) : null;
   const classifyOpts = { bpmRanges: opts.bpmRanges, keySet };
 
-  const tier0 = [];
-  const tier1 = [];
-  const tier2 = [];
+  const tiers = [[], [], []];
   for (const row of rows) {
-    const t = classifyRow(row, classifyOpts);
-    if (t === 0) { tier0.push(row); }
-    else if (t === 1) { tier1.push(row); }
-    else { tier2.push(row); }
+    tiers[classifyRow(row, classifyOpts)].push(row);
   }
-  if (tier0.length > 0) { return tier0; }
-  if (tier1.length > 0) { return tier1; }
-  return tier2;
+  return [...tiers[0], ...tiers[1], ...tiers[2]];
 }
 
 // SQL twin of classifyRow, built against the ORIGINAL request constraints
-// (exactly what the JS applyTierFilter call at the end of runRandomSongs
-// classifies with — tight ranges + expanded key names). Used as the leading
-// ORDER BY term of every bounded waterfall query: rows sort best-tier-first
-// before the RANDOM() tiebreak, so a LIMIT-sized pool provably contains the
-// best tier present in scope and sampling can't starve the tier filter.
-// The JS filter stays the authority — this only shapes what gets sampled.
+// (exactly what the JS rankByTier call in finalisePick classifies with —
+// tight ranges + expanded key names). Used as the leading ORDER BY term of
+// every bounded waterfall query: rows sort best-tier-first before the
+// RANDOM() tiebreak, so a LIMIT-sized pool provably contains the best tier
+// present in scope and sampling can't starve the tier ranking. The JS
+// ranking stays the authority — this only shapes what gets sampled.
 //
 // Emission order matters: params are pushed by the emit* helpers as the
 // template literal evaluates left-to-right, keeping placeholder order and
@@ -421,17 +532,20 @@ function runWaterfallQuery(d, baseSql, baseParams, filterOpts, bounded) {
   // to JS per pick). When the request carries BPM/key constraints,
   // `tierOrder` leads the ORDER BY so the pool always contains the best
   // tier present (see buildTierOrderExpr); the id cooldown is excluded in
-  // SQL first, and when that alone empties the step, the SAME step retries
-  // without it so cooldown exhaustion falls back to repeats WITHIN this
-  // step's constraints (matching finalisePick's fallback).
+  // SQL first, and when that alone leaves the step short of `limit` fresh
+  // rows (with one song asked: empty), the SAME step retries without it so
+  // cooldown exhaustion falls back to repeats WITHIN this step's
+  // constraints (matching finalisePick's fallback). The fresh rows stay in
+  // front of the merged result so the repeats only fill what's left.
   //
   // The retry is skipped for artist-cooldown-ENFORCING steps
-  // (allowRepeatRetry false): their all-cooled rows would be rejected
-  // by the step loop's id-fresh rule anyway (see runRandomSongs), so
-  // returning empty lets the waterfall advance toward the
-  // drop-cooldown step without paying for a query whose result is
-  // discarded.
-  const { ignoreIds, allowRepeatRetry, tierOrder } = bounded;
+  // (allowRepeatRetry false) that came back with NO fresh row: their
+  // all-cooled rows would be rejected by the step loop's id-fresh rule
+  // anyway (see runRandomSongs), so returning empty lets the waterfall
+  // advance toward the drop-cooldown step without paying for a query
+  // whose result is discarded. An enforcing step that has SOME fresh rows
+  // wins regardless, so its batch is topped up like any other step's.
+  const { ignoreIds, allowRepeatRetry, tierOrder, limit } = bounded;
   const orderBy = tierOrder
     ? `ORDER BY ${tierOrder.expr}, RANDOM()`
     : 'ORDER BY RANDOM()';
@@ -444,8 +558,9 @@ function runWaterfallQuery(d, baseSql, baseParams, filterOpts, bounded) {
       .all(...baseParams, ...params, ...(exclude ? ignoreIds : []), ...tierParams);
   };
   const rows = attempt(true);
-  if (rows.length > 0 || ignoreIds.length === 0 || !allowRepeatRetry) { return rows; }
-  return attempt(false);
+  if (rows.length >= limit || ignoreIds.length === 0) { return rows; }
+  if (rows.length === 0 && !allowRepeatRetry) { return rows; }
+  return mergeRows(rows, attempt(false));
 }
 
 // ── Sonic similarity pool (discovery embeddings) ────────────────────────────
@@ -487,18 +602,47 @@ function buildSonicPool(req, body) {
 
   const vecs = [];
   const seedHashes = [];
-  for (const p of body.similarTo) {
-    const row = resolveSeedTrack(req, p, 'random-songs sonic');
-    const canonHash = row.audio_hash || row.file_hash;
-    const entry = canonHash ? index.byHash.get(canonHash) : null;
-    if (!entry) {
-      throw new WebError('Sonic seed track has not been analyzed yet', 400);
+  let seedKey;
+
+  if (body.similarToVector) {
+    // A seed from somewhere this server can't see — the caller averaged the
+    // vectors of what is playing (possibly across several servers) and sent
+    // the result. Nothing downstream of the pool cares where a vector came
+    // from, so only the decode and the model check are new.
+    //
+    // A mismatch is a hard 400 here, unlike the federation peer route's soft
+    // `modelMismatch`. That route answers a RANKING, where "no results" is a
+    // truthful empty answer; this one answers "what do I play next", and
+    // comparing across model spaces would return confident nonsense — tracks
+    // with no real relationship to the seed. The caller is expected to have
+    // read this server's model id first and skip it when it disagrees, so
+    // reaching here at all is a bug worth surfacing.
+    if (body.similarToModelId !== index.modelId) {
+      throw new WebError(
+        `Sonic seed is from model '${body.similarToModelId}', this library is indexed with '${index.modelId}'`, 400);
     }
-    vecs.push(entry.vec);
-    seedHashes.push(canonHash);
+    if (index.dim === null) {
+      throw new WebError('No tracks have been analyzed yet', 400);
+    }
+    vecs.push(decodeSeedVector(index, body.similarToVector));
+    // Content-addressed so the pool cache behaves exactly as it does for the
+    // filepath form: the same vector and threshold hit the same entry.
+    seedKey = `vec:${createHash('sha1').update(body.similarToVector).digest('hex')}`;
+  } else {
+    for (const p of body.similarTo) {
+      const row = resolveSeedTrack(req, p, 'random-songs sonic');
+      const canonHash = row.audio_hash || row.file_hash;
+      const entry = canonHash ? index.byHash.get(canonHash) : null;
+      if (!entry) {
+        throw new WebError('Sonic seed track has not been analyzed yet', 400);
+      }
+      vecs.push(entry.vec);
+      seedHashes.push(canonHash);
+    }
+    seedKey = [...seedHashes].sort().join('|');
   }
 
-  const cacheKey = `${[...seedHashes].sort().join('|')}@${body.minSimilarity}`;
+  const cacheKey = `${seedKey}@${body.minSimilarity}`;
   let perIndex = sonicPoolCache.get(index);
   if (!perIndex) { perIndex = new Map(); sonicPoolCache.set(index, perIndex); }
   const hit = perIndex.get(cacheKey);
@@ -512,6 +656,10 @@ function buildSonicPool(req, body) {
   // The seeds are the session's recent picks (rolling anchor) or the
   // currently-playing song (locked anchor) — Auto-DJ must never answer
   // "what's next" with "the song you just played".
+  //
+  // A vector seed carries no hashes, so this protection does not apply to it
+  // and `ignoreList` becomes the only thing keeping the DJ off the song that
+  // is playing. Callers using similarToVector MUST send one.
   for (const h of seedHashes) { allowed.delete(h); }
   // The JSON form is what the SQL pool constraint binds (json_each) —
   // stringified once here so locked-anchor picks don't re-serialize a
@@ -530,10 +678,21 @@ function buildSonicPool(req, body) {
 // (The Joi wire cap of 500 stays as defense-in-depth headroom.)
 const IGNORE_COOLDOWN_MAX = 50;
 
-// Candidate-pool size for the bounded simple-mode query. The pick is one
-// song; 50 keeps the pool comfortably larger than the cooldown so
-// consecutive picks stay varied even right after a fallback.
-const SIMPLE_POOL_LIMIT = 50;
+// Candidate-pool size for every bounded candidate query (simple mode and
+// each waterfall step). 50 keeps the pool comfortably larger than the
+// cooldown so consecutive picks stay varied even right after a fallback.
+// Exported for the invariant test on PICK_LIMIT_MAX.
+export const SIMPLE_POOL_LIMIT = 50;
+
+// Most songs one request may ask for (`limit`). Two invariants keep a
+// batch cheap and coherent, both pinned by test/integration/random-route.test.mjs:
+//   • ≤ SIMPLE_POOL_LIMIT — one bounded pool always holds a full batch,
+//     so no query grows with the request, and a pool that comes back
+//     short has provably shown every fresh candidate in scope.
+//   • ≤ IGNORE_COOLDOWN_MAX / 2 — a maximal batch still leaves the whole
+//     previous batch in the ignoreList, so back-to-back batches never
+//     repeat each other.
+export const PICK_LIMIT_MAX = 25;
 
 // Sanitize the client's round-tripped ignoreList to track ids we can bind
 // into SQL / compare against rows. Joi already enforces integers >= 0;
@@ -543,13 +702,44 @@ function ignoreIdsFrom(body) {
   return list.filter((n) => Number.isInteger(n) && n >= 0);
 }
 
+// How many songs the request asks for. Joi defaults `limit` to 1 and caps
+// it at PICK_LIMIT_MAX; the clamp here is the same defence-in-depth as
+// ignoreIdsFrom for callers that bypass the route schema.
+function pickLimitFrom(body) {
+  const n = Number(body.limit);
+  if (!Number.isInteger(n) || n < 1) { return 1; }
+  return Math.min(n, PICK_LIMIT_MAX);
+}
+
+// Union of a cooldown-excluding query and its no-exclusion retry over the
+// SAME candidate set: the fresh rows first, then whatever the retry added
+// (all cooled — a first query that came back short of `limit` rows already
+// returned every fresh row in scope, see PICK_LIMIT_MAX). Order matters:
+// finalisePick hands out the front of the list, so repeats only ever fill
+// what fresh rows couldn't.
+function mergeRows(fresh, more) {
+  const seen = new Set(fresh.map((r) => r.id));
+  const out = [...fresh];
+  for (const r of more) {
+    if (seen.has(r.id)) { continue; }
+    seen.add(r.id);
+    out.push(r);
+  }
+  return out;
+}
+
 export function runRandomSongs(req, body) {
   const d = db.getDB();
   if (!d) { throw new WebError('Database not ready', 400); }
 
+  // Batch size — every bounded query's top-up rule and the final pick
+  // honour it (see the header comment).
+  const limit = pickLimitFrom(body);
+
   // Sonic pool first — it can 403/404/400 on its own and there's no point
   // running SQL when the seed itself is bad.
-  const sonic = (Array.isArray(body.similarTo) && body.similarTo.length > 0)
+  const sonic = ((Array.isArray(body.similarTo) && body.similarTo.length > 0)
+      || body.similarToVector)
     ? buildSonicPool(req, body)
     : null;
 
@@ -557,7 +747,12 @@ export function runRandomSongs(req, body) {
   const baseConditions = [filter.clause];
   const baseParams = [...(req.user?.id ? [req.user.id] : []), ...filter.params];
 
-  if (body.minRating && Number(body.minRating) > 0) {
+  // Ratings are per-user. A caller with no user id — a federation key, whose
+  // synthetic user carries none — has no stars to filter on: trackQuery
+  // joins user_metadata on NULL for it, so this clause could only ever
+  // empty the pool. Skip it rather than starve a federated Auto DJ pick
+  // (the webapp never sends it to a peer; a stray one is harmless now).
+  if (body.minRating && Number(body.minRating) > 0 && req.user?.id) {
     baseConditions.push('um.rating >= ?');
     baseParams.push(Number(body.minRating));
   }
@@ -570,6 +765,19 @@ export function runRandomSongs(req, body) {
   if (genre.clauses.length > 0) {
     baseConditions.push(...genre.clauses);
     baseParams.push(...genre.params);
+  }
+
+  // Track-length window — the other ALWAYS-ON base condition (see
+  // buildDurationFilter). Unknown-duration rows are excluded unless the
+  // request opts in via allowUnknownDuration. Both bounds absent → no-op.
+  const duration = buildDurationFilter({
+    minDuration: body.minDuration,
+    maxDuration: body.maxDuration,
+    allowUnknownDuration: body.allowUnknownDuration,
+  });
+  if (duration.clauses.length > 0) {
+    baseConditions.push(...duration.clauses);
+    baseParams.push(...duration.params);
   }
 
   // Playlist files indexed as tracks (supportedAudioFiles m3u) are never
@@ -598,9 +806,9 @@ export function runRandomSongs(req, body) {
   }
 
   // Skip the trackQuery `tg_agg` aggregation for the candidate-set
-  // query — only the picked row's genres survive to the response, and
+  // query — only the picked rows' genres survive to the response, and
   // SQLite MATERIALIZEs the aggregation over the full tracks table
-  // before applying the WHERE clause. finalisePick enriches the
+  // before applying the WHERE clause. finalisePick enriches each
   // chosen row via fetchGenresForTrack so `metadata.genres` is still
   // populated on the wire. Measured ~80% SQL speedup on the smoke DB
   // (52 rows) and extrapolates to ~460ms saved per request at 100k
@@ -636,11 +844,12 @@ export function runRandomSongs(req, body) {
       ).all(...baseParams, ...(exclude ? ignoreIds : []));
     };
     let rows = bounded(true);
-    if (rows.length === 0 && ignoreIds.length > 0) {
-      // Cooldown covers everything in scope — allow repeats rather
-      // than stalling the session (same contract as the waterfall's
-      // drop-cooldown steps).
-      rows = bounded(false);
+    if (rows.length < limit && ignoreIds.length > 0) {
+      // The cooldown leaves fewer fresh songs in scope than asked for
+      // (with one song asked: none at all) — fill the rest with repeats
+      // rather than stalling the session (same contract as the
+      // waterfall's drop-cooldown steps). Fresh rows stay in front.
+      rows = mergeRows(rows, bounded(false));
     }
     if (rows.length === 0) {
       throw new WebError(sonic
@@ -823,7 +1032,7 @@ export function runRandomSongs(req, body) {
     // step).
     const candidate = runWaterfallQuery(
       d, baseSql, baseParams, opts,
-      { ignoreIds, allowRepeatRetry: !enforcesCooldown, tierOrder },
+      { ignoreIds, allowRepeatRetry: !enforcesCooldown, tierOrder, limit },
     );
     if (candidate.length === 0) { continue; }
     if (enforcesCooldown && candidate.every((r) => ignoreSet.has(r.id))) { continue; }
@@ -837,56 +1046,78 @@ export function runRandomSongs(req, body) {
       : 'No songs that match criteria', 400);
   }
 
-  // Apply tier filter against the ORIGINAL request constraints so that
-  // even after the chain drops the SQL filter, in-range rows still win.
-  rows = applyTierFilter(rows, {
+  // Ranked against the ORIGINAL request constraints inside finalisePick,
+  // so that even after the chain drops the SQL filter, in-range rows are
+  // served first.
+  return finalisePick(rows, body, sonic, {
     bpmRanges: body.bpmRanges,
     musicalKeys: body.musicalKeys,
   });
-
-  return finalisePick(rows, body, sonic);
 }
 
-function finalisePick(rows, body, sonic) {
+// Turn the winning candidate rows into the response: the first `limit`
+// rows in priority order, the advanced cooldown, and (sonic mode) the
+// picks' similarities.
+//
+// Priority is tier first, freshness second. The cooldown is soft —
+// best-effort variety — while the tier ranking guards the BPM/key promise
+// the request made, so a recently-served in-range row outranks a never-
+// served unknown-tag row. Within a tier, rows not served recently come
+// first; when the cooldown covers the whole candidate set (tiny library /
+// narrow filters / long session) the repeats fill in — they beat stalling
+// the session. Simple mode already excluded the cooled ids in SQL, so its
+// fresh partition only matters after a repeat top-up; the waterfall passes
+// `tierOpts` so its relaxed steps still serve in-range rows first. Every
+// query behind `rows` ends in RANDOM(), so the front of the ordering is a
+// uniform sample and a single pick is as random as it ever was.
+function finalisePick(rows, body, sonic, tierOpts = null) {
+  const limit = pickLimitFrom(body);
   const sent = ignoreIdsFrom(body);
   const ignoreSet = new Set(sent);
-  // Cooldown: prefer candidates not served recently. When the cooldown
-  // covers the whole candidate set (tiny library / narrow filters / long
-  // session), fall back to the full set — repeats beat stalling the
-  // session. Simple mode already excluded the ids in SQL, so the filter
-  // is a no-op there; waterfall and sonic sets are filtered here.
-  const fresh = rows.filter((r) => !ignoreSet.has(r.id));
-  const pool = fresh.length > 0 ? fresh : rows;
-  const picked = pool[Math.floor(Math.random() * pool.length)];
+  let ordered = [
+    ...rows.filter((r) => !ignoreSet.has(r.id)),
+    ...rows.filter((r) => ignoreSet.has(r.id)),
+  ];
+  if (tierOpts) { ordered = rankByTier(ordered, tierOpts); }
+  const picked = ordered.slice(0, limit);
 
-  // Move-to-end + trim: newest last, bounded, no duplicate of the pick.
+  // Move-to-end + trim: newest last, bounded, no duplicate of any pick.
   // Stale entries (deleted tracks, a pre-rework index-based list) age
   // out through the cap as new picks append.
-  const nextIgnore = sent.filter((id) => id !== picked.id);
-  nextIgnore.push(picked.id);
+  const pickedIds = picked.map((r) => r.id);
+  const pickedSet = new Set(pickedIds);
+  const nextIgnore = sent.filter((id) => !pickedSet.has(id));
+  nextIgnore.push(...pickedIds);
   while (nextIgnore.length > IGNORE_COOLDOWN_MAX) { nextIgnore.shift(); }
 
-  // Enrich the picked row with `genres_concat` so renderMetadataObj
+  // Enrich each picked row with `genres_concat` so renderMetadataObj
   // emits a populated `metadata.genres` field. The candidate-set
-  // query above skipped the LEFT JOIN aggregation for speed; this
-  // single targeted SELECT costs ~10µs and keeps the wire shape
+  // query above skipped the LEFT JOIN aggregation for speed; these
+  // targeted SELECTs cost ~10µs apiece and keep the wire shape
   // contractually identical.
-  const { genres_concat } = fetchGenresForTrack(db.getDB(), picked.id);
-  picked.genres_concat = genres_concat;
+  const d = db.getDB();
+  for (const row of picked) {
+    row.genres_concat = fetchGenresForTrack(d, row.id).genres_concat;
+  }
 
   const out = {
-    songs: [renderMetadataObj(picked)],
+    songs: picked.map((row) => renderMetadataObj(row)),
     ignoreList: nextIgnore,
   };
 
-  // Sonic mode: report the pick's actual cosine vs the seed/centroid (UI
+  // Sonic mode: report each pick's actual cosine vs the seed/centroid (UI
   // display + slider tuning) and how many analyzed tracks are inside the
   // range at all (before the other filters cut it down further).
+  // `similarities` is aligned with `songs`; `similarity` stays the first
+  // song's value so single-pick callers keep reading one number.
   if (sonic) {
-    const similarity = sim.similarityToHash(
-      sonic.index, sonic.seedVec, picked.audio_hash || picked.file_hash);
+    const similarities = picked.map((row) => {
+      const s = sim.similarityToHash(sonic.index, sonic.seedVec, row.audio_hash || row.file_hash);
+      return s === null ? null : Math.round(s * 10000) / 10000;
+    });
     out.sonic = {
-      similarity: similarity === null ? null : Math.round(similarity * 10000) / 10000,
+      similarity: similarities[0],
+      similarities,
       poolSize: sonic.allowed.size,
     };
   }
@@ -934,10 +1165,18 @@ export function setup(mstream) {
     //   • artists/ignoreArtists: Last.fm's `artist.getSimilar` returns
     //                    at most 50 candidates; 100 covers the unioned
     //                    case where multiple callers want extra slack.
-    //   • bpmRanges (and Wide): velvet's UI sends 3 (normal+half+double);
+    //   • bpmRanges (and Wide): the Auto-DJ panel sends 3 (normal+half+double);
     //                    16 is room for future tolerance-window UIs.
     //   • musicalKeys:   24 possible Camelot codes; the cap matches.
     const schema = Joi.object({
+      // How many songs to return — 1 (the default, and the pre-batch wire
+      // shape) up to PICK_LIMIT_MAX. Songs in a batch are distinct, served
+      // best-tier-first and fresh-before-repeats from the same bounded pool
+      // a single pick uses, and every one of them advances the ignoreList.
+      // `songs.length` can fall short of `limit` when fewer candidates are
+      // in scope, or when the waterfall step that wins holds fewer matches
+      // — the chain never cascades into a relaxed step to fill a batch.
+      limit: Joi.number().integer().min(1).max(PICK_LIMIT_MAX).default(1),
       ignoreList: Joi.array().items(Joi.number().integer().min(0)).max(500).optional(),
       ignoreVPaths: Joi.array().items(Joi.string()).max(50).optional(),
       // minRating accepts 0..10 — the alpha-UI rating dropdown
@@ -994,6 +1233,20 @@ export function setup(mstream) {
       // selects a small subset.
       genres: Joi.array().items(Joi.string().min(1).max(200)).max(200).optional(),
       genreMode: Joi.string().valid('whitelist', 'blacklist').default('whitelist'),
+      // Track-length window, in SECONDS (the units of tracks.duration and
+      // of the `duration` field on the wire). Both bounds are independent
+      // and optional; 0 means "no bound on this side" so a client can send
+      // a persisted zero without meaning it. The 86400 ceiling (24h) is
+      // generous headroom over the longest real audiobook chapter — like
+      // the BPM bounds it exists to reject garbage loudly rather than
+      // silently emit a clause that matches nothing.
+      //
+      // `allowUnknownDuration` flips NULL handling: absent/false excludes
+      // rows the scanner couldn't read a length from, true lets them
+      // through alongside the in-range rows. See buildDurationFilter.
+      minDuration: Joi.number().min(0).max(86400).optional(),
+      maxDuration: Joi.number().min(0).max(86400).optional(),
+      allowUnknownDuration: Joi.boolean().optional(),
       // Sonic similarity (discovery embeddings) — both-or-neither, enforced
       // by the .and() below.
       //   • similarTo:     1-8 file paths. One = plain seed; several average
@@ -1005,9 +1258,48 @@ export function setup(mstream) {
       //                    (EffNet reality: same-artist ≈ .6-.9, cross ≈
       //                    .3-.7 — the client maps a perceptual slider onto
       //                    this; the API takes the raw value.)
+      //   • similarToVector / similarToModelId: the same seed as a raw
+      //                    vector, for a caller whose seed lives on a
+      //                    DIFFERENT server — a filepath means nothing here,
+      //                    but a vector does. Base64 of dim × float32
+      //                    little-endian, same wire form the federation peer
+      //                    route takes. The model id is required and must
+      //                    match this library's: vectors only compare within
+      //                    one model space, and a silent cross-space compare
+      //                    returns confident nonsense.
       similarTo: Joi.array().items(Joi.string()).min(1).max(8).optional(),
+      similarToVector: Joi.string().base64().optional(),
+      similarToModelId: Joi.string().optional(),
       minSimilarity: Joi.number().min(0).max(1).optional(),
-    }).and('similarTo', 'minSimilarity');
+      // One seed form or the other, never both — they would disagree.
+      // Each form carries its own required peers; `.and()` can't express that
+      // (it would demand the peers of BOTH forms at once), so this is .with()
+      // one way plus an explicit check that a threshold never arrives without
+      // a seed to apply it to.
+    }).oxor('similarTo', 'similarToVector')
+      .with('similarTo', 'minSimilarity')
+      .with('similarToVector', ['similarToModelId', 'minSimilarity'])
+      .custom((v, helpers) => {
+        if (v.minSimilarity !== undefined
+            && v.similarTo === undefined && v.similarToVector === undefined) {
+          return helpers.error('any.custom', { message: 'minSimilarity needs a seed: similarTo or similarToVector' });
+        }
+        return v;
+      }, 'sonic seed pairing')
+      // Backwards duration window ({minDuration: 600, maxDuration: 60}) is
+      // the same class of typo as a backwards bpmRange: it produces a
+      // clause that matches nothing, and because the duration filter is
+      // never relaxed by the waterfall it would 400 every pick for the
+      // rest of the session with no hint as to why. Reject at the
+      // boundary. Only fires when BOTH bounds are real (>0) — a lone
+      // bound, or a persisted 0 meaning "no bound", constrains nothing
+      // on its side and can't be backwards.
+      .custom((v, helpers) => {
+        if (v.minDuration > 0 && v.maxDuration > 0 && v.minDuration > v.maxDuration) {
+          return helpers.error('any.custom', { message: 'minDuration must be <= maxDuration' });
+        }
+        return v;
+      }, 'duration window ordering');
     const { value } = joiValidate(schema, req.body || {});
 
     res.json(runRandomSongs(req, value));

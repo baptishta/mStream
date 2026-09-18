@@ -1,6 +1,6 @@
 {
   "name": "mstream",
-  "version": "6.24.0",
+  "version": "6.26.0",
   "description": "music streaming server",
   "type": "module",
   "main": "cli-boot-wrapper.js",
@@ -32,7 +32,6 @@
     "test:db": "node --test --test-reporter=spec \"test/db/**/*.test.mjs\"",
     "test:scanner": "node --test --test-reporter=spec \"test/scanner/**/*.test.mjs\"",
     "test:torrent": "node --test --test-reporter=spec \"test/torrent/**/*.test.mjs\"",
-    "test:subsonic": "node --test --test-reporter=spec \"test/subsonic/**/*.test.mjs\"",
     "test:integration": "node --test --test-reporter=spec \"test/integration/**/*.test.mjs\"",
     "test:dlna": "node --test --test-reporter=spec \"test/**/dlna.test.mjs\"",
     "test:cli-audio": "docker build -f test/cli-audio/Dockerfile -t mstream-cli-audio-smoke . && docker run --rm mstream-cli-audio-smoke",
@@ -87,6 +86,6 @@
     "@redocly/cli": "^2.47.0",
     "eslint": "^10.8.1",
     "globals": "^17.11.0",
-    "resedit": "3.0.2"
+    "resedit": "3.1.0"
   }
 }

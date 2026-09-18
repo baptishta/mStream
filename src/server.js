@@ -1,7 +1,6 @@
 import winston from 'winston';
 import express from 'express';
 import fs from 'fs';
-import path from 'path';
 import Joi from 'joi';
 import cookieParser from 'cookie-parser';
 import { compression } from './util/compression.js';
@@ -35,7 +34,9 @@ import * as dbManager from './db/manager.js';
 import * as discoveryDb from './db/discovery-db.js';
 import { reapOrphanedScanner } from './db/scan-pidfile.js';
 // scanner.js removed — parser now writes directly to SQLite
+import * as serverInfoApi from './api/server-info.js';
 import * as federationApi from './api/federation.js';
+import * as federationBrowseApi from './api/federation-browse.js';
 import * as federationDiscoveryApi from './api/federation-discovery.js';
 import * as federationLimitsApi from './api/federation-limits.js';
 import * as federationStreamApi from './api/federation-stream.js';
@@ -45,10 +46,6 @@ import * as dlnaApi from './api/dlna.js';
 import * as dlnaSsdp from './dlna/ssdp.js';
 import * as dlnaServer from './dlna/dlna-server.js';
 import * as mdns from './discovery/mdns.js';
-import * as subsonicApi from './api/subsonic/index.js';
-import * as subsonicServer from './subsonic/subsonic-server.js';
-import * as userApiKeysApi from './api/user-api-keys.js';
-import * as userSubsonicPasswordApi from './api/user-subsonic-password.js';
 import * as serverPlaybackApi from './api/server-playback.js';
 import * as albumArtApi from './api/album-art.js';
 import * as waveformApi from './api/waveform.js';
@@ -57,7 +54,6 @@ import * as lyricsApi from './api/lyrics.js';
 import * as lyricsLrclib from './api/lyrics-cache.js';
 import * as backupApi from './api/backup.js';
 import * as backupManager from './backup/manager.js';
-// Velvet UI modules — dynamically imported only when ui='velvet' is active
 import { classifyError } from './util/web-error.js';
 import { isAdminAllowed } from './util/admin-network.js';
 import { writeJsonAtomic, completedWrites } from './util/atomic-json.js';
@@ -65,7 +61,6 @@ import * as adminUtil from './util/admin.js';
 import * as updateCheck from './util/update-check.js';
 import * as bootWatchdog from './util/boot-watchdog.js';
 
-import packageJson from '../package.json' with { type: 'json' };
 
 let mstream;
 let server;
@@ -177,7 +172,7 @@ function sameBind(a, b) {
 // on Windows, a listen socket is a kernel object shared with every child that
 // inherited a handle to it, and under Bun <= 1.3.14 EVERY spawned child does
 // (uSockets created inheritable handles; fixed upstream in oven-sh/bun#36938,
-// unreleased as of Aug 2026). So close() in the parent releases nothing while a
+// first released in Bun 1.4.0). So close() in the parent releases nothing while a
 // scanner, transcode, ffmpeg download or enrichment worker is alive — the port
 // stays LISTENING (and even completes TCP handshakes that then hang) until the
 // last such child exits, which for a scan or a backfill can be an hour. A
@@ -508,15 +503,6 @@ export async function serveIt(configFile, { relisten = null } = {}) {
       return next();
     }
 
-    // Velvet and the bundled Subsonic client both handle auth inside
-    // the SPA (Velvet shows an inline form; Refix submits creds via
-    // ping/getArtists on first nav). Skip the server-side /login
-    // redirect for those — let the SPA decide what to render.
-    // TODO: standardize login flow so all UIs handle auth the same way
-    if (config.program.ui === 'velvet' || config.program.ui === 'subsonic') {
-      return next();
-    }
-
     try {
       jwt.verify(req.cookies['x-access-token'], config.program.secret);
       next();
@@ -526,12 +512,6 @@ export async function serveIt(configFile, { relisten = null } = {}) {
   });
 
   mstream.get('/login', (req, res, next) => {
-    // Velvet / Subsonic both own their login UI — a server-side hit on
-    // /login is meaningless for them, so redirect back to the SPA root.
-    if (config.program.ui === 'velvet' || config.program.ui === 'subsonic') {
-      return res.redirect(302, '/');
-    }
-
     if (dbManager.getAllUsers().length === 0) {
       return res.redirect(302, '..');
     }
@@ -547,56 +527,14 @@ export async function serveIt(configFile, { relisten = null } = {}) {
   // Server-remote route (must be before static middleware to intercept /server-remote)
   serverPlaybackApi.setupBeforeAuth(mstream);
 
-  // Give access to public folder. Three supported UIs — default, velvet,
-  // and the bundled Subsonic web client (Airsonic Refix). Subsonic UI
-  // talks to our own /rest/* endpoints so nothing else needs wiring
-  // differently.
-  const webappDir = config.program.ui === 'velvet'
-    ? path.join(config.program.webAppDirectory, 'velvet')
-    : config.program.ui === 'subsonic'
-      ? path.join(config.program.webAppDirectory, 'subsonic')
-      : config.program.webAppDirectory;
-  mstream.use('/', express.static(webappDir));
-
-  // Subsonic-UI SPA fallback: the bundled client is a Vue SPA with
-  // history-mode routing (/servers, /albums, /artists, /playlists/...),
-  // so a reload of any route other than `/` must serve index.html and
-  // let the client-side router take over. Inserted right after the
-  // static middleware so it catches unmatched GETs BEFORE the mStream
-  // auth wall 401s them — the SPA handles its own auth by calling
-  // /rest/ping. Scoped to `ui === 'subsonic'` so the default and
-  // velvet UIs keep their 404 behaviour.
-  //
-  // Explicitly skip API namespaces so those fall through to their
-  // real handlers (and 404 properly when the method doesn't exist).
-  if (config.program.ui === 'subsonic') {
-    const SPA_SKIP = /^\/(rest|api|media|album-art|server-remote|shared|dlna)(\/|$)/;
-    const indexPath = path.join(webappDir, 'index.html');
-    // Read the shell once at boot — it's ~800B and never changes while
-    // the process is up.
-    const indexHtml = fs.readFileSync(indexPath, 'utf8');
-    mstream.get(/.*/, (req, res, next) => {
-      if (SPA_SKIP.test(req.path)) { return next(); }
-      // Request explicitly asks for a non-HTML resource — let it 404.
-      const accept = String(req.get('accept') || '');
-      if (accept && !accept.includes('text/html') && !accept.includes('*/*')) {
-        return next();
-      }
-      res.type('html').send(indexHtml);
-    });
-  }
+  // Give access to public folder.
+  mstream.use('/', express.static(config.program.webAppDirectory));
 
   // Public APIs
   remoteApi.setupBeforeAuth(mstream, server);
   await sharedApi.setupBeforeSecurity(mstream);
   // DLNA routes must be before the auth wall — only needed in same-port mode
   if (config.program.dlna.mode === 'same-port') { dlnaApi.setup(mstream); }
-
-  // Subsonic REST API — sits before the auth wall because it carries its own
-  // credentials (u/p query string or apiKey) and populates req.user itself.
-  // Only mount when configured for same-port; separate-port uses its own
-  // http.Server started in the post-boot hook below.
-  if (config.program.subsonic.mode === 'same-port') { subsonicApi.setup(mstream); }
 
   // Everything below this line requires authentication
   authApi.setup(mstream);
@@ -605,6 +543,13 @@ export async function serveIt(configFile, { relisten = null } = {}) {
   // (needs req.user.federation) and before every route/static mount whose
   // responses it meters.
   federationLimitsApi.setup(mstream);
+
+  // GET /api/ — the layered server-info endpoint. Deliberately BEHIND the
+  // wall: tokenless requests on a users-server MUST 401 — third-party
+  // clients probe this to decide whether to show a login form. That 401
+  // is client-facing API surface, not an accident of ordering (see the
+  // header of api/server-info.js before ever moving this).
+  serverInfoApi.setup(mstream);
 
   adminApi.setup(mstream);
   irohApi.setup(mstream);
@@ -638,6 +583,7 @@ export async function serveIt(configFile, { relisten = null } = {}) {
   federationApi.setup(mstream);
   federationDiscoveryApi.setup(mstream);
   federationStreamApi.setup(mstream);
+  federationBrowseApi.setup(mstream);
   ytdlApi.setup(mstream);
   torrentApi.setup(mstream);
   albumArtApi.setup(mstream);
@@ -656,45 +602,6 @@ export async function serveIt(configFile, { relisten = null } = {}) {
   // and on reboot().
   backupManager.init();
   serverPlaybackApi.setup(mstream);
-  userApiKeysApi.setup(mstream);
-  userSubsonicPasswordApi.setup(mstream);
-
-  // VELVET ONLY: additional API modules loaded only when ui='velvet'
-  // These provide features specific to the Velvet UI (ListenBrainz, smart playlists,
-  // stats tracking, user settings, Discogs, cue points).
-  // TODO: evaluate which of these should be promoted to core /v1 APIs
-  if (config.program.ui === 'velvet') {
-    const [listenbrainzApi, smartPlaylistsApi, wrappedApi,
-           userSettingsApi, discogsApi, cuepointsApi, velvetStubs] = await Promise.all([
-      import('./api/listenbrainz.js'),
-      import('./api/smart-playlists.js'),
-      import('./api/wrapped.js'),
-      import('./api/user-settings.js'),
-      import('./api/discogs.js'),
-      import('./api/cuepoints.js'),
-      import('./api/velvet-stubs.js'),
-    ]);
-    listenbrainzApi.setup(mstream);
-    smartPlaylistsApi.setup(mstream);
-    wrappedApi.setup(mstream);
-    userSettingsApi.setup(mstream);
-    discogsApi.setup(mstream);
-    cuepointsApi.setup(mstream);
-    velvetStubs.setup(mstream);
-  }
-
-  // Versioned APIs. Includes a small `features` block for the frontend
-  // to gate UI on without an extra round-trip — currently just whether
-  // the Subsonic API surface is mounted (used by the mobile-clients
-  // panel to conditionally render the Subsonic password / API key UI).
-  // Public — no auth required for this endpoint.
-  mstream.get('/api/', (req, res) => res.json({
-    server: packageJson.version,
-    apiVersions: ["1"],
-    features: {
-      subsonic: config.program.subsonic.mode !== 'disabled',
-    },
-  }));
 
   // album art folder
   mstream.get('/album-art/:file', albumArtApi.serveAlbumArtFile);
@@ -827,20 +734,15 @@ export async function serveIt(configFile, { relisten = null } = {}) {
     if (config.program.dlna.mode !== 'disabled') {
       dlnaSsdp.start();
     }
-    // The separate-port servers are kept listeners (util/kept-listener.js):
-    // reboot() deliberately does NOT stop them, so start() here keeps their
+    // The separate-port DLNA server is a kept listener (util/kept-listener.js):
+    // reboot() deliberately does NOT stop it, so start() here keeps its
     // socket when port/address are unchanged and only recycles it when they
     // are — same rule as the main listener, same Windows/Bun reason. A config
-    // that no longer wants them must therefore stop them HERE.
+    // that no longer wants it must therefore stop it HERE.
     if (config.program.dlna.mode === 'separate-port') {
       dlnaServer.start();
     } else {
       dlnaServer.stop();
-    }
-    if (config.program.subsonic.mode === 'separate-port') {
-      subsonicServer.start();
-    } else {
-      subsonicServer.stop();
     }
 
     // Iroh P2P remote-access tunnel (opt-in; default off). Lazy-loaded so a
@@ -1025,7 +927,8 @@ export async function serveIt(configFile, { relisten = null } = {}) {
           `Port ${bind.port} still held ${Math.round(waitedMs / 1000)}s after reboot — retrying until it frees ` +
           '(mStream is unreachable meanwhile). A child process that was alive during the reboot — a scan, ' +
           'transcode, ffmpeg download or enrichment worker — can hold the old listening socket until it ' +
-          'exits: under Bun <= 1.3.14 on Windows spawned children inherit it (oven-sh/bun#36936).');
+          'exits: under Bun <= 1.3.14 on Windows spawned children inherit it (oven-sh/bun#36936, ' +
+          'fixed in Bun 1.4.0).');
         relistenDiagnosed = true;
         relistenLastLoggedAt = Date.now();
       }
@@ -1082,13 +985,14 @@ export function reboot() {
     transcode.reset();
 
     dlnaSsdp.stop();
-    // The separate-port DLNA/Subsonic servers are NOT stopped here: they are
-    // kept listeners (util/kept-listener.js) and onListening re-ensures them
-    // against the re-read config — kept when their bind is unchanged, recycled
-    // (with same-port patience) when it isn't, stopped when no longer wanted.
-    // Closing them here made every soft reboot on the Windows Bun bundle
-    // re-listen against a child's inherited handle, and their re-listen has
-    // no second chance: the Subsonic API stayed dead until the next restart.
+    // The separate-port DLNA server is NOT stopped here: it is a kept
+    // listener (util/kept-listener.js) and onListening re-ensures it against
+    // the re-read config — kept when its bind is unchanged, recycled (with
+    // same-port patience) when it isn't, stopped when no longer wanted.
+    // Closing it here made every soft reboot on the Windows Bun bundle
+    // re-listen against a child's inherited handle, and that re-listen has
+    // no second chance: the secondary server stayed dead until the next
+    // restart.
     mdns.stop();
     serverPlaybackApi.killRustPlayer();
     // Tear down the /remote WebSocket server: it detaches its upgrade/error

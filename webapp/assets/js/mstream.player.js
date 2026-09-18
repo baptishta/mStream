@@ -52,8 +52,15 @@ const MSTREAMPLAYER = (() => {
   // This is a placeholder function that the API layer can take hold of to implement the scrobble call
   let scrobbleTimer;
   mstreamModule.scrobble = () => {
+    const song = mstreamModule.getCurrentSong();
+    if (!song) { return; }
+    // A federated track's path lives in the PEER's vpath namespace, so
+    // scrobble-by-filepath cannot resolve it against this library — it
+    // just errors 30 seconds into every peer track. Same degrade rule as
+    // the waveform, rating and Sonic Path guards.
+    if (song.federation) { return; }
     MSTREAMAPI.scrobbleByFilePath(
-      mstreamModule.getCurrentSong().rawFilePath, 
+      song.rawFilePath,
       (response, error) => {});
   }
 
@@ -138,6 +145,13 @@ const MSTREAMPLAYER = (() => {
       ignoreVPaths,
     };
 
+    // Songs per fetch (mStream #966). Only on the wire when it changes
+    // anything: at the default of 1 the request stays byte-identical to
+    // the pre-batch shape, and a server from before `limit` existed
+    // (Joi, no unknown keys) never sees a field it would reject.
+    const limit = autodjLoaded ? Number(AUTODJ.state.djLimit) : 1;
+    if (Number.isInteger(limit) && limit > 1) { body.limit = limit; }
+
     // Current song's metadata — used for BPM anchor / Camelot anchor /
     // similar-artist source. May be undefined on the very first DJ
     // pick of a session.
@@ -221,6 +235,27 @@ const MSTREAMPLAYER = (() => {
       body.genreMode = AUTODJ.state.djGenreMode;
     }
 
+    // Track-length window — server-applied as an always-on base
+    // condition (src/api/random.js's buildDurationFilter). State holds
+    // SECONDS with 0 meaning "no bound on this side", so each bound is
+    // only put on the wire when it's a real constraint; sending a bare
+    // 0 would be a no-op server-side but muddies the payload.
+    //
+    // allowUnknownDuration rides along only when a bound is actually
+    // set — on its own it constrains nothing, and the server ignores
+    // it in that case anyway.
+    if (autodjLoaded && AUTODJ.state.djDurationEnabled) {
+      const minDur = Number(AUTODJ.state.djMinDuration);
+      const maxDur = Number(AUTODJ.state.djMaxDuration);
+      const haveMin = Number.isFinite(minDur) && minDur > 0;
+      const haveMax = Number.isFinite(maxDur) && maxDur > 0;
+      if (haveMin) { body.minDuration = minDur; }
+      if (haveMax) { body.maxDuration = maxDur; }
+      if (haveMin || haveMax) {
+        body.allowUnknownDuration = !!AUTODJ.state.djAllowUnknownDuration;
+      }
+    }
+
     // Sonic similarity — constrain picks to the discovery-embedding
     // neighborhood of the session anchor (PR #697 server API). Gated on
     // the ping capability flag so feature-off servers never receive the
@@ -230,10 +265,13 @@ const MSTREAMPLAYER = (() => {
         && AUTODJ.state.sonicEnabled
         && MSTREAMAPI.currentServer.discovery === true) {
       const curSong = mstreamModule.getCurrentSong && mstreamModule.getCurrentSong();
-      const sonic = AUTODJ.buildSonicParams(curSong ? curSong.rawFilePath : null);
+      const sonic = AUTODJ.buildSonicParams(curSong || null);
       if (sonic) {
         body.similarTo = sonic.similarTo;
         body.minSimilarity = sonic.minSimilarity;
+      } else if (opts && opts.sonicOptional) {
+        // The federated pick: its anchors may all live on peers, and the
+        // vector it sends replaces `similarTo` anyway.
       } else {
         // No resolvable anchor: empty queue and no explicit seed. The
         // pick can't honor the "within the similarity range" promise —
@@ -293,14 +331,268 @@ const MSTREAMPLAYER = (() => {
         AUTODJ.setCamelotAnchor(meta['musical-key']);
       }
       // Rolling sonic anchor — each DJ pick joins the last-N window the
-      // next request's `similarTo` centroid averages over.
+      // next request's `similarTo` centroid averages over. A peer pick
+      // records its owner, so a federated session can read that anchor's
+      // vector back from the server that actually holds it.
       if (AUTODJ.state.sonicEnabled) {
-        AUTODJ.pushSonicHistory(filepath);
+        AUTODJ.pushSonicHistory(filepath, curSong.federation ? curSong.federation.peerId : null);
       }
       AUTODJ.markFilepathCounted(filepath);
     } else {
       AUTODJ.resetAnchors();
     }
+  }
+
+  // Client-side post-fetch guard, shared by the single-server retry loop and
+  // the federated pick. Velvet's `_djSongBlocked` — the server's tier
+  // filter already prefers in-range rows, but in degraded fallback cases
+  // (step 5, step 10) the candidate can still be off-target. Songs with NULL
+  // bpm/key pass through (server already exhausted the tagged options).
+  //
+  // Keyword filter — independent of BPM/harmonic toggles. The server doesn't
+  // know about user-supplied skip words (kept entirely client-side per
+  // velvet's design), so this is the only place it gets applied.
+  // Genre + track-length are defence-in-depth against the server's pick:
+  // the server already enforces both, this catches a rescan changing the
+  // row between the server's SELECT and our read.
+  function _autoDjSongBlocked(metadata, refBpm, refNeighbours) {
+    if (typeof AUTODJ === 'undefined' || !AUTODJ.songBlocked) { return false; }
+    return AUTODJ.songBlocked(metadata, {
+      bpmContinuity: AUTODJ.state.bpmContinuity,
+      refBpm,
+      bpmTolerance: AUTODJ.state.bpmTolerance,
+      harmonicMixing: AUTODJ.state.harmonicMixing,
+      refNeighbours,
+      filterEnabled: AUTODJ.state.djFilterEnabled,
+      filterWords: AUTODJ.state.djFilterWords,
+      genreEnabled: AUTODJ.state.djGenreEnabled,
+      genreMode: AUTODJ.state.djGenreMode,
+      genres: AUTODJ.state.djGenres,
+      durationEnabled: AUTODJ.state.djDurationEnabled,
+      minDuration: AUTODJ.state.djMinDuration,
+      maxDuration: AUTODJ.state.djMaxDuration,
+      allowUnknownDuration: AUTODJ.state.djAllowUnknownDuration,
+    });
+  }
+
+  // ── Cross-server session (mStream #929) ─────────────────────────────
+  //
+  // With "play from federated servers" on, a pick is chosen across this
+  // server and every paired peer that shares its discovery model. The
+  // anchor's vectors are read from the servers that OWN them (a path only
+  // names a row where it lives — AUTODJ.resolveSonicOwners), averaged
+  // client-side, and sent to each server as `similarToVector`; the best
+  // reported cosine wins. Peer picks are queued through the federation
+  // wizard, so they stream through the proxy and carry the `federation`
+  // marker every degrade guard keys on.
+  //
+  // Anything that can't run this way — no eligible peer, no usable seed,
+  // nobody answered — returns false, and the single-server loop runs
+  // unchanged: switching this on can never leave the queue empty where it
+  // would otherwise have filled.
+  //
+  // Peers and their model id are learned through the browse proxy (GET
+  // federation/health is allowlisted) and cached for a few minutes; a peer
+  // that still answers a model-space 400 is dropped for the session.
+  let _fedPeersCache = null; // { at, peers: [{ id, name, modelId|null }] }
+  const FED_PEERS_TTL_MS = 5 * 60 * 1000;
+
+  async function _federatedPeers() {
+    if (_fedPeersCache && Date.now() - _fedPeersCache.at < FED_PEERS_TTL_MS) {
+      return _fedPeersCache.peers;
+    }
+    const listed = (await MSTREAMAPI.federationPeers()).peers || [];
+    const peers = await Promise.all(listed
+      // The admin's per-peer discovery opt-in — the same flag the Discover
+      // aggregator honours.
+      .filter(p => p.useDiscovery !== false)
+      .map(async (p) => {
+        try {
+          const health = await MSTREAMAPI.peer.health(p.id);
+          const modelId = health && health.discovery && health.discovery.modelId;
+          return { id: p.id, name: p.name, modelId: modelId || null };
+        } catch (_e) {
+          // Unreachable, or too old to answer: sits this session out.
+          return { id: p.id, name: p.name, modelId: null };
+        }
+      }));
+    _fedPeersCache = { at: Date.now(), peers };
+    return peers;
+  }
+
+  // One federated pick. True when a song was queued.
+  // A peer's random-songs, with one concession to age: a peer from before
+  // batch picks (mStream #966) rejects `limit` outright — Joi, no unknown
+  // keys — and would otherwise sit out every round while the setting is
+  // above 1. Ask such a peer for one song instead, the way the app's
+  // capability learner does, rather than dropping it from the session.
+  function _askPeerRandomSongs(peer, body) {
+    return MSTREAMAPI.peer.randomSongs(peer.id, body).catch((err) => {
+      const msg = (err && err.body && err.body.error) || '';
+      if (body.limit !== undefined && err && err.status === 400 && /"limit" is not allowed/i.test(msg)) {
+        const single = { ...body };
+        delete single.limit;
+        return MSTREAMAPI.peer.randomSongs(peer.id, single);
+      }
+      throw err;
+    });
+  }
+
+  async function _autoDjFederatedPick(signal) {
+    // The anchors and their owners in one synchronous read, before
+    // anything is awaited (see AUTODJ.sonicAnchors): a song change during
+    // the pick prunes the owners map, and a path read after that could
+    // land on the wrong server.
+    const curSong = mstreamModule.getCurrentSong && mstreamModule.getCurrentSong();
+    const anchors = AUTODJ.sonicAnchors(curSong);
+    if (anchors.length === 0) { return false; }
+
+    const peers = (await _federatedPeers()).filter(p => p.modelId && !AUTODJ.isPeerExcluded(p.id));
+    if (peers.length === 0) { return false; }
+
+    // Continuity, filters and our ignoreList; the local `similarTo` is
+    // optional here (every anchor may live on a peer).
+    const { body, refBpm, refNeighbours } = await _buildAutoDjBody({ ignoreList: AUTODJ.getIgnoreList(), sonicOptional: true });
+
+    // The anchors' vectors, each from its own server. The session's model
+    // space is whatever answers first (the local server, when it holds an
+    // anchor); vectors from another space are skipped, never averaged in.
+    const byOwner = new Map();
+    for (const a of anchors) {
+      const key = a.peerId === null ? 'local' : String(a.peerId);
+      if (!byOwner.has(key)) { byOwner.set(key, { peerId: a.peerId, paths: [] }); }
+      byOwner.get(key).paths.push(a.path);
+    }
+    let modelId = null;
+    let dim = null;
+    const vectors = [];
+    for (const { peerId, paths } of byOwner.values()) {
+      let got = null;
+      try {
+        got = peerId === null
+          ? await MSTREAMAPI.discoveryEmbeddings(paths.slice(0, 8))
+          : await MSTREAMAPI.peer.discoveryEmbeddings(peerId, paths.slice(0, 8));
+      } catch (_e) {
+        got = null;
+      }
+      if (!got || got.disabled || !got.model || !Array.isArray(got.tracks)) { continue; }
+      if (modelId === null) { modelId = got.model.id; dim = got.dim; }
+      else if (got.model.id !== modelId || got.dim !== dim) { continue; }
+      for (const trk of got.tracks) {
+        const v = trk && trk.embedding ? AUTODJ.decodeWireVector(trk.embedding, dim) : null;
+        if (v) { vectors.push(v); }
+      }
+    }
+    const seed = modelId ? AUTODJ.meanUnitVector(vectors, dim) : null;
+    if (!seed) { return false; }
+    const vectorSeed = {
+      similarToVector: AUTODJ.encodeWireVector(seed),
+      similarToModelId: modelId,
+      // The pool floor travels with the vector; the local body only
+      // carries it when this server holds an anchor.
+      minSimilarity: Number.isFinite(body.minSimilarity) ? body.minSimilarity : AUTODJ.state.sonicMinSimilarity,
+    };
+
+    // The same body everywhere, minus what only means something on this
+    // server: the filepath seed (the vector replaces it), ignoreVPaths (OUR
+    // library names) and minRating (OUR user's stars); each peer gets its
+    // own ignoreList. Every server is asked at once — a session that waited
+    // for each in turn would stall the queue on the slowest one.
+    //
+    // A server answers with random rows from its pool, so when every
+    // answer is a repeat or blocked the ask is repeated a couple of times
+    // with each server's own returned ignoreList fed back (the way the
+    // single-server loop retries) before the pick is left to that loop —
+    // otherwise a strict slider, whose pools are small, would keep turning
+    // the session local-only. The fed-back lists stay transient: only the
+    // cooldowns of servers whose songs get queued advance.
+    //
+    // Songs per fetch applies across all servers: every server is asked
+    // for the whole batch (`limit` rides along in `shared`) and the best
+    // `want` cosines overall are queued, so one server with the closest
+    // matches can supply the entire batch.
+    const { similarTo, ignoreVPaths, minRating, ignoreList, ...shared } = body;
+    const eligible = peers.filter(p => p.modelId === modelId);
+    const retryLists = new Map([['local', ignoreList]]);
+    for (const p of eligible) { retryLists.set(String(p.id), AUTODJ.getPeerIgnoreList(p.id)); }
+    const recentKeys = AUTODJ.federatedRecentKeys(anchors, curSong);
+    const want = Number.isInteger(shared.limit) && shared.limit > 1 ? shared.limit : 1;
+    const MAX_ASKS = 3;
+    let chosen = [];
+    for (let attempt = 0; attempt < MAX_ASKS && chosen.length === 0; attempt++) {
+      const asks = [
+        MSTREAMAPI.getRandomSong({ ...shared, ignoreVPaths, minRating, ignoreList: retryLists.get('local'), ...vectorSeed }, { signal })
+          .then(res => ({ peer: null, res }), err => ({ peer: null, err })),
+        ...eligible.filter(p => !AUTODJ.isPeerExcluded(p.id)).map(p =>
+          _askPeerRandomSongs(p, { ...shared, ignoreList: retryLists.get(String(p.id)), ...vectorSeed })
+            .then(res => ({ peer: p, res }), err => ({ peer: p, err }))),
+      ];
+      const answers = await Promise.all(asks);
+      if (signal && signal.aborted) { return false; }
+
+      const scored = [];
+      for (const a of answers) {
+        if (a.err) {
+          if (a.err.name === 'AbortError') { return false; }
+          if (a.peer && a.err.status === 400 && /Sonic seed is from model/i.test((a.err.body && a.err.body.error) || '')) {
+            AUTODJ.excludePeerForSession(a.peer.id);
+          }
+          continue;
+        }
+        const songs = a.res && Array.isArray(a.res.songs) ? a.res.songs : [];
+        if (songs.length === 0) { continue; }
+        if (Array.isArray(a.res.ignoreList)) { retryLists.set(a.peer ? String(a.peer.id) : 'local', a.res.ignoreList); }
+        // One cosine per song (`sonic.similarities`, aligned with `songs`);
+        // a peer from before batches reports only the first song's value.
+        const sims = a.res.sonic && Array.isArray(a.res.sonic.similarities) ? a.res.sonic.similarities : [];
+        songs.forEach((song, i) => {
+          let sim = -1;
+          if (Number.isFinite(sims[i])) { sim = sims[i]; }
+          else if (i === 0 && a.res.sonic && Number.isFinite(a.res.sonic.similarity)) { sim = a.res.sonic.similarity; }
+          scored.push({
+            peerId: a.peer ? a.peer.id : null,
+            peer: a.peer,
+            song,
+            res: a.res,
+            similarity: sim,
+            blocked: _autoDjSongBlocked(song.metadata, refBpm, refNeighbours),
+          });
+        });
+      }
+      // Nobody answered — asking again would not change that.
+      if (scored.length === 0) { break; }
+      chosen = AUTODJ.chooseFederatedPicks(scored, recentKeys, want);
+    }
+    if (chosen.length === 0) { return false; }
+
+    // Only the cooldowns of servers whose songs are being queued advance —
+    // the others' answers were not played. A contributing server's list
+    // also carries the ids of its songs that lost to a better cosine
+    // elsewhere; the cooldown is soft variety and they cycle back out.
+    const advanced = new Set();
+    for (const pick of chosen) {
+      const key = pick.peerId === null ? 'local' : String(pick.peerId);
+      if (advanced.has(key)) { continue; }
+      advanced.add(key);
+      if (pick.peerId === null) {
+        AUTODJ.setIgnoreList(Array.isArray(pick.res.ignoreList) ? pick.res.ignoreList : []);
+        autoDjIgnoreArray = AUTODJ.getIgnoreList();
+      } else {
+        AUTODJ.setPeerIgnoreList(pick.peerId, pick.res.ignoreList);
+      }
+    }
+
+    // Queue best first so the playlist order is the ranking.
+    for (const pick of chosen) {
+      const meta = { ...(pick.song.metadata || {}), _djPicked: true };
+      if (meta.artist) { AUTODJ.pushArtistHistory(meta.artist); }
+      if (pick.peerId === null) {
+        await VUEPLAYERCORE.addSongWizard(pick.song.filepath, meta);
+      } else {
+        VUEPLAYERCORE.addFederationSongWizard(pick.peer, pick.song.filepath, meta, false);
+      }
+    }
+    return true;
   }
 
   // Re-entrancy guard — multiple triggers (song-end, removeSong,
@@ -361,6 +653,19 @@ const MSTREAMPLAYER = (() => {
     let ignoreList = autodjLoaded ? AUTODJ.getIgnoreList() : [];
     const MAX_RETRIES = 5;
 
+    // Cross-server session first (see _autoDjFederatedPick). It returns
+    // false whenever it can't run this way, and the single-server loop
+    // below then runs exactly as before.
+    if (autodjLoaded
+        && AUTODJ.state.sonicEnabled && AUTODJ.state.federatedEnabled
+        && MSTREAMAPI.currentServer.discovery === true
+        && MSTREAMAPI.currentServer.federationBrowse === true) {
+      if (await _autoDjFederatedPick(signal)) {
+        _showSimilarArtistsInfoStrip();
+        return;
+      }
+    }
+
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       const { body, refBpm, refNeighbours } = await _buildAutoDjBody({ ignoreList });
       let res;
@@ -379,6 +684,18 @@ const MSTREAMPLAYER = (() => {
             err.djToast = { title: t('autoDJ.sonicToastTitle'), message: t('autoDJ.sonicSeedUnanalyzed') };
           }
         }
+        // The duration window is an always-on server filter, so an
+        // over-narrow one 400s every pick for the rest of the session.
+        // The generic "Auto DJ Failed" gives the user nothing to act
+        // on; name the filter that's most likely at fault. Only when
+        // no more specific story (sonic) already claimed the error.
+        if (err?.name !== 'AbortError' && !err.djToast
+            && (body.minDuration || body.maxDuration)) {
+          err.djToast = {
+            title: t('autoDJ.durationToastTitle'),
+            message: t('autoDJ.durationNoMatch'),
+          };
+        }
         throw err;
       }
       lastResponse = res;
@@ -387,65 +704,48 @@ const MSTREAMPLAYER = (() => {
       // blocked retry doesn't re-pick the same song.
       if (Array.isArray(res?.ignoreList)) { ignoreList = res.ignoreList; }
 
-      const song = res.songs && res.songs[0];
-      if (!song) { break; }
+      const songs = Array.isArray(res.songs) ? res.songs : [];
+      if (songs.length === 0) { break; }
 
       // Client-side post-fetch guard. Velvet's `_djSongBlocked` —
-      // the server's tier filter already prefers in-range rows, but
-      // in degraded fallback cases (step 5, step 10) the candidate
+      // the server's tier ranking already prefers in-range rows, but
+      // in degraded fallback cases (step 5, step 10) a candidate
       // can still be off-target. Retry-on-blocked closes the gap.
       // Songs with NULL bpm/key pass through (server already
-      // exhausted the tagged options).
-      const blocked = (autodjLoaded && AUTODJ.songBlocked)
-        ? AUTODJ.songBlocked(song.metadata, {
-            bpmContinuity: AUTODJ.state.bpmContinuity,
-            refBpm,
-            bpmTolerance: AUTODJ.state.bpmTolerance,
-            harmonicMixing: AUTODJ.state.harmonicMixing,
-            refNeighbours,
-            // Keyword filter — independent of BPM/harmonic toggles.
-            // Server doesn't know about user-supplied skip words
-            // (kept entirely client-side per velvet's design), so
-            // the retry loop is the only place this gets applied.
-            filterEnabled: AUTODJ.state.djFilterEnabled,
-            filterWords: AUTODJ.state.djFilterWords,
-            // Genre filter — defence-in-depth check against the
-            // server's pick. Server already filters via EXISTS /
-            // NOT EXISTS, so a survivor of the server filter
-            // should never block here under normal operation. The
-            // rare case this handles: a server-returned row whose
-            // track_genres rows were modified by a rescan between
-            // the server SELECT and the client receiving metadata.
-            genreEnabled: AUTODJ.state.djGenreEnabled,
-            genreMode: AUTODJ.state.djGenreMode,
-            genres: AUTODJ.state.djGenres,
-          })
-        : false;
-      if (!blocked) { picked = song; break; }
+      // exhausted the tagged options). A batch keeps whatever part
+      // of it passes; only an answer blocked in full is retried.
+      const accepted = songs.filter((s) => !_autoDjSongBlocked(s.metadata, refBpm, refNeighbours));
+      if (accepted.length > 0) { picked = accepted; break; }
     }
 
     // If every retry was blocked, fall through with whatever the
     // last response was so the session doesn't stall completely.
     // The server's fallback chain is already exhausting all viable
     // alternatives; refusing here just means the DJ stops.
-    if (!picked && lastResponse?.songs?.[0]) {
-      picked = lastResponse.songs[0];
+    if (!picked && Array.isArray(lastResponse?.songs) && lastResponse.songs.length > 0) {
+      picked = lastResponse.songs;
     }
     if (!picked) {
       throw new Error('no song in response');
     }
 
-    // Mark as a DJ pick so the song-change handler later knows to
+    // Mark as DJ picks so the song-change handler later knows to
     // push to BPM history (vs. resetting anchors on a manual pick).
-    // `_djPicked` is the only metadata flag the song carries; the
+    // `_djPicked` is the only metadata flag a song carries; the
     // "have we counted this song's BPM yet" state lives in AUTODJ
     // proper (state.djCountedFilepaths), not on the metadata.
-    const meta = { ...(picked.metadata || {}), _djPicked: true };
+    const queued = picked.map((song) => ({
+      filepath: song.filepath,
+      meta: { ...(song.metadata || {}), _djPicked: true },
+    }));
 
-    // Persist updated ignoreList + push picked artist to cooldown.
+    // Persist updated ignoreList + push every picked artist to the
+    // cooldown — all of them are about to be queued.
     if (autodjLoaded) {
       AUTODJ.setIgnoreList(ignoreList);
-      if (meta.artist) { AUTODJ.pushArtistHistory(meta.artist); }
+      for (const { meta } of queued) {
+        if (meta.artist) { AUTODJ.pushArtistHistory(meta.artist); }
+      }
     }
     // Legacy bridge — keep the old global in sync until everywhere
     // else has migrated off it.
@@ -462,10 +762,13 @@ const MSTREAMPLAYER = (() => {
     // via the dev console but the user gets the gist.
     _showSimilarArtistsInfoStrip();
 
-    // Await so async failures inside addSongWizard surface through
-    // the outer try/catch and trigger the iziToast warning instead
-    // of becoming a silent unhandled rejection.
-    await VUEPLAYERCORE.addSongWizard(picked.filepath, meta);
+    // Await each so async failures inside addSongWizard surface through
+    // the outer try/catch and trigger the iziToast warning instead of
+    // becoming a silent unhandled rejection — and so the queue keeps
+    // the server's order (best tier first).
+    for (const { filepath, meta } of queued) {
+      await VUEPLAYERCORE.addSongWizard(filepath, meta);
+    }
   }
 
   // Info strip helper — fires an iziToast.info if similar-mode is on
@@ -1361,11 +1664,13 @@ const MSTREAMPLAYER = (() => {
   // (No mstreamModule.minRating init — the legacy global is dead;
   // the rewritten autoDJ() reads djMinRating from AUTODJ.state.)
 
-  // Queue N Auto-DJ picks sequentially. The autoDJ() function is
-  // guarded against re-entrancy (a second call while the first is
-  // in flight returns the same in-flight promise), so we must await
-  // each pick before requesting the next — calling autoDJ() twice in
-  // a row collapses to a single pick.
+  // Queue Auto-DJ fetches until at least N songs have been added. The
+  // autoDJ() function is guarded against re-entrancy (a second call
+  // while the first is in flight returns the same in-flight promise),
+  // so each fetch is awaited before the next — calling autoDJ() twice
+  // in a row collapses to a single fetch. One fetch adds up to
+  // AUTODJ.state.djLimit songs: at the default of 1 that is two fetches
+  // here, at any larger setting a single fetch already covers the runway.
   //
   // Used on STARTUP paths (toggleAutoDJ, clearPlaylist) to bootstrap
   // a 2-deep lookahead. The downstream "queue one ahead" triggers in
@@ -1379,13 +1684,14 @@ const MSTREAMPLAYER = (() => {
   // Re-checks `mstreamModule.playerStats.autoDJ` between picks so a
   // user toggling Auto-DJ off mid-bootstrap aborts cleanly.
   async function _autoDjQueueN(n) {
-    for (let i = 0; i < n; i++) {
+    const start = mstreamModule.playlist.length;
+    while (mstreamModule.playlist.length - start < n) {
       if (mstreamModule.playerStats.autoDJ !== true) { return; }
       const before = mstreamModule.playlist.length;
       try {
         await autoDJ();
       } catch (_) { /* autoDJ already toasts; don't stack errors */ }
-      // A pick that added nothing failed (autoDJ toasted why) — the
+      // A fetch that added nothing failed (autoDJ toasted why) — the
       // next bootstrap attempt would fail the same way; stop instead
       // of stacking a duplicate toast + duplicate server round-trip.
       if (mstreamModule.playlist.length === before) { return; }

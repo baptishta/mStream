@@ -24,7 +24,7 @@ import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { lrcToSearchText } from '../../src/api/subsonic/lrc-parser.js';
+import { lrcToSearchText } from '../../src/util/lrc-parser.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
@@ -43,7 +43,9 @@ function findFreePort() {
   });
 }
 
-async function waitForReady(baseUrl, timeoutMs = 30_000) {
+// 90 s, not 30: the same loaded-CI-runner ceiling test/helpers/server.mjs
+// uses for this wait — a starved Windows shard has expired 30 s at boot.
+async function waitForReady(baseUrl, timeoutMs = 90_000) {
   const start = Date.now();
   let lastErr;
   while (Date.now() - start < timeoutMs) {
@@ -61,9 +63,7 @@ async function bootMstream(tmpDir, musicDir, extraLibraries = {}) {
   const config = {
     port,
     address: '127.0.0.1',
-    ui: 'default',
     dlna:     { mode: 'disabled' },
-    subsonic: { mode: 'disabled' },
     folders:  { testlib: { root: musicDir }, ...extraLibraries },
     storage: {
       albumArtDirectory:   path.join(tmpDir, 'image-cache'),
@@ -86,7 +86,11 @@ async function bootMstream(tmpDir, musicDir, extraLibraries = {}) {
     { cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, NODE_ENV: 'test' } },
   );
   proc.stdout.on('data', () => {});
-  proc.stderr.on('data', () => {});
+  // Keep the tail of stderr: a boot that CRASHED and one that was merely slow
+  // on a loaded runner both end in ECONNREFUSED at the deadline, and only the
+  // child's own output tells them apart (test/helpers/server.mjs does the same).
+  let stderrTail = '';
+  proc.stderr.on('data', (d) => { stderrTail = (stderrTail + d).slice(-4000); });
   const baseUrl = `http://127.0.0.1:${port}`;
   try {
     await waitForReady(baseUrl);
@@ -95,8 +99,10 @@ async function bootMstream(tmpDir, musicDir, extraLibraries = {}) {
     // healthy on a loaded runner, and a live orphan's stdio keeps this file's
     // event loop open — the run then hangs at exit instead of reporting the
     // timeout. test/helpers/server.mjs kills on this path for the same reason.
+    const exit = proc.exitCode != null ? `exited with code ${proc.exitCode}` : 'still running, killed';
     try { proc.kill('SIGKILL'); } catch { /* already gone */ }
-    throw err;
+    throw new Error(`${err.message}; child ${exit}; stderr tail:
+${stderrTail.trim() || '(empty)'}`, { cause: err });
   }
   return { proc, baseUrl, port };
 }

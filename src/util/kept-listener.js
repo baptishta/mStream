@@ -1,4 +1,4 @@
-// A secondary HTTP listener (the Subsonic and DLNA separate-port servers)
+// A secondary HTTP listener (the DLNA separate-port server)
 // that survives a soft reboot when its bind is unchanged, and recycles with
 // the main listener's same-port patience when it isn't.
 //
@@ -6,11 +6,13 @@
 // reboot precisely because, on Windows under Bun <= 1.3.14, every spawned
 // child (scanner, transcode, ffmpeg download, enrichment worker) inherits a
 // handle to every listen socket in the process, and close() in the parent
-// releases nothing until that child exits (oven-sh/bun#36938). The separate-
-// port servers were still doing close()+listen() on every reboot: their
+// releases nothing until that child exits (oven-sh/bun#36938; fix first
+// released in Bun 1.4.0). The separate-port servers were still doing
+// close()+listen() on every reboot: their
 // re-listen hit EADDRINUSE mid-scan, their 'error' handler nulled the module
-// reference, and the Subsonic API (every mobile client) stayed silently dead
-// until the next restart while the tray said Running. Keeping the server
+// reference, and the secondary API (at the time the Subsonic API — every
+// mobile client) stayed silently dead until the next restart while the tray
+// said Running. Keeping the server
 // object across a same-bind reboot sidesteps that on every runtime; a bind
 // change (port/address edit) recycles, retrying EADDRINUSE with backoff when
 // it is re-taking the port it just held (a release delay or a held handle,
@@ -64,7 +66,8 @@ export function createKeptListener(name) {
           winston.warn(
             `[${name}] Port ${port} still held ${Math.round(waitedMs / 1000)}s after reboot — retrying until it frees ` +
             '(the separate server is unreachable meanwhile). A child process alive during the reboot can hold the ' +
-            'old listening socket until it exits (Bun <= 1.3.14 on Windows: oven-sh/bun#36938).');
+            'old listening socket until it exits (Bun <= 1.3.14 on Windows: oven-sh/bun#36938, ' +
+            'fixed in Bun 1.4.0).');
           diagnosed = true;
           lastLoggedAt = Date.now();
         }

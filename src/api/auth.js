@@ -7,6 +7,7 @@ import * as db from '../db/manager.js';
 import * as shared from '../api/shared.js';
 import { isActiveJukeboxToken } from '../api/remote.js';
 import * as federationAuth from './federation-auth.js';
+import * as federationGuest from '../state/federation-guest.js';
 import WebError from '../util/web-error.js';
 
 export function setup(mstream) {
@@ -62,103 +63,39 @@ export function setup(mstream) {
       return next();
     }
 
-    const allUsers = db.getAllUsers();
-
-    // Handle No Users (public access mode)
-    if (allUsers.length === 0) {
-      const allLibs = db.getAllLibraries();
-      const adminLocked = config.program.lockAdmin === true;
-      // Spread the sentinel's actual users-table row first so per-user
-      // columns (lastfm_user, lastfm_password, listenbrainz_token, …)
-      // are present on req.user exactly the way they are for real-user
-      // requests above. Endpoints that read those columns off req.user
-      // (scrobbler.js, velvet-stubs.js /lastfm/status, etc.) then work
-      // in public mode without per-endpoint DB lookups. Permission
-      // flags below override whatever the sentinel row stored — the
-      // sentinel's own allow_* defaults are 0 (see ensureAnonymousUser),
-      // and we want them driven by adminLocked instead.
-      const sentinel = db.getAnonymousUser() || {};
-      req.user = {
-        ...sentinel,
-        vpaths: allLibs.map(l => l.name),
-        username: 'mstream-user',
-        admin: !adminLocked,
-        // Pin to the always-present anonymous sentinel row in the
-        // users table. Per-user tables (user_metadata, playlists,
-        // cue_points, …) all FK on users(id) NOT NULL, so a null id
-        // here meant every write endpoint crashed in public mode.
-        // The sentinel is filtered out of getAllUsers() so the
-        // empty-check above still means "no real users".
-        id: db.getAnonymousUserId(),
-        allow_upload: adminLocked ? 0 : 1,
-        allow_mkdir: adminLocked ? 0 : 1,
-        allow_file_modify: adminLocked ? 0 : 1,
-        // Mirrors the other permission flags: when the admin API is
-        // locked, the single implicit user is demoted and loses the
-        // write permissions AND server-audio access. When unlocked,
-        // they're effectively admin, so the gate is bypassed anyway —
-        // the value here only matters in the locked case.
-        allow_server_audio: adminLocked ? 0 : 1
-      };
+    // Federation GUEST tokens next — the same ordering reason. A guest is a
+    // device of a key holder carrying a short-lived JWT this server signed
+    // for the key (state/federation-guest.js); it rides the ordinary token
+    // slots so clients need no special header. Routed by CLAIM (a plain
+    // decode) so ordinary user tokens are still verified exactly once,
+    // below; a token that claims to be a guest is verified for real in the
+    // guest branch, and a bad one is a 401 there — never a fall-through to
+    // public mode.
+    const token = readToken(req);
+    if (token && federationGuest.looksLikeGuestToken(token)) {
+      req.token = token;
+      req.user = federationAuth.authenticateGuestToken(token, req);
       return next();
     }
 
-    const token = req.body?.token || req.query?.token || req.headers?.['x-access-token'] || req.cookies?.['x-access-token'];
+    // Handle No Users (public access mode)
+    if (db.getAllUsers().length === 0) {
+      req.user = buildPublicModeUser();
+      return next();
+    }
+
     if (!token) { throw new WebError('Authentication Error', 401); }
     req.token = token;
 
-    // jwt.verify throws on a token we can't trust (malformed, bad signature,
-    // expired). That's a 401, not an unhandled error that falls through to a
-    // generic 500. Log the cause — an invalid token at the auth wall is a
-    // probing signal.
-    let decoded;
-    try {
-      decoded = jwt.verify(token, config.program.secret);
-    } catch (err) {
-      winston.warn(`Rejected invalid token from ${req.ip} on ${req.path}: ${err.message}`);
-      throw new WebError('Authentication Error', 401);
-    }
+    const decoded = verifyToken(token, req);
 
     // Handle jukebox tokens
     if (decoded.jukebox === true && decoded.username) {
-      // Verify the token belongs to an active jukebox session
-      if (!isActiveJukeboxToken(token)) {
-        throw new WebError('Jukebox session expired', 401);
-      }
-
-      const user = db.getUserByUsername(decoded.username);
-      if (!user) { throw new WebError('Authentication Error', 401); }
-      const libIds = db.getUserLibraryIds(user);
-      const libraries = db.getAllLibraries().filter(l => libIds.includes(l.id));
-      req.user = {
-        ...user,
-        vpaths: libraries.map(l => l.name),
-        admin: false,
-        allow_upload: 0,
-        allow_mkdir: 0,
-        allow_file_modify: 0,
-        allow_server_audio: 0
-      };
+      req.user = buildJukeboxUser(decoded, token);
       return next();
     }
 
-    if (!decoded.username) {
-      throw new WebError('Authentication Error', 401);
-    }
-
-    const user = db.getUserByUsername(decoded.username);
-    if (!user) {
-      throw new WebError('Authentication Error', 401);
-    }
-
-    // Build user object with vpaths
-    const libIds = db.getUserLibraryIds(user);
-    const libraries = db.getAllLibraries().filter(l => libIds.includes(l.id));
-    req.user = {
-      ...user,
-      vpaths: libraries.map(l => l.name),
-      admin: user.is_admin === 1
-    };
+    req.user = buildRealUser(decoded);
 
     // Handle Shared Tokens
     if (decoded.shareToken && decoded.shareToken === true) {
@@ -179,3 +116,110 @@ export function setup(mstream) {
     next();
   });
 }
+
+// The token slots, in precedence order.
+function readToken(req) {
+  return req.body?.token || req.query?.token || req.headers?.['x-access-token'] || req.cookies?.['x-access-token'];
+}
+
+// ── User builders ───────────────────────────────────────────────────────────
+// Shared by the wall above and resolveOptionalUser below — ONE source of
+// truth for what each credential kind resolves to. Behavior here is the
+// wall's original inline logic, moved verbatim.
+
+// The public-access-mode user (no real users in the DB).
+function buildPublicModeUser() {
+  const allLibs = db.getAllLibraries();
+  const adminLocked = config.program.lockAdmin === true;
+  // Spread the sentinel's actual users-table row first so per-user
+  // columns (lastfm_user, lastfm_password, …) are present on req.user
+  // exactly the way they are for real-user requests. Endpoints that
+  // read those columns off req.user (scrobbler.js /lastfm/status and
+  // the scrobble routes) then work
+  // in public mode without per-endpoint DB lookups. Permission
+  // flags below override whatever the sentinel row stored — the
+  // sentinel's own allow_* defaults are 0 (see ensureAnonymousUser),
+  // and we want them driven by adminLocked instead.
+  const sentinel = db.getAnonymousUser() || {};
+  return {
+    ...sentinel,
+    vpaths: allLibs.map(l => l.name),
+    username: 'mstream-user',
+    admin: !adminLocked,
+    // Pin to the always-present anonymous sentinel row in the
+    // users table. Per-user tables (user_metadata, playlists,
+    // shared_playlists, …) all FK on users(id) NOT NULL, so a null id
+    // here meant every write endpoint crashed in public mode.
+    // The sentinel is filtered out of getAllUsers() so the
+    // empty-check still means "no real users".
+    id: db.getAnonymousUserId(),
+    allow_upload: adminLocked ? 0 : 1,
+    allow_mkdir: adminLocked ? 0 : 1,
+    allow_file_modify: adminLocked ? 0 : 1,
+    // Mirrors the other permission flags: when the admin API is
+    // locked, the single implicit user is demoted and loses the
+    // write permissions AND server-audio access. When unlocked,
+    // they're effectively admin, so the gate is bypassed anyway —
+    // the value here only matters in the locked case.
+    allow_server_audio: adminLocked ? 0 : 1
+  };
+}
+
+// jwt.verify throws on a token we can't trust (malformed, bad signature,
+// expired). That's a 401, not an unhandled error that falls through to a
+// generic 500. Log the cause — an invalid token at the auth wall is a
+// probing signal.
+function verifyToken(token, req) {
+  try {
+    return jwt.verify(token, config.program.secret);
+  } catch (err) {
+    winston.warn(`Rejected invalid token from ${req.ip} on ${req.path}: ${err.message}`);
+    throw new WebError('Authentication Error', 401);
+  }
+}
+
+// A jukebox session's restricted user: real user's libraries, no writes,
+// never admin. Verifies the token belongs to an ACTIVE jukebox session.
+function buildJukeboxUser(decoded, token) {
+  if (!isActiveJukeboxToken(token)) {
+    throw new WebError('Jukebox session expired', 401);
+  }
+  const user = db.getUserByUsername(decoded.username);
+  if (!user) { throw new WebError('Authentication Error', 401); }
+  const libIds = db.getUserLibraryIds(user);
+  const libraries = db.getAllLibraries().filter(l => libIds.includes(l.id));
+  return {
+    ...user,
+    vpaths: libraries.map(l => l.name),
+    admin: false,
+    allow_upload: 0,
+    allow_mkdir: 0,
+    allow_file_modify: 0,
+    allow_server_audio: 0
+  };
+}
+
+// A real user token → user object with vpaths.
+function buildRealUser(decoded) {
+  if (!decoded.username) {
+    throw new WebError('Authentication Error', 401);
+  }
+  const user = db.getUserByUsername(decoded.username);
+  if (!user) {
+    throw new WebError('Authentication Error', 401);
+  }
+  const libIds = db.getUserLibraryIds(user);
+  const libraries = db.getAllLibraries().filter(l => libIds.includes(l.id));
+  return {
+    ...user,
+    vpaths: libraries.map(l => l.name),
+    admin: user.is_admin === 1
+  };
+}
+
+// NOTE (history, do not repeat): #932 briefly exported an optional-auth
+// resolver here so GET /api/ could serve an anonymous public layer from
+// before the wall. That broke third-party clients, which probe /api/
+// tokenless and read the 401 as "this server requires login". The
+// endpoint lives behind the wall again; if some future route genuinely
+// needs optional auth, it must not be one that clients auth-probe.

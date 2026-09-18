@@ -383,13 +383,6 @@ const lastFMOptions = Joi.object({
   apiSecret: Joi.string().default('a9df934fc504174d4cb68853d9feb143')
 });
 
-const discogsOptions = Joi.object({
-  enabled: Joi.boolean().default(false),
-  allowArtUpdate: Joi.boolean().default(false),
-  apiKey: Joi.string().allow('').default(''),
-  apiSecret: Joi.string().allow('').default(''),
-});
-
 // Iroh P2P remote-access tunnel. When enabled, mStream binds an Iroh endpoint
 // that proxies incoming QUIC connections to the local HTTP server, so a paired
 // device can reach the server from anywhere by dialing its EndpointId — no
@@ -397,7 +390,7 @@ const discogsOptions = Joi.object({
 //   secretKey     — base64 of 32 random bytes; the endpoint's identity. The
 //                   EndpointId (and therefore every issued QR) is derived from
 //                   it, so it's auto-generated once and persisted (like
-//                   `secret`/`subsonicSecret`). Losing it changes the EndpointId
+//                   `secret`). Losing it changes the EndpointId
 //                   and breaks every previously-issued QR/ticket.
 //   connectSecret — base64 shared secret carried inside the QR. The tunnel only
 //                   completes a connection after the client proves knowledge of
@@ -448,6 +441,13 @@ const federationOptions = Joi.object({
   secretKey: Joi.string().optional(),
   serverName: Joi.string().max(64).allow('').default(''),
   limits: federationLimitsOptions.default(federationLimitsOptions.validate({}).value),
+  // The federation-requests inbox: whether OTHER discovery peers may send
+  // this server pairing requests over the DM transport. Opt-in (default
+  // off) — the sidecar's DM handler is fail-closed until the stack pushes
+  // this flag down via setDmAccept. Gates NEW inbound requests only:
+  // replies to this server's own outbound requests always pass (see
+  // pushAcceptPolicy in state/federation-requests.js).
+  acceptRequests: Joi.boolean().default(false),
 });
 
 // The music-discovery P2P layer (p2p-sidecar: iroh-blobs snapshot sharing
@@ -481,6 +481,12 @@ const discoveryP2pOptions = Joi.object({
   // below still applies — the shelf stops at whichever limit hits first.
   autoFetch: Joi.boolean().default(true),
   autoFetchCount: Joi.number().integer().min(0).max(50).default(6),
+  // Auto-fetch only pulls snapshots whose announced embedding model matches
+  // ours — the similarity search reads nothing else, so an incompatible
+  // snapshot is dead weight that still costs disk and a download. Flip on
+  // to opt back in (migration readiness, or seeding the swarm with blobs
+  // you can't search); the manual admin fetch always works regardless.
+  autoFetchIncompatibleModels: Joi.boolean().default(false),
   maxPeerDbStorageMb: Joi.number().integer().min(10).max(100000).default(500),
   // Sidecar memory watchdog: when the p2p-sidecar's resident set exceeds
   // this many MB, the mesh-health watch kills it and lets crash recovery
@@ -537,11 +543,6 @@ const dlnaOptions = Joi.object({
   shareUserData: Joi.boolean().default(true),
 });
 
-const subsonicOptions = Joi.object({
-  mode: Joi.string().valid('disabled', 'same-port', 'separate-port').default('disabled'),
-  port: Joi.number().integer().min(1).max(65535).default(3012),
-});
-
 // LAN service discovery. Advertises the API as a `_mstream._tcp` mDNS/DNS-SD
 // service so zero-config clients (the portable mStream player) can find the
 // server without typing an IP. Advertise-only: it exposes metadata, not the
@@ -571,7 +572,7 @@ const discoveryOptions = Joi.object({
 // `transmission` holds the saved RPC credentials for the Transmission
 // backend. Empty `host` means "no credentials saved" (the admin UI
 // shows the login form rather than the status card). Plaintext on
-// purpose — matches the existing pattern for `lastFM`, `discogs`, and
+// purpose — matches the existing pattern for `lastFM` and
 // `rpn.password`; encrypting these would be inconsistent and would
 // require a key-rotation story we don't have. Anyone who can read the
 // config file can also read the .torrent files; threat-modelling the
@@ -693,7 +694,6 @@ const schema = Joi.object({
     "opus": true, "m3u": false
   }),
   lastFM: lastFMOptions.default(lastFMOptions.validate({}).value),
-  discogs: discogsOptions.default(discogsOptions.validate({}).value),
   scanOptions: scanOptions.default(scanOptions.validate({}).value),
   noUpload: Joi.boolean().default(false),
   noMkdir: Joi.boolean().default(false),
@@ -715,28 +715,12 @@ const schema = Joi.object({
   lockAdmin: Joi.boolean().default(false),
   adminAccess: adminAccessOptions.default(adminAccessOptions.validate({}).value),
   storage: storageJoi.default(storageJoi.validate({}).value),
-  // 'default'  — mStream's classic UI (webapp/alpha/)
-  // 'velvet'   — mStream's alternative UI (webapp/velvet/)
-  // 'subsonic' — bundled Airsonic Refix (webapp/subsonic/), a third-party
-  //              Subsonic web client pointed at our own /rest/* endpoints.
-  //              Users log in with their mStream username + password;
-  //              every HTTP call from the UI speaks Subsonic.
-  ui: Joi.string().valid('default', 'velvet', 'subsonic').default('default'),
   webAppDirectory: Joi.string().default(path.join(appRoot, 'webapp')),
   rpn: rpnOptions.default(rpnOptions.validate({}).value),
   transcode: transcodeOptions.default(transcodeOptions.validate({}).value),
   updates: updatesOptions.default(updatesOptions.validate({}).value),
   lyrics: lyricsOptions.default(lyricsOptions.validate({}).value),
   secret: Joi.string().optional(),
-  // Separate secret used to derive the AES-256-GCM key for the
-  // Subsonic-specific password column added in V35. Kept distinct from
-  // `secret` (which signs JWTs) so the two can rotate independently —
-  // rotating the JWT secret invalidates active sessions; rotating the
-  // Subsonic secret invalidates all stored Subsonic passwords (users
-  // would have to re-set them via the mobile-clients panel).
-  // Auto-generated on first boot like `secret`, persisted to the
-  // config file.
-  subsonicSecret: Joi.string().optional(),
   maxRequestSize: Joi.string().pattern(/[0-9]+(KB|MB)/i).default('1MB'),
   // Cap on the total uncompressed size of a bulk zip download
   // (/api/v1/download/*). The source files are summed before any bytes are
@@ -793,7 +777,6 @@ const schema = Joi.object({
   federation: federationOptions.default(federationOptions.validate({}).value),
   discoveryP2p: discoveryP2pOptions.default(discoveryP2pOptions.validate({}).value),
   dlna: dlnaOptions.default(dlnaOptions.validate({}).value),
-  subsonic: subsonicOptions.default(subsonicOptions.validate({}).value),
   discovery: discoveryOptions.default(discoveryOptions.validate({}).value),
   torrent: torrentOptions.default(torrentOptions.validate({}).value),
   autoBootServerAudio: Joi.boolean().default(false),
@@ -847,19 +830,64 @@ export async function setup(configFileArg) {
     await fs.writeFile(configFileArg, JSON.stringify(programData, null, 2), 'utf8');
   }
 
-  // Setup the separate Subsonic-password secret. Kept independent of
-  // `secret` so a JWT-secret rotation doesn't accidentally invalidate
-  // every user's Subsonic password (HKDF derives the AES key from this
-  // secret; rotating it makes existing ciphertexts unreadable).
-  if (!programData.subsonicSecret) {
-    winston.info('Config file does not have subsonicSecret.  Generating a secret and saving');
-    programData.subsonicSecret = await asyncRandom(128);
-    await fs.writeFile(configFileArg, JSON.stringify(programData, null, 2), 'utf8');
+  // Settings that no longer exist. `ui` picked the web UI back when there
+  // were three of them; the bundled Subsonic client left with the Subsonic
+  // API and the velvet UI was removed (schema V69), so the default UI is the
+  // only one and the key means nothing — whatever its value. The admin panel
+  // wrote `"ui": "default"` into most config files for years, so the plain
+  // value is expected and gets an info line; a retired value ('velvet',
+  // 'subsonic') gets a warning, because that operator's users will see a
+  // different UI than they used to. `discogs` configured the velvet-only
+  // Discogs art lookup. Both keys are inert under allowUnknown; they are
+  // removed from the file and the result persisted, so the note appears
+  // exactly once (the lockAdmin -> adminAccess precedent).
+  {
+    const retired = [];
+    let retiredUi = null;
+    if (programData.ui !== undefined) {
+      retiredUi = programData.ui;
+      retired.push(retiredUi === 'default' ? 'ui' : `ui='${retiredUi}'`);
+      delete programData.ui;
+    }
+    if (programData.discogs !== undefined) { retired.push('discogs'); delete programData.discogs; }
+    if (retired.length > 0) {
+      const msg = `[config] Removing retired setting(s) ${retired.join(', ')} from the config file — `
+        + 'the default web UI is the only UI, and the Discogs art lookup went with the velvet UI.';
+      if (retiredUi !== null && retiredUi !== 'default') { winston.warn(msg); } else { winston.info(msg); }
+      await fs.writeFile(configFileArg, JSON.stringify(programData, null, 2), 'utf8');
+    }
+  }
+
+  // The Subsonic API, its per-user secrets and the bundled Subsonic web
+  // client were removed (docs/subsonic-deprecation.md). Two leftovers can
+  // sit in an existing config file (the third, ui: 'subsonic', is handled
+  // with the other retired settings above):
+  //   subsonic: {...}  — inert (validation runs with allowUnknown), but an
+  //                      operator who had the API on deserves one clear log
+  //                      line about why their clients stopped connecting.
+  //   subsonicSecret   — key material for the dropped password column;
+  //                      nothing can read those ciphertexts any more.
+  // Both are removed from the file and the result persisted, so the notice
+  // appears exactly once.
+  {
+    const stale = [];
+    if (programData.subsonic !== undefined) {
+      const mode = programData.subsonic && programData.subsonic.mode;
+      stale.push(mode && mode !== 'disabled' ? `subsonic.mode='${mode}'` : 'subsonic');
+      delete programData.subsonic;
+    }
+    if (programData.subsonicSecret !== undefined) { stale.push('subsonicSecret'); delete programData.subsonicSecret; }
+    if (stale.length > 0) {
+      winston.warn(`[config] The Subsonic API was removed in mStream 6.26 (see docs/subsonic-deprecation.md); `
+        + `dropping ${stale.join(', ')} from the config file. Subsonic clients can no longer connect `
+        + 'to this server — the first-party mStream apps are the supported clients.');
+      await fs.writeFile(configFileArg, JSON.stringify(programData, null, 2), 'utf8');
+    }
   }
 
   // Iroh tunnel identity (secretKey -> stable EndpointId) and the pipe secret
   // (connectSecret). Generated once and persisted up-front — same generate-and-
-  // persist precedent as secret/subsonicSecret/dlna.uuid — so the EndpointId and
+  // persist precedent as secret/dlna.uuid — so the EndpointId and
   // any issued QR stay stable across reboots, and so enabling the feature later
   // from the admin panel doesn't need a key-generation round-trip. secretKey is
   // base64 of exactly 32 bytes (the size Iroh's SecretKey expects).
@@ -884,8 +912,8 @@ export async function setup(configFileArg) {
   // Back-compat migration for the lockAdmin -> adminAccess rename. A config
   // file that predates adminAccess and had lockAdmin=true meant "admin
   // disabled", which is now adminAccess.mode='none'. Coerce + persist before
-  // validation so the upgrade is sticky (matches the secret/subsonicSecret/
-  // dlna.uuid generate-and-persist precedents in this function). A pre-existing
+  // validation so the upgrade is sticky (matches the secret/dlna.uuid
+  // generate-and-persist precedents in this function). A pre-existing
   // adminAccess always wins; a missing/false lockAdmin needs no migration
   // (adminAccess defaults to mode='all', which is the lockAdmin=false meaning).
   if (programData.adminAccess === undefined && programData.lockAdmin === true) {
@@ -949,24 +977,6 @@ export async function setup(configFileArg) {
       `trusts X-Forwarded-For, which clients can spoof unless a trusted reverse proxy overwrites it. ` +
       `Ensure your proxy strips/sets X-Forwarded-For, or the gate can be bypassed.`
     );
-  }
-
-  // Enforce the `ui=subsonic` <-> Subsonic same-port constraint: the
-  // bundled Airsonic Refix SPA is configured to talk to the SAME origin
-  // it was served from (env.js SERVER_URL=""). If Subsonic is disabled
-  // or on a separate port, the SPA loads fine but every /rest/* call
-  // 404s and the user sees a "no server" splash with no indication why.
-  // Auto-coerce to same-port + log a loud warning so the operator sees
-  // what we did.
-  if (program.ui === 'subsonic') {
-    if (program.subsonic.mode !== 'same-port') {
-      winston.warn(
-        `[config] ui='subsonic' requires subsonic.mode='same-port' (had '${program.subsonic.mode}'); ` +
-        `forcing same-port so the bundled Refix client can reach the /rest/* API it was built against. ` +
-        `Set ui='default' or ui='velvet' if you need Subsonic disabled/separate-port.`
-      );
-      program.subsonic.mode = 'same-port';
-    }
   }
 
   // Persist a stable DLNA UUID so renderers recognise the server across reboots

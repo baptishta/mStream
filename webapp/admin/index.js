@@ -52,9 +52,6 @@ const ADMINDATA = (() => {
   // dlna
   module.dlnaParams = {};
   module.dlnaParamsUpdated = { ts: 0 };
-  // subsonic
-  module.subsonicParams = {};
-  module.subsonicParamsUpdated = { ts: 0 };
 
   module.irohParams = {};
   module.irohParamsUpdated = { ts: 0 };
@@ -66,6 +63,12 @@ const ADMINDATA = (() => {
   // The key row the edit-limits modal is acting on (modals are global
   // components, so per-row context rides shared state, not props).
   module.federationLimitsTarget = { key: null };
+  // Federation requests (in-network pairing over discovery DMs, V67).
+  // Shared between the Federation tab's Requests card and the discovery
+  // catalog's relationship chips.
+  module.federationRequests = { list: [], acceptRequests: false };
+  module.federationRequestTarget = { row: null }; // accept modal context
+  module.federationComposeTarget = { peer: null }; // compose modal context
   // torrent (UX-layer settings — client + whitelist gating)
   module.torrentParams = {
     client:       'disabled',
@@ -102,14 +105,6 @@ const ADMINDATA = (() => {
     sampleMetadata:    {},
   };
   module.torrentPathTemplatesUpdated = { ts: 0 };
-  // subsonic — API keys for the currently-authenticated user. Keys are
-  // returned in full only at creation; subsequent listings are metadata-only.
-  module.apiKeys = [];
-  module.apiKeysUpdated = { ts: 0 };
-  // Holds the most recently minted key so the UI can render a one-time
-  // "copy this now" panel. Cleared as soon as the user dismisses it.
-  module.lastMintedKey = { val: null, name: null };
-
   module.getSharedPlaylists = async () => {
     const res = await API.axios({
       method: 'GET',
@@ -290,17 +285,6 @@ const ADMINDATA = (() => {
     module.dlnaParamsUpdated.ts = Date.now();
   }
 
-  module.getSubsonicParams = async () => {
-    try {
-      const res = await API.axios({
-        method: 'GET',
-        url: `${API.url()}/api/v1/admin/subsonic`
-      });
-      Object.keys(res.data).forEach(key => { module.subsonicParams[key] = res.data[key]; });
-    } catch (err) {}
-    module.subsonicParamsUpdated.ts = Date.now();
-  }
-
   module.getIroh = async () => {
     try {
       const res = await API.axios({
@@ -340,6 +324,17 @@ const ADMINDATA = (() => {
         url: `${API.url()}/api/v1/admin/federation/peers`
       });
       module.federationPeers.list = res.data;
+    } catch (err) {}
+  }
+
+  module.getFederationRequests = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/admin/federation/requests`
+      });
+      module.federationRequests.list = res.data.requests;
+      module.federationRequests.acceptRequests = res.data.acceptRequests === true;
     } catch (err) {}
   }
 
@@ -413,114 +408,6 @@ const ADMINDATA = (() => {
       module.torrentStatus.reason    = err.message || 'request failed';
     }
     module.torrentStatusUpdated.ts = Date.now();
-  }
-
-  // ── Subsonic API key management ───────────────────────────────────────
-  // All three helpers operate on the currently-authenticated user's keys
-  // via /api/v1/user/api-keys.
-  module.getApiKeys = async () => {
-    try {
-      const res = await API.axios({
-        method: 'GET',
-        url: `${API.url()}/api/v1/user/api-keys`
-      });
-      module.apiKeys.length = 0;
-      res.data.forEach(k => module.apiKeys.push(k));
-    } catch (err) { /* not fatal for panel load */ }
-    module.apiKeysUpdated.ts = Date.now();
-  }
-
-  module.createApiKey = async (name) => {
-    const res = await API.axios({
-      method: 'POST',
-      url: `${API.url()}/api/v1/user/api-keys`,
-      data: { name }
-    });
-    // Stash the plaintext key for the one-time display card.
-    module.lastMintedKey.val = res.data.key;
-    module.lastMintedKey.name = res.data.name;
-    await module.getApiKeys();
-    return res.data.key;
-  }
-
-  module.revokeApiKey = async (id) => {
-    await API.axios({
-      method: 'DELETE',
-      url: `${API.url()}/api/v1/user/api-keys/${id}`
-    });
-    await module.getApiKeys();
-  }
-
-  // ── Subsonic admin-panel polish data ────────────────────────────────
-  module.subsonicStats = { methodsImplemented: 0, methods: [], nowPlaying: [] };
-  module.subsonicStatsUpdated = { ts: 0 };
-  module.getSubsonicStats = async () => {
-    try {
-      const res = await API.axios({
-        method: 'GET', url: `${API.url()}/api/v1/admin/subsonic/stats`,
-      });
-      Object.assign(module.subsonicStats, res.data);
-    } catch (err) { /* UI shows placeholder */ }
-    module.subsonicStatsUpdated.ts = Date.now();
-  }
-
-  // Jukebox status card. `available: false` means autoBootServerAudio is
-  // disabled or the mstream-player binary isn't reachable — the UI
-  // hides the whole card in that case.
-  module.jukeboxStatus = { available: false };
-  module.jukeboxStatusUpdated = { ts: 0 };
-  module.getJukeboxStatus = async () => {
-    try {
-      const res = await API.axios({
-        method: 'GET', url: `${API.url()}/api/v1/admin/subsonic/jukebox`,
-      });
-      module.jukeboxStatus = res.data;
-    } catch (err) { module.jukeboxStatus = { available: false, reason: err.message }; }
-    module.jukeboxStatusUpdated.ts = Date.now();
-  }
-
-  // Recent token-auth rejections. Each entry is { username, client, at, ua }.
-  module.tokenAuthAttempts = [];
-  module.tokenAuthAttemptsUpdated = { ts: 0 };
-  module.getTokenAuthAttempts = async () => {
-    try {
-      const res = await API.axios({
-        method: 'GET', url: `${API.url()}/api/v1/admin/subsonic/token-auth-attempts`,
-      });
-      module.tokenAuthAttempts.length = 0;
-      (res.data.attempts || []).forEach(a => module.tokenAuthAttempts.push(a));
-    } catch (err) { /* empty list */ }
-    module.tokenAuthAttemptsUpdated.ts = Date.now();
-  }
-
-  module.clearTokenAuthAttempts = async () => {
-    await API.axios({
-      method: 'DELETE', url: `${API.url()}/api/v1/admin/subsonic/token-auth-attempts`,
-    });
-    await module.getTokenAuthAttempts();
-  }
-
-  // Admin mints a key on behalf of a specific user. Returns the plaintext
-  // key once so the admin can relay it to the affected client.
-  module.mintKeyFor = async (username, name) => {
-    const res = await API.axios({
-      method: 'POST',
-      url: `${API.url()}/api/v1/admin/subsonic/mint-key`,
-      data: { username, name },
-    });
-    return res.data;
-  }
-
-  // Hit the Subsonic API as a real client would and return { ok, latencyMs, ... }.
-  module.testSubsonicConnection = async () => {
-    try {
-      const res = await API.axios({
-        method: 'GET', url: `${API.url()}/api/v1/admin/subsonic/test`,
-      });
-      return res.data;
-    } catch (err) {
-      return { ok: false, reason: err.message };
-    }
   }
 
   module.getVersion = async () => {
@@ -628,17 +515,12 @@ ADMINDATA.getDbParams();
 ADMINDATA.getServerParams();
 ADMINDATA.getServerAudioInfo();
 ADMINDATA.getDlnaParams();
-ADMINDATA.getSubsonicParams();
 ADMINDATA.getIroh();
 ADMINDATA.getTorrentParams();
 ADMINDATA.getTorrentStatus();
 ADMINDATA.getTorrentList();
 ADMINDATA.getTorrentVpathAccess();
 ADMINDATA.getTorrentPathTemplates();
-ADMINDATA.getApiKeys();
-ADMINDATA.getSubsonicStats();
-ADMINDATA.getJukeboxStatus();
-ADMINDATA.getTokenAuthAttempts();
 ADMINDATA.getVersion();
 ADMINDATA.getWinDrives();
 ADMINDATA.getBackupDestinations();
@@ -1148,16 +1030,8 @@ const usersView = Vue.component('users-view', {
       directories: ADMINDATA.folders,
       users: ADMINDATA.users,
       usersTS: ADMINDATA.usersUpdated,
-      // Used to gate the optional Subsonic-password field on the
-      // user-create form — only shown if Subsonic is enabled.
-      subsonicParams: ADMINDATA.subsonicParams,
       newUsername: '',
       newPassword: '',
-      // Optional opt-in Subsonic-specific password (V35). When set,
-      // the new user can immediately use token-auth Subsonic clients
-      // (Symfonium, DSub, etc); otherwise the user has to set one
-      // themselves later via the mobile-clients panel.
-      newSubsonicPassword: '',
       makeAdmin: Object.keys(ADMINDATA.users).length === 0 ? true : false,
       allowMkdir: true,
       allowUpload: true,
@@ -1274,17 +1148,6 @@ const usersView = Vue.component('users-view', {
                     <div class="input-field directory-name-field col s12 m6">
                       <input @blur="maybeResetForm()" v-model="newPassword" id="new-password" required type="password" class="validate">
                       <label for="new-password">{{ t('admin.users.passwordLabel') }}</label>
-                    </div>
-                  </div>
-                  <div class="row" v-if="subsonicParams.mode && subsonicParams.mode !== 'disabled'">
-                    <div class="input-field directory-name-field col s12 m6">
-                      <input v-model="newSubsonicPassword" id="new-subsonic-password" type="password" class="validate">
-                      <label for="new-subsonic-password">Subsonic password (optional)</label>
-                    </div>
-                    <div class="col s12 m6" style="font-size: 0.85em; opacity: 0.85; padding-top: 1.5em;">
-                      Optional separate password for token-auth Subsonic clients.
-                      Stored encrypted (recoverable) — intentionally less secure than the main password.
-                      Leave blank to let the user set one themselves via the mobile-clients panel.
                     </div>
                   </div>
                   <div class="row">
@@ -1522,13 +1385,6 @@ const usersView = Vue.component('users-view', {
             allowUpload: this.allowUpload,
             allowServerAudio: this.allowServerAudio
           };
-          // V35: only include the field when the admin actually filled
-          // it in. Empty string would round-trip through Joi as
-          // "missing" anyway, but be explicit.
-          if (this.newSubsonicPassword) {
-            data.subsonicPassword = this.newSubsonicPassword;
-          }
-
           await API.axios({
             method: 'PUT',
             url: `${API.url()}/api/v1/admin/users`,
@@ -1539,7 +1395,6 @@ const usersView = Vue.component('users-view', {
           const addedName = this.newUsername;
           this.newUsername = '';
           this.newPassword = '';
-          this.newSubsonicPassword = '';
           this.selectUser(addedName);
 
           // if this is the first user, prompt user and take them to login page
@@ -1676,12 +1531,6 @@ const advancedView = Vue.component('advanced-view', {
                         [<a v-on:click="toggleTrustProxy()">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
-                    <tr>
-                      <td><b>{{ t('admin.settings.frontend') }}</b> {{uiLabel(params.ui)}}</td>
-                      <td>
-                        [<a v-on:click="switchUI()">switch to {{uiLabel(nextUI(params.ui))}}</a>]
-                      </td>
-                    </tr>
                   </tbody>
                 </table>
               </div>
@@ -1788,70 +1637,6 @@ const advancedView = Vue.component('advanced-view', {
     openModal: function(modalView) {
       modVM.currentViewModal = modalView;
       M.Modal.getInstance(document.getElementById('admin-modal')).open();
-    },
-    // Lookup: internal UI id → user-visible label. The `subsonic`
-    // value (Airsonic Refix — webapp/subsonic/) is still valid in
-    // the Joi validator and can be set by hand-editing config.json,
-    // but it is intentionally NOT listed in the switcher rotation
-    // below. The admin panel + shared pages don't yet render cleanly
-    // under the Subsonic UI; until that's sorted out we don't want
-    // to let operators trap themselves in a broken state by flipping
-    // to it from here. `uiLabel` still knows the Subsonic label so
-    // an operator who set it via config.json sees the correct name
-    // rendered instead of a raw 'subsonic' string.
-    uiLabel: function(id) {
-      return ({ default: 'Default', velvet: 'Velvet', subsonic: 'Subsonic UI' })[id] || id;
-    },
-    // Rotate through the switcher-exposed UIs on each click.
-    // Subsonic is deliberately omitted — see uiLabel comment.
-    nextUI: function(id) {
-      const order = ['default', 'velvet'];
-      const i = order.indexOf(id);
-      return order[(i < 0 ? 0 : i + 1) % order.length];
-    },
-    switchUI: function() {
-      const newUI = this.nextUI(this.params.ui);
-      const label = this.uiLabel(newUI);
-      iziToast.question({
-        timeout: 20000,
-        close: false,
-        overlayClose: true,
-        overlay: true,
-        displayMode: 'once',
-        id: 'question',
-        zindex: 99999,
-        layout: 2,
-        maxWidth: 600,
-        title: `<b>${t('admin.settings.switchFrontend', { label: label })}</b>`,
-        message: t('admin.settings.switchRestart'),
-        position: 'center',
-        buttons: [
-          [`<button><b>${t('admin.settings.switchingTo', { label: label })}</b></button>`, (instance, toast) => {
-            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
-            API.axios({
-              method: 'POST',
-              url: `${API.url()}/api/v1/admin/config/ui`,
-              data: { ui: newUI }
-            }).then(() => {
-              iziToast.success({
-                title: t('admin.settings.switchingTo', { label: label }),
-                message: t('admin.settings.serverRestarting'),
-                position: 'topCenter',
-                timeout: 3500
-              });
-            }).catch(() => {
-              iziToast.error({
-                title: t('admin.settings.failed'),
-                position: 'topCenter',
-                timeout: 3500
-              });
-            });
-          }, true],
-          [`<button>${t('admin.settings.cancel')}</button>`, (instance, toast) => {
-            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
-          }],
-        ]
-      });
     },
     removeSSL: function() {
       iziToast.question({
@@ -3334,6 +3119,10 @@ const lyricsView = Vue.component('lyrics-view', {
       // in the Database view's Enrichment Status card.
       writeSidecar: false,
       providers: { lrclib: true, netease: false, kugou: false },
+      // Read-only lyrics_cache ledger counters (hit / miss / error /
+      // pending / total) + a transient message next to the purge buttons.
+      cache: null,
+      cachePurgeMsg: null,
     };
   },
   template: `
@@ -3371,6 +3160,34 @@ const lyricsView = Vue.component('lyrics-view', {
               </div>
             </div>
           </div>
+          <div class="col s12">
+            <div class="card">
+              <div class="card-content">
+                <span class="card-title">Lyrics Cache</span>
+                <p>The backfill worker keeps a cache / cooldown ledger of every lookup it has made, so tracks with no lyrics are not re-queried on every pass. The counters are read-only; the purge buttons make the worker try again.</p>
+                <table v-if="loaded && cache" style="max-width:400px">
+                  <tbody>
+                    <tr><td><b>Cached hits</b></td>  <td>{{cache.hit}}</td></tr>
+                    <tr><td><b>Cached misses</b></td><td>{{cache.miss}}</td></tr>
+                    <tr><td><b>Errors</b></td>       <td>{{cache.error}}</td></tr>
+                    <tr><td><b>Pending</b></td>      <td>{{cache.pending}}</td></tr>
+                    <tr><td><b>Total rows</b></td>   <td>{{cache.total}}</td></tr>
+                  </tbody>
+                </table>
+                <p style="margin-top:12px">
+                  <a v-on:click="purgeLyricsCache('retry')" class="btn-flat waves-effect" style="padding:0 8px">
+                    Retry errors
+                  </a>
+                  <a v-on:click="purgeLyricsCache('full')" class="btn-flat waves-effect red-text" style="padding:0 8px">
+                    Purge all
+                  </a>
+                  <span v-if="cachePurgeMsg" style="margin-left:12px;color:#5cb85c">
+                    {{cachePurgeMsg}}
+                  </span>
+                </p>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>`,
@@ -3378,6 +3195,7 @@ const lyricsView = Vue.component('lyrics-view', {
     try {
       await ADMINDATA.getLyricsParams();
       this.writeSidecar = !!ADMINDATA.lyricsParams.writeSidecar;
+      this.cache = ADMINDATA.lyricsParams.cache || null;
       const list = Array.isArray(ADMINDATA.lyricsParams.providers) ? ADMINDATA.lyricsParams.providers : ['lrclib'];
       this.providers = {
         lrclib: list.includes('lrclib'),
@@ -3423,6 +3241,23 @@ const lyricsView = Vue.component('lyrics-view', {
       }).catch(() => {
         iziToast.error({ title: 'Update failed', position: 'topCenter', timeout: 3000 });
       });
+    },
+    // Lyrics cache ledger purge. mode='full' wipes all rows, 'retry'
+    // clears error/pending; each call refreshes the counters.
+    purgeLyricsCache: async function (mode) {
+      try {
+        const r = await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/lyrics/cache/purge`,
+          data: { mode },
+        });
+        this.cachePurgeMsg = `Removed ${r.data.removed} row(s).`;
+        setTimeout(() => { this.cachePurgeMsg = null; }, 4000);
+        await ADMINDATA.getLyricsParams();
+        this.cache = ADMINDATA.lyricsParams.cache || null;
+      } catch (err) {
+        iziToast.error({ title: `Purge failed: ${escHtml(err.message || '?')}`, position: 'topCenter', timeout: 3000 });
+      }
     },
   },
 });
@@ -3948,7 +3783,10 @@ const federationView = Vue.component('federation-view', {
       fed: ADMINDATA.federationParams,
       keys: ADMINDATA.federationKeys,
       peers: ADMINDATA.federationPeers,
+      requests: ADMINDATA.federationRequests,
       togglePending: false,
+      inboxPending: false,
+      reqPollTimer: null,
       // Add-peer form state
       peerTicket: '',
       peerName: '',
@@ -3958,6 +3796,10 @@ const federationView = Vue.component('federation-view', {
     };
   },
   computed: {
+    // Rows waiting on a human here — what the Requests card badge counts.
+    pendingInbound() {
+      return this.requests.list.filter((r) => r.direction === 'in' && r.state === 'received').length;
+    },
     // Client-side preview of a pasted ticket: decode mstrfed1:<base64url(JSON)>
     // just enough to show who/what before the admin commits. Parse errors
     // return null and the UI shows a gentle "doesn't look right" hint.
@@ -3986,6 +3828,7 @@ const federationView = Vue.component('federation-view', {
       ADMINDATA.getFederation();
       ADMINDATA.getFederationKeys();
       ADMINDATA.getFederationPeers();
+      ADMINDATA.getFederationRequests();
     },
     setRowPending(id, val) { Vue.set(this.rowPending, id, val); },
     async toggle() {
@@ -4119,9 +3962,154 @@ const federationView = Vue.component('federation-view', {
       if (peer.last_status) { return '#c62828'; }
       return '#9e9e9e';
     },
+    // ── Federation requests (the Requests card) ──────────────────────
+    // One chip vocabulary for every state: the pair is [family, label],
+    // family picks the pastel. Kept as data so the state→UI matrix in the
+    // design doc stays checkable against one table here.
+    reqChip(r) {
+      const map = {
+        'out:pending-delivery': ['wait', 'sending…'],
+        'out:delivered': ['wait', 'waiting on them'],
+        'out:granting': ['wait', 'sharing back…'],
+        'in:received': ['theirs', 'needs your answer'],
+        'in:accepted': ['wait', 'sending your ticket…'],
+        'in:granting': ['wait', 'waiting on their share'],
+        'out:rejected': ['dead', 'declined'],
+        'in:rejected': ['dead', 'you declined'],
+        'out:refused': ['dead', 'their inbox is closed'],
+      };
+      const any = { completed: ['good', 'federated'], cancelled: ['mute', 'withdrawn'], expired: ['mute', 'expired'] };
+      return map[`${r.direction}:${r.state}`] || any[r.state] || ['mute', r.state];
+    },
+    reqChipStyle(fam) {
+      const pal = {
+        wait: '#fff8e1;color:#8d6e00', theirs: '#e8eaf6;color:#3949ab',
+        good: '#e8f5e9;color:#2e7d32', dead: '#fdecea;color:#b71c1c',
+        mute: '#f5f5f5;color:#757575',
+      };
+      return `display:inline-block;padding:2px 9px;border-radius:10px;font-size:0.78em;font-weight:600;white-space:nowrap;background:${pal[fam] || pal.mute}`;
+    },
+    // Retry info replaces a retry button: rendered straight off the
+    // engine's ladder state, never re-implemented client-side.
+    reqRetryLine(r) {
+      const sending = (r.direction === 'out' && ['pending-delivery', 'granting'].includes(r.state))
+        || (r.direction === 'in' && r.state === 'accepted');
+      if (!sending || !r.fail_count || !r.next_attempt_at) { return null; }
+      const ms = new Date(r.next_attempt_at.replace(' ', 'T') + 'Z').getTime() - Date.now();
+      let eta = 'any moment now';
+      if (Number.isFinite(ms) && ms > 45000) {
+        const min = Math.round(ms / 60000);
+        eta = min < 90 ? `in ~${min} min` : `in ~${Math.round(min / 60)} h`;
+      }
+      return `retry #${r.fail_count + 1} ${eta}`;
+    },
+    reqAge(r) {
+      const ms = Date.now() - new Date(String(r.created_at).replace(' ', 'T') + 'Z').getTime();
+      if (!Number.isFinite(ms) || ms < 90000) { return 'now'; }
+      const min = Math.round(ms / 60000);
+      if (min < 90) { return `${min} min`; }
+      const h = Math.round(min / 60);
+      if (h < 36) { return `${h} h`; }
+      return `${Math.round(h / 24)} d`;
+    },
+    fp(id) { return String(id || '').slice(0, 12) + '…'; },
+    reqPeerFor(r) {
+      return r.created_peer_id ? this.peers.list.find((p) => p.id === r.created_peer_id) : null;
+    },
+    async toggleInbox() {
+      this.inboxPending = true;
+      try {
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/federation/accept-requests`,
+          data: { enabled: !this.requests.acceptRequests },
+        });
+      } catch (e) {
+        iziToast.error({ title: 'Error', message: 'Failed to update the request inbox setting.' });
+      }
+      await ADMINDATA.getFederationRequests(); // mirror the server's truth
+      this.inboxPending = false;
+    },
+    openAcceptModal(r) {
+      ADMINDATA.federationRequestTarget.row = r;
+      modVM.currentViewModal = 'federation-request-accept-modal';
+      M.Modal.getInstance(document.getElementById('admin-modal')).open();
+    },
+    rejectRequest(r) {
+      // peer_name is self-asserted by the remote server — it only ever
+      // reaches toast HTML through escHtml (R1).
+      const who = escHtml(r.peer_name || this.fp(r.peer_endpoint_id));
+      iziToast.question({
+        timeout: 30000, close: false, overlayClose: true, overlay: true,
+        displayMode: 'once', id: 'question', zindex: 99999, layout: 2, maxWidth: 600,
+        title: `<b>Reject the request from ${who}?</b>`
+          + `<div style="margin:10px 0 2px"><input id="fedreq-reject-reason" type="text" maxlength="200" placeholder="Reason (optional, sent to them)" style="width:100%"></div>`
+          + `<div style="font-size:0.85em;color:#616161;margin-top:6px">Further requests from this server are ignored for 7 days.</div>`,
+        position: 'center',
+        buttons: [
+          [`<button><b>Reject</b></button>`, async (instance, toast) => {
+            const reason = (document.getElementById('fedreq-reject-reason')?.value || '').trim();
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+            this.setRowPending(r.id, true);
+            try {
+              await API.axios({
+                method: 'POST',
+                url: `${API.url()}/api/v1/admin/federation/requests/${r.id}/reject`,
+                data: reason ? { reason } : {},
+              });
+              iziToast.success({ title: 'Rejected', message: `${who} was told no${reason ? '' : ' (no reason given)'}.`, position: 'topCenter', timeout: 3500 });
+            } catch (e) {
+              iziToast.error({ title: 'Error', message: escHtml(e.response?.data?.error || 'Failed to reject the request.'), position: 'topCenter', timeout: 4000 });
+            }
+            await ADMINDATA.getFederationRequests();
+            this.setRowPending(r.id, false);
+          }, true],
+          [`<button>Go Back</button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+          }],
+        ],
+      });
+    },
+    async cancelRequest(r) {
+      this.setRowPending(r.id, true);
+      try {
+        await API.axios({ method: 'POST', url: `${API.url()}/api/v1/admin/federation/requests/${r.id}/cancel` });
+      } catch (e) {
+        iziToast.error({ title: 'Error', message: escHtml(e.response?.data?.error || 'Failed to withdraw the request.'), position: 'topCenter', timeout: 4000 });
+      }
+      await ADMINDATA.getFederationRequests();
+      this.setRowPending(r.id, false);
+    },
+    async dismissRequest(r) {
+      this.setRowPending(r.id, true);
+      try {
+        await API.axios({ method: 'DELETE', url: `${API.url()}/api/v1/admin/federation/requests/${r.id}` });
+      } catch (e) {
+        iziToast.error({ title: 'Error', message: escHtml(e.response?.data?.error || 'Failed to dismiss the request.'), position: 'topCenter', timeout: 4000 });
+      }
+      await ADMINDATA.getFederationRequests();
+      this.setRowPending(r.id, false);
+    },
+    scrollToPeers() {
+      document.getElementById('fed-peers-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    },
     fmtDate(s) { return s ? s.replace('T', ' ').slice(0, 16) : '—'; },
   },
-  mounted() { this.refresh(); },
+  mounted() {
+    this.refresh();
+    // Inbound requests and DM-driven state advances land without a user
+    // action here — poll quietly while the tab is on screen so they appear
+    // without a manual reload (same guard as the discovery card's poll).
+    this.reqPollTimer = setInterval(() => {
+      if (document.hidden) { return; }
+      if (this.fed.enabled !== true) { return; }
+      ADMINDATA.getFederationRequests();
+      ADMINDATA.getFederationPeers();
+    }, 30000);
+  },
+  beforeDestroy() {
+    if (this.reqPollTimer) { clearInterval(this.reqPollTimer); this.reqPollTimer = null; }
+  },
   template: `
     <div v-if="fedTS.ts === 0" class="row">
       <svg class="spinner" width="65px" height="65px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
@@ -4146,6 +4134,65 @@ const federationView = Vue.component('federation-view', {
               <a v-on:click="toggle()" :class="{disabled: togglePending}" class="waves-effect waves-light btn right">
                 {{ fed.enabled ? 'Turn Off' : 'Turn On' }}
               </a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="fed.enabled" class="row">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Federation Requests
+                <span v-if="pendingInbound > 0" style="display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:22px;border-radius:11px;background:#ef5350;color:#fff;font-size:0.55em;font-weight:700;padding:0 7px;vertical-align:4px">{{ pendingInbound }}</span>
+              </span>
+              <p style="font-size:0.9em;color:#777">Servers on the discovery network can ask to pair with you here — and this is where your own asks live. No access changes hands until a request is accepted.</p>
+              <div style="display:flex;align-items:center;gap:14px;margin:6px 0 14px;flex-wrap:wrap">
+                <div class="switch"><label>
+                  <input type="checkbox" :checked="requests.acceptRequests" :disabled="inboxPending" v-on:change="toggleInbox()"/>
+                  <span class="lever"></span>
+                </label></div>
+                <span>Accept requests from the discovery network</span>
+                <span style="font-size:0.85em;color:#777">— off by default; when off, new requests are refused at the transport, but answers to <i>your</i> requests still arrive.</span>
+              </div>
+              <p v-if="requests.acceptRequests && pendingInbound >= 50" style="font-size:0.9em;color:#8d6e00">Inbox is full — new requests are refused until you act on these.</p>
+              <div v-if="requests.list.length > 0" style="overflow-x:auto">
+              <table class="striped">
+                <thead><tr><th>Server</th><th>Message / Offer</th><th>Status</th><th style="width:90px">Age</th><th style="width:220px"></th></tr></thead>
+                <tbody>
+                  <tr v-for="r in requests.list" :key="r.id">
+                    <td>
+                      <b>{{ r.peer_name || '(unnamed server)' }}</b>
+                      <div style="font-family:monospace;font-size:0.78em;color:#757575">{{ fp(r.peer_endpoint_id) }}</div>
+                    </td>
+                    <td style="max-width:290px;font-size:0.9em">
+                      <div v-if="r.message" style="color:#424242">“{{ r.message }}”</div>
+                      <div v-if="r.direction === 'in'" style="color:#777">{{ r.offered_libraries.length ? 'offers: ' + r.offered_libraries.join(', ') : 'offers nothing' }}</div>
+                      <div v-else style="color:#777">{{ r.offered_libraries.length ? 'you offered: ' + r.offered_libraries.join(', ') : 'you offered nothing' }}</div>
+                    </td>
+                    <td style="font-size:0.95em">
+                      <span :style="reqChipStyle(reqChip(r)[0])">{{ reqChip(r)[1] }}</span>
+                      <div v-if="reqRetryLine(r)" style="font-size:0.8em;color:#8d6e00;margin-top:3px">{{ reqRetryLine(r) }}</div>
+                      <div v-if="r.direction === 'out' && r.state === 'rejected' && r.reject_reason" style="font-size:0.85em;color:#757575;margin-top:3px">“{{ r.reject_reason }}”</div>
+                      <div v-if="r.direction === 'in' && r.state === 'rejected'" style="font-size:0.8em;color:#757575;margin-top:3px">requests from this server are ignored for 7 days</div>
+                      <div v-if="r.state === 'completed' && reqPeerFor(r)" style="font-size:0.85em;margin-top:3px"><a v-on:click="scrollToPeers()" style="cursor:pointer">view peer</a></div>
+                    </td>
+                    <td style="font-size:0.9em">{{ reqAge(r) }}</td>
+                    <td class="right-align">
+                      <template v-if="r.direction === 'in' && r.state === 'received'">
+                        <a class="btn-small green waves-effect" :class="{disabled: rowPending[r.id]}" v-on:click="openAcceptModal(r)">Accept…</a>
+                        <a class="btn-flat btn-small waves-effect" :class="{disabled: rowPending[r.id]}" v-on:click="rejectRequest(r)">Reject</a>
+                      </template>
+                      <a v-else-if="r.direction === 'out' && ['pending-delivery', 'delivered'].includes(r.state)"
+                        class="btn-flat btn-small waves-effect" :class="{disabled: rowPending[r.id]}" v-on:click="cancelRequest(r)">Cancel</a>
+                      <a v-else-if="['completed', 'rejected', 'refused', 'cancelled', 'expired'].includes(r.state)"
+                        class="btn-flat btn-small waves-effect" :class="{disabled: rowPending[r.id]}" v-on:click="dismissRequest(r)">Dismiss</a>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              </div>
+              <p v-else-if="requests.acceptRequests" style="color:#777">No requests yet — servers on the discovery network can find you here.</p>
             </div>
           </div>
         </div>
@@ -4193,7 +4240,7 @@ const federationView = Vue.component('federation-view', {
 
       <div v-if="fed.enabled" class="row">
         <div class="col s12">
-          <div class="card">
+          <div class="card" id="fed-peers-card">
             <div class="card-content">
               <span class="card-title">Peers — Servers You Can Read</span>
               <table v-if="peers.list.length > 0" class="striped">
@@ -4924,567 +4971,6 @@ const dlnaView = Vue.component('dlna-view', {
   }
 });
 
-const subsonicView = Vue.component('subsonic-view', {
-  data() {
-    return {
-      paramsTS: ADMINDATA.subsonicParamsUpdated,
-      params: ADMINDATA.subsonicParams,
-      selectedMode: 'disabled',
-      selectedPort: 3012,
-      applyPending: false,
-      // API keys — the state lives in ADMINDATA so every view sees a fresh
-      // list, but we reach in locally for the inputs driving this form.
-      apiKeysTS:  ADMINDATA.apiKeysUpdated,
-      apiKeys:    ADMINDATA.apiKeys,
-      newKeyName: '',
-      mintPending: false,
-      lastMintedKey: ADMINDATA.lastMintedKey,
-      // Polish widgets — stats / now-playing / jukebox / token-auth log.
-      statsTS:            ADMINDATA.subsonicStatsUpdated,
-      stats:              ADMINDATA.subsonicStats,
-      jukeboxTS:          ADMINDATA.jukeboxStatusUpdated,
-      jukebox:            ADMINDATA.jukeboxStatus,
-      tokenAttemptsTS:    ADMINDATA.tokenAuthAttemptsUpdated,
-      tokenAttempts:      ADMINDATA.tokenAuthAttempts,
-      testResult:         null,
-      testPending:        false,
-      showMethodList:     false,
-      // Transient success message shown next to the purge buttons.
-      lyricsCachePurgeMsg: null,
-      // One-time display for admin-minted-on-behalf-of keys. Mirrors
-      // `lastMintedKey` but carries the target username too.
-      adminMintedForUser: { val: null, name: null, username: null },
-      pollTimer:          null,
-    };
-  },
-
-  mounted() {
-    // Refresh the live widgets every 5s so now-playing / jukebox state
-    // stays fresh without the admin reloading the page. Stopped on unmount.
-    this.pollTimer = setInterval(() => {
-      ADMINDATA.getSubsonicStats();
-      ADMINDATA.getJukeboxStatus();
-      ADMINDATA.getTokenAuthAttempts();
-    }, 5000);
-  },
-  beforeDestroy() {
-    if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
-  },
-  watch: {
-    'paramsTS.ts': {
-      immediate: true,
-      handler: function() {
-        this.selectedMode = this.params.mode || 'disabled';
-        this.selectedPort = this.params.port || 3012;
-      }
-    }
-  },
-  template: `
-    <div v-if="paramsTS.ts === 0" class="row">
-      <svg class="spinner" width="65px" height="65px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
-    </div>
-    <div v-else class="container">
-      <div class="row" style="margin-top:24px">
-        <div class="col s12">
-          <div class="card">
-            <div class="card-content">
-              <span class="card-title">Subsonic REST API</span>
-              <div class="card-panel amber lighten-4" style="margin-top:12px">
-                <p><b>Deprecated:</b> the Subsonic API will be removed in a future release once the first-party mStream apps are available. Development focus is on the first-party apps and their iroh-based Quick Connect, which no third-party client can offer. The Subsonic surface is frozen &mdash; crash and security fixes only, no new endpoints.</p>
-                <p style="margin-top:8px">If you rely on the Subsonic API, please say so on <a href="https://github.com/IrosTheBeggar/mStream/issues" target="_blank" rel="noopener">GitHub</a> or Discord &mdash; real usage reports are what decide the removal timeline.</p>
-              </div>
-              <p>The Subsonic API lets you use third-party music apps &mdash; DSub, Symfonium, Substreamer, play:Sub, Feishin, Sonixd, and many others &mdash; as clients for your mStream library. Each user signs in with their mStream username and password (or an API key they generate on their profile) from inside the client app.</p>
-              <div style="margin-top:16px">
-                <p><b>Current mode:</b> {{params.mode || 'disabled'}}</p>
-                <p v-if="params.mode === 'separate-port'"><b>Subsonic port:</b> {{params.port}}</p>
-              </div>
-              <div style="margin-top:20px">
-                <p><b>Change mode:</b></p>
-                <p>
-                  <label style="margin-right:20px">
-                    <input type="radio" v-model="selectedMode" value="disabled" />
-                    <span>Disabled</span>
-                  </label>
-                  <label style="margin-right:20px">
-                    <input type="radio" v-model="selectedMode" value="same-port" />
-                    <span>Same port as mStream</span>
-                  </label>
-                  <label>
-                    <input type="radio" v-model="selectedMode" value="separate-port" />
-                    <span>Separate port</span>
-                  </label>
-                </p>
-                <div v-if="selectedMode === 'separate-port'" style="margin-top:12px">
-                  <div class="input-field" style="max-width:200px">
-                    <input id="subsonic-port" type="number" v-model.number="selectedPort" min="1" max="65535" />
-                    <label for="subsonic-port" class="active">Subsonic Port</label>
-                  </div>
-                </div>
-              </div>
-              <div v-if="selectedMode !== 'disabled'" class="card-panel orange lighten-4" style="margin-top:16px">
-                <p><b>Security notice:</b> Subsonic clients authenticate with your mStream user credentials. For best security, enable HTTPS before exposing the Subsonic API to untrusted networks, and use an API key in each client instead of sharing your password.</p>
-                <p style="margin-top:8px">Mint and revoke API keys in the section below. Token-style auth (<code>t=</code>, <code>s=</code>) is not supported &mdash; use plaintext over HTTPS, or an API key.</p>
-              </div>
-            </div>
-            <div class="card-action flow-root">
-              <a v-on:click="applyMode()" :disabled="applyPending"
-                 class="waves-effect waves-light btn right">
-                Apply
-              </a>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Methods implemented + test connection -->
-      <div v-if="params.mode !== 'disabled'" class="row">
-        <div class="col s12 m6">
-          <div class="card">
-            <div class="card-content">
-              <span class="card-title">API Surface</span>
-              <p style="font-size:32px;font-weight:300;margin:8px 0">
-                {{stats.methodsImplemented || '—'}}
-                <span style="font-size:14px;color:#777;font-weight:400">
-                  Subsonic methods implemented
-                </span>
-              </p>
-              <p v-if="stats.fullCount != null" style="color:#777;margin:0 0 4px">
-                <small>{{stats.fullCount}} fully implemented &middot; {{stats.stubCount}} stubbed (empty response — real feature not backed)</small>
-              </p>
-              <p style="color:#777"><small>Subsonic 1.16.1 + OpenSubsonic defines roughly 70 methods. The ones this server does not implement at all return a "method not found" error — see the decline list in docs/subsonic-phase3.md.</small></p>
-              <a v-on:click="showMethodList = !showMethodList" class="btn-flat waves-effect" style="padding:0 8px">
-                {{showMethodList ? 'Hide' : 'Show'}} method list
-              </a>
-              <div v-if="showMethodList" style="margin-top:12px;max-height:220px;overflow-y:auto;background:#f5f5f5;padding:8px;border-radius:4px;font-family:monospace;font-size:12px">
-                <!-- New shape: per-method {name, status}. Fall back to the
-                     plain list on older server builds that don't emit it. -->
-                <div v-if="stats.methodStatuses && stats.methodStatuses.length">
-                  <div v-for="m in stats.methodStatuses" :key="m.name">
-                    <span v-if="m.status === 'stub'"
-                          style="display:inline-block;min-width:42px;background:#f0ad4e;color:#fff;padding:0 4px;border-radius:2px;margin-right:6px;font-size:10px;text-align:center;vertical-align:1px">STUB</span>
-                    <span v-else
-                          style="display:inline-block;min-width:42px;background:#5cb85c;color:#fff;padding:0 4px;border-radius:2px;margin-right:6px;font-size:10px;text-align:center;vertical-align:1px">FULL</span>
-                    {{m.name}}
-                  </div>
-                </div>
-                <div v-else>
-                  <div v-for="m in stats.methods" :key="m">{{m}}</div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-        <div class="col s12 m6">
-          <div class="card">
-            <div class="card-content">
-              <span class="card-title">Test Connection</span>
-              <p>Make a ping request against the running Subsonic endpoint as if a client were connecting. Useful for verifying a mode change took effect.</p>
-              <a v-on:click="runTest()" :disabled="testPending"
-                 class="waves-effect waves-light btn" style="margin-top:8px">
-                {{testPending ? 'Testing…' : 'Test Connection'}}
-              </a>
-              <div v-if="testResult" style="margin-top:16px" :class="testResult.ok ? 'card-panel green lighten-4' : 'card-panel red lighten-4'">
-                <p><b>{{testResult.ok ? 'OK' : 'Failed'}}</b>
-                  <span v-if="testResult.ok"> — {{testResult.latencyMs}}ms, server v{{testResult.serverVersion}}</span>
-                  <span v-else> — {{testResult.reason || testResult.status || 'unknown error'}}</span>
-                </p>
-                <p v-if="testResult.url" style="margin-top:6px"><small><code>{{testResult.url}}</code></small></p>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Now-playing strip -->
-      <div v-if="params.mode !== 'disabled'" class="row">
-        <div class="col s12">
-          <div class="card">
-            <div class="card-content">
-              <span class="card-title">Now Playing</span>
-              <p v-if="stats.nowPlaying.length === 0" style="color:#777"><i>Nobody is streaming right now.</i></p>
-              <table v-else class="striped">
-                <thead>
-                  <tr><th>User</th><th>Track</th><th>Artist</th><th>Album</th><th>Since</th></tr>
-                </thead>
-                <tbody>
-                  <tr v-for="p in stats.nowPlaying" :key="p.username + ':' + p.trackId">
-                    <td><b>{{p.username}}</b></td>
-                    <td>{{p.title || '(unknown title)'}}</td>
-                    <td>{{p.artist || '—'}}</td>
-                    <td>{{p.album || '—'}}</td>
-                    <td><small>{{formatSince(p.sinceMs)}}</small></td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Lyrics cache ledger (read-only). Lyrics are filled by the proactive
-           backfill worker now, configured in the dedicated "Lyrics" admin
-           section — this card only surfaces the cache / cooldown ledger and a
-           purge control. Visible regardless of Subsonic mode because the
-           ledger is shared by every lyrics path. -->
-      <div v-if="stats.lyrics" class="row">
-        <div class="col s12">
-          <div class="card">
-            <div class="card-content">
-              <span class="card-title">Lyrics Cache</span>
-              <p>
-                Lyrics are fetched ahead of time by the proactive backfill worker.
-                Enable it, choose providers, and toggle sidecar writing in the
-                <b>Lyrics</b> admin section. This card just shows the read-only
-                cache / cooldown ledger that the worker keeps.
-              </p>
-              <table v-if="stats.lyrics.cache" style="max-width:400px">
-                <tbody>
-                  <tr><td><b>Cached hits</b></td>  <td>{{stats.lyrics.cache.hit}}</td></tr>
-                  <tr><td><b>Cached misses</b></td><td>{{stats.lyrics.cache.miss}}</td></tr>
-                  <tr><td><b>Errors</b></td>       <td>{{stats.lyrics.cache.error}}</td></tr>
-                  <tr><td><b>Pending</b></td>      <td>{{stats.lyrics.cache.pending}}</td></tr>
-                  <tr><td><b>Total rows</b></td>   <td>{{stats.lyrics.cache.total}}</td></tr>
-                </tbody>
-              </table>
-              <p style="margin-top:12px">
-                <a v-on:click="purgeLyricsCache('retry')" class="btn-flat waves-effect" style="padding:0 8px">
-                  Retry errors
-                </a>
-                <a v-on:click="purgeLyricsCache('full')" class="btn-flat waves-effect red-text" style="padding:0 8px">
-                  Purge all
-                </a>
-                <span v-if="lyricsCachePurgeMsg" style="margin-left:12px;color:#5cb85c">
-                  {{lyricsCachePurgeMsg}}
-                </span>
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Jukebox live status -->
-      <div v-if="params.mode !== 'disabled' && jukebox.available" class="row">
-        <div class="col s12">
-          <div class="card">
-            <div class="card-content">
-              <span class="card-title">Jukebox (Server Audio)</span>
-              <p>
-                <span v-if="jukebox.playing" class="chip green lighten-4" style="font-size:12px">Playing</span>
-                <span v-else-if="jukebox.paused" class="chip orange lighten-4" style="font-size:12px">Paused</span>
-                <span v-else class="chip grey lighten-3" style="font-size:12px">Idle</span>
-                <span v-if="jukebox.queueLength > 0" style="margin-left:12px">
-                  Track {{jukebox.queueIndex + 1}} of {{jukebox.queueLength}}
-                </span>
-              </p>
-              <p v-if="jukebox.currentFile"><b>Current file:</b> <code>{{jukebox.currentFile}}</code></p>
-              <p v-if="jukebox.duration > 0">
-                <b>Position:</b> {{formatSeconds(jukebox.position)}} / {{formatSeconds(jukebox.duration)}}
-              </p>
-              <p>
-                <b>Volume:</b> {{Math.round(jukebox.volume * 100)}}% &middot;
-                <b>Loop:</b> {{jukebox.loopMode}} &middot;
-                <b>Shuffle:</b> {{jukebox.shuffle ? 'on' : 'off'}}
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Token-auth warning log -->
-      <div v-if="params.mode !== 'disabled' && tokenAttempts.length > 0" class="row">
-        <div class="col s12">
-          <div class="card orange lighten-5">
-            <div class="card-content">
-              <span class="card-title" style="color:#bf5700">Token-auth attempts — clients stuck in a login loop</span>
-              <p>mStream cannot support Subsonic's legacy token auth (the server would need the plaintext password to compute the MD5 digest — it only keeps PBKDF2 hashes). Clients that default to token auth get rejected with error 41 and usually loop. Mint an API key for the affected user below and hand it to them.</p>
-              <table class="striped" style="margin-top:12px">
-                <thead>
-                  <tr><th>User</th><th>Client</th><th>When</th><th></th></tr>
-                </thead>
-                <tbody>
-                  <tr v-for="(a, i) in tokenAttempts" :key="i">
-                    <td><b>{{a.username || '(anonymous)'}}</b></td>
-                    <td>{{a.client || '—'}}</td>
-                    <td><small>{{formatSince(Date.now() - a.at)}} ago</small></td>
-                    <td>
-                      <a v-if="a.username" v-on:click="mintForUser(a.username)"
-                         class="btn-small waves-effect waves-light blue">Generate key for {{a.username}}</a>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-            <div class="card-action flow-root">
-              <a v-on:click="clearTokenLog()" class="btn-flat waves-effect right">Clear log</a>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Admin-minted-key one-time display -->
-      <div v-if="adminMintedForUser.val" class="row">
-        <div class="col s12">
-          <div class="card-panel green lighten-4">
-            <p><b>Key created for user "{{adminMintedForUser.username}}":</b> {{adminMintedForUser.name}}</p>
-            <p style="margin-top:8px">
-              <code style="user-select:all;word-break:break-all;background:#fff;padding:4px 8px;border-radius:4px;display:inline-block">{{adminMintedForUser.val}}</code>
-            </p>
-            <p style="margin-top:8px"><small>Relay this to the user. They paste it as their API key in their Subsonic client.</small></p>
-            <a v-on:click="dismissAdminMintedKey()" class="waves-effect btn-flat">Dismiss</a>
-          </div>
-        </div>
-      </div>
-
-      <div class="row">
-        <div class="col s12">
-          <div class="card">
-            <div class="card-content">
-              <span class="card-title">Your Subsonic API Keys</span>
-              <p>API keys are per-user. Each key authenticates Subsonic clients without exposing your mStream password. The full key value is only shown at creation &mdash; copy it into your client immediately, or revoke it and mint a new one.</p>
-
-              <div v-if="lastMintedKey.val" class="card-panel green lighten-4" style="margin-top:16px">
-                <p><b>New key created:</b> {{lastMintedKey.name}}</p>
-                <p style="margin-top:8px">
-                  <code style="user-select:all;word-break:break-all;background:#fff;padding:4px 8px;border-radius:4px;display:inline-block">{{lastMintedKey.val}}</code>
-                </p>
-                <p style="margin-top:8px"><small>This is the only time the full key will be shown. Paste it into your Subsonic client now.</small></p>
-                <a v-on:click="dismissMintedKey()" class="waves-effect btn-flat">Dismiss</a>
-              </div>
-
-              <div style="margin-top:16px">
-                <div class="row" style="margin-bottom:0">
-                  <div class="input-field col s12 m8">
-                    <input id="api-key-name" type="text" v-model="newKeyName" maxlength="100" placeholder="e.g. phone-dsub, laptop-feishin" />
-                    <label for="api-key-name" class="active">New key name</label>
-                  </div>
-                  <div class="col s12 m4" style="padding-top:20px">
-                    <a v-on:click="mintKey()" :disabled="mintPending || !newKeyName.trim()"
-                       class="waves-effect waves-light btn">Generate key</a>
-                  </div>
-                </div>
-              </div>
-
-              <div v-if="apiKeysTS.ts > 0" style="margin-top:16px">
-                <p v-if="apiKeys.length === 0"><i>No API keys yet.</i></p>
-                <table v-else class="striped">
-                  <thead>
-                    <tr><th>Name</th><th>Created</th><th>Last used</th><th></th></tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="k in apiKeys" :key="k.id">
-                      <td>{{k.name || '(unnamed)'}}</td>
-                      <td><small>{{formatTs(k.created_at)}}</small></td>
-                      <td><small>{{formatTs(k.last_used) || '—'}}</small></td>
-                      <td>
-                        <a v-on:click="revokeKey(k)" class="waves-effect waves-red btn-small red lighten-1">Revoke</a>
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>`,
-  methods: {
-    formatTs: function(s) {
-      if (!s) { return null; }
-      // SQLite stores as "YYYY-MM-DD HH:MM:SS" in UTC.
-      const d = new Date(s.replace(' ', 'T') + 'Z');
-      return isNaN(d.getTime()) ? s : d.toLocaleString();
-    },
-    // "12.3 seconds ago" → "12s", "123s" → "2m", "4000s" → "1h". Tight
-    // formatting for the inline-table durations.
-    formatSince: function(ms) {
-      if (!Number.isFinite(ms) || ms < 0) { return '—'; }
-      const s = Math.floor(ms / 1000);
-      if (s < 60)   { return `${s}s`; }
-      if (s < 3600) { return `${Math.floor(s / 60)}m`; }
-      return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
-    },
-    // "1:23" / "62:15" position/duration formatting.
-    formatSeconds: function(s) {
-      if (!Number.isFinite(s) || s < 0) { return '0:00'; }
-      const m = Math.floor(s / 60);
-      const ss = String(Math.floor(s) % 60).padStart(2, '0');
-      return `${m}:${ss}`;
-    },
-    dismissMintedKey: function() {
-      ADMINDATA.lastMintedKey.val = null;
-      ADMINDATA.lastMintedKey.name = null;
-    },
-    dismissAdminMintedKey: function() {
-      this.adminMintedForUser = { val: null, name: null, username: null };
-    },
-    runTest: async function() {
-      this.testPending = true;
-      this.testResult = null;
-      try {
-        this.testResult = await ADMINDATA.testSubsonicConnection();
-      } catch (err) {
-        this.testResult = { ok: false, reason: err.message };
-      } finally {
-        this.testPending = false;
-      }
-    },
-    // Lyrics cache ledger purge (the enable / sidecar-write toggles moved to
-    // the dedicated Lyrics admin view). mode='full' wipes all rows, 'retry'
-    // clears error/pending; each call refreshes the stats counters.
-    purgeLyricsCache: async function(mode) {
-      try {
-        const r = await API.axios({
-          method: 'POST',
-          url: `${API.url()}/api/v1/admin/subsonic/lyrics-cache/purge`,
-          data: { mode },
-        });
-        this.lyricsCachePurgeMsg = `Removed ${r.data.removed} row(s).`;
-        setTimeout(() => { this.lyricsCachePurgeMsg = null; }, 4000);
-        await ADMINDATA.getSubsonicStats();
-      } catch (err) {
-        iziToast.error({ title: `Purge failed: ${escHtml(err.message || '?')}`,
-          position: 'topCenter', timeout: 3000 });
-      }
-    },
-    mintForUser: async function(username) {
-      // Same prompt shape as iziToast's question so it feels consistent
-      // with the rest of the admin panel's confirm dialogs.
-      const name = `admin-minted-${new Date().toISOString().slice(0, 10)}`;
-      iziToast.question({
-        timeout: 20000, close: false, overlayClose: true, overlay: true,
-        displayMode: 'once', id: 'admin-mint-key', zindex: 99999, layout: 2,
-        // Usernames have no server-side character validation — escape
-        // them at every toast sink in this flow.
-        title: `Create a Subsonic API key for "${escHtml(username)}"?`,
-        message: `The key will be labelled "${name}". You will see the key value once and must relay it to the user yourself.`,
-        position: 'center',
-        buttons: [
-          [`<button><b>Create key</b></button>`, async (instance, toast) => {
-            try {
-              const data = await ADMINDATA.mintKeyFor(username, name);
-              this.adminMintedForUser = { val: data.key, name: data.name, username: data.username };
-              iziToast.success({ title: `Key created for ${escHtml(username)}`, position: 'topCenter', timeout: 3000 });
-            } catch (err) {
-              iziToast.error({ title: `Failed to create key: ${escHtml(err.message || 'unknown error')}`, position: 'topCenter', timeout: 4000 });
-            } finally {
-              instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
-            }
-          }, true],
-          [`<button>Cancel</button>`, (instance, toast) => {
-            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
-          }],
-        ]
-      });
-    },
-    clearTokenLog: async function() {
-      try {
-        await ADMINDATA.clearTokenAuthAttempts();
-      } catch (err) {
-        iziToast.error({ title: 'Failed to clear log', position: 'topCenter', timeout: 3000 });
-      }
-    },
-    mintKey: async function() {
-      const name = this.newKeyName.trim();
-      if (!name) { return; }
-      try {
-        this.mintPending = true;
-        await ADMINDATA.createApiKey(name);
-        this.newKeyName = '';
-        iziToast.success({ title: 'API key created', position: 'topCenter', timeout: 3000 });
-      } catch (err) {
-        iziToast.error({ title: 'Failed to create API key', position: 'topCenter', timeout: 3500 });
-      } finally {
-        this.mintPending = false;
-      }
-    },
-    revokeKey: function(k) {
-      iziToast.question({
-        timeout: 20000, close: false, overlayClose: true, overlay: true,
-        displayMode: 'once', id: 'api-key-revoke', zindex: 99999, layout: 2,
-        title: `Revoke API key "${escHtml(k.name || '(unnamed)')}"?`,
-        message: 'Any client using this key will stop working. You cannot undo this.',
-        position: 'center',
-        buttons: [
-          [`<button><b>Revoke</b></button>`, async (instance, toast) => {
-            try {
-              await ADMINDATA.revokeApiKey(k.id);
-              iziToast.success({ title: 'Key revoked', position: 'topCenter', timeout: 2500 });
-            } catch (err) {
-              iziToast.error({ title: 'Failed to revoke key', position: 'topCenter', timeout: 3500 });
-            } finally {
-              instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
-            }
-          }, true],
-          [`<button>Cancel</button>`, (instance, toast) => {
-            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
-          }],
-        ]
-      });
-    },
-    applyMode: async function() {
-      const mode = this.selectedMode;
-      const port = this.selectedPort;
-      const modeLabels = { disabled: 'Disabled', 'same-port': 'Same Port', 'separate-port': 'Separate Port' };
-      iziToast.question({
-        timeout: 20000,
-        close: false,
-        overlayClose: true,
-        overlay: true,
-        displayMode: 'once',
-        id: 'subsonic-question',
-        zindex: 99999,
-        layout: 2,
-        maxWidth: 600,
-        title: `Set Subsonic mode to "${modeLabels[mode] || mode}"?`,
-        message: mode === 'same-port' || this.params.mode === 'same-port'
-          ? 'This will restart the mStream server.'
-          : '',
-        position: 'center',
-        buttons: [
-          [`<button><b>Apply</b></button>`, async (instance, toast) => {
-            try {
-              this.applyPending = true;
-              const data = { mode };
-              if (mode === 'separate-port') { data.port = port; }
-              await API.axios({
-                method: 'POST',
-                url: `${API.url()}/api/v1/admin/subsonic/mode`,
-                data
-              });
-              await ADMINDATA.getSubsonicParams();
-              instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
-              iziToast.success({
-                title: `Subsonic mode set to ${modeLabels[mode] || mode}`,
-                position: 'topCenter',
-                timeout: 3500
-              });
-            } catch(err) {
-              iziToast.error({ title: 'Failed to update Subsonic setting', position: 'topCenter', timeout: 3500 });
-            } finally {
-              this.applyPending = false;
-            }
-          }, true],
-          [`<button>Cancel</button>`, (instance, toast) => {
-            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
-          }],
-        ]
-      });
-    }
-  }
-});
-
-// ── Torrent (V37 — UX-layer settings) ──────────────────────────────────────
-// First-cut admin surface for the optional torrent-client feature. Two
-// dropdowns:
-//   client      — 'disabled' (default) or 'transmission'. More backends
-//                 will land later (qBittorrent, Deluge, rTorrent); the
-//                 dropdown is a single-select on purpose because only one
-//                 client is active at a time in v1.
-//   enabledFor  — 'all' (every authenticated user) or 'whitelist' (only
-//                 users with users.allow_torrent = 1). When 'whitelist'
-//                 is selected, an inline user-grant table appears so the
-//                 admin can flip the per-user flag without leaving the
-//                 page.
 const torrentView = Vue.component('torrent-view', {
   data() {
     return {
@@ -7820,6 +7306,10 @@ const discoveryView = Vue.component('discovery-view', {
   data() {
     return {
       discoveryP2p: { loaded: false, status: null, peers: [], storage: null, autoFetch: false, hiddenIncompatible: 0, showIncompatible: false },
+      // Federation-request state for the catalog's relationship chips and
+      // the "Federate…" action (shared stores with the Federation tab).
+      fedRequests: ADMINDATA.federationRequests,
+      fed: ADMINDATA.federationParams,
       p2pIdentity: P2PIDENTITY,
       p2pToggling: false,
       peerFilter: '',
@@ -8055,9 +7545,14 @@ const discoveryView = Vue.component('discovery-view', {
                         <span v-else style="padding: 2px 8px; border-radius: 10px; font-size: 0.75em; font-weight: 600; background: #f5f5f5; color: #757575;">not downloaded</span>
                         <span v-if="peer.fetched && peer.fetched.pinned" style="padding: 2px 8px; border-radius: 10px; font-size: 0.75em; font-weight: 600; background: #ececf2; color: #505061;">pinned</span>
                         <span v-if="peer.compatible === false" style="padding: 2px 8px; border-radius: 10px; font-size: 0.75em; font-weight: 600; background: #fff3e0; color: #a06010;">incompatible model</span>
+                        <span v-if="fedReqStateFor(peer.from) === 'federated'" style="padding: 2px 8px; border-radius: 10px; font-size: 0.75em; font-weight: 600; background: #e8f5e9; color: #2e7d32;">federated</span>
+                        <span v-else-if="fedReqStateFor(peer.from) === 'theirs'" style="padding: 2px 8px; border-radius: 10px; font-size: 0.75em; font-weight: 600; background: #e8eaf6; color: #3949ab;">they asked you</span>
+                        <span v-else-if="fedReqStateFor(peer.from) === 'sent'" style="padding: 2px 8px; border-radius: 10px; font-size: 0.75em; font-weight: 600; background: #fff8e1; color: #8d6e00;">request sent</span>
                       </div>
                       <div style="display: flex; gap: 10px; font-size: 0.85em; border-top: 1px solid #eee; padding-top: 7px; flex-wrap: wrap;">
                         <span>[<a v-on:click="discoveryFetchPeer(peer.from)">{{ peer.fetched ? 'Update' : 'Download' }}</a>]</span>
+                        <span v-if="fed.available !== false && fedReqStateFor(peer.from) === null">[<a v-on:click="openFederateModal(peer)">Federate…</a>]</span>
+                        <span v-if="fedReqStateFor(peer.from) === 'theirs'">[<a v-on:click="goToFederationTab()">Review their request</a>]</span>
                         <span v-if="peer.fetched">[<a v-on:click="discoveryRemovePeer(peer.from)">Remove</a>]</span>
                         <span v-if="peer.fetched">[<a v-on:click="discoveryPinPeer(peer.from, !peer.fetched.pinned)">{{ peer.fetched.pinned ? 'Unpin' : 'Pin' }}</a>]</span>
                         <span v-if="!peer.online && !peer.fetched">[<a v-on:click="discoveryForgetPeer(peer.from)">Forget</a>]</span>
@@ -8084,6 +7579,10 @@ const discoveryView = Vue.component('discovery-view', {
                         </td>
                         <td>
                           [<a v-on:click="discoveryFetchPeer(peer.from)">{{ peer.fetched ? 'Update' : 'Download' }}</a>]
+                          <span v-if="fed.available !== false && fedReqStateFor(peer.from) === null">[<a v-on:click="openFederateModal(peer)">Federate…</a>]</span>
+                          <span v-if="fedReqStateFor(peer.from) === 'theirs'">[<a v-on:click="goToFederationTab()">Review their request</a>]</span>
+                          <span v-else-if="fedReqStateFor(peer.from) === 'federated'" style="padding: 2px 8px; border-radius: 10px; font-size: 0.75em; font-weight: 600; background: #e8f5e9; color: #2e7d32;">federated</span>
+                          <span v-else-if="fedReqStateFor(peer.from) === 'sent'" style="padding: 2px 8px; border-radius: 10px; font-size: 0.75em; font-weight: 600; background: #fff8e1; color: #8d6e00;">request sent</span>
                           <span v-if="peer.fetched">[<a v-on:click="discoveryRemovePeer(peer.from)">Remove</a>]</span>
                           <span v-if="peer.fetched">[<a v-on:click="discoveryPinPeer(peer.from, !peer.fetched.pinned)">{{ peer.fetched.pinned ? 'Unpin' : 'Pin' }}</a>]</span>
                           <span v-if="!peer.online && !peer.fetched">[<a v-on:click="discoveryForgetPeer(peer.from)">Forget</a>]</span>
@@ -8218,23 +7717,49 @@ const discoveryView = Vue.component('discovery-view', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: `<b>Join the discovery network?</b> Your server will publish a metadata-only snapshot of its music library (never audio files) to the public discovery network, with your server's name and description visible to everyone. Music-discovery data collection will also be enabled.`,
+        // Body + opt-in in `message` (not `title`) so the toast grows to fit
+        // instead of overlapping the buttons. The checkbox's immediate
+        // sibling is a <div>, NOT a <span>: Materialize globally styles
+        // `[type=checkbox] + span` (drawing its own box/checkmark and a 35px
+        // pad), which — combined with the opacity override that un-hides the
+        // native input — rendered TWO checkboxes and broke the box model.
+        // A <div> sibling sidesteps that rule; one clean native checkbox.
+        title: `<b>Join the discovery network?</b>`,
+        message: `Your server will publish a metadata-only snapshot of its music library (never audio files) to the public discovery network, with your server's name and description visible to everyone. Music-discovery data collection will also be enabled.`
+          + `<div style="margin-top:12px; padding:10px 12px; background:#f5f5f5; border-radius:3px;">`
+          + `<label style="display:flex; gap:8px; align-items:flex-start; cursor:pointer; margin:0;">`
+          + `<input id="fedreq-enable-inbox" type="checkbox" style="position:static; opacity:1; pointer-events:auto; width:16px; height:16px; margin:2px 0 0 0; flex-shrink:0;"/>`
+          + `<div style="flex:1;">Also let other servers send me <b>federation requests</b> — invitations to share libraries. Nothing is shared unless you approve each one. <span style="color:#616161;">(Turns federation on.)</span></div>`
+          + `</label></div>`,
         position: 'center',
         buttons: [
           [`<button><b>Enable</b></button>`, async (instance, toast) => {
+            const wantInbox = document.getElementById('fedreq-enable-inbox')?.checked === true;
             instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             this.p2pToggling = true;
             try {
-              await API.axios({
+              const res = await API.axios({
                 method: 'POST',
                 url: `${API.url()}/api/v1/admin/discovery/p2p/enabled`,
-                data: { enabled: true }
+                data: wantInbox ? { enabled: true, acceptFederationRequests: true } : { enabled: true }
               });
               iziToast.success({
                 title: 'Discovery network enabled',
-                message: 'Give the mesh a minute to weave in.',
+                message: res.data?.acceptRequests === true
+                  ? 'Give the mesh a minute to weave in. The request inbox is on — see the Federation tab.'
+                  : 'Give the mesh a minute to weave in.',
                 position: 'topCenter', timeout: 4000
               });
+              // Partial failure: discovery genuinely came up, but the
+              // federation/inbox half failed and its flags were rolled
+              // back server-side — say exactly that, never "it all failed".
+              if (wantInbox && res.data?.federationError) {
+                iziToast.warning({
+                  title: `Discovery is on, but the request inbox didn't start`,
+                  message: `${escHtml(res.data.federationError)} — discovery works normally; you can retry the inbox from the Federation tab.`,
+                  position: 'topCenter', timeout: 8000
+                });
+              }
               await this.loadDiscoveryP2p();
               // Straight into naming the server: 'mStream' next to 18k
               // other 'mStream's is the first thing everyone would want
@@ -8363,6 +7888,11 @@ const discoveryView = Vue.component('discovery-view', {
           this.discoveryP2p.hiddenIncompatible = cat.hiddenIncompatible || 0;
           this.discoveryP2p.storage = cat.storage;
           this.discoveryP2p.autoFetch = cat.autoFetch;
+          // The catalog's relationship chips and the Federate… gate read
+          // these shared stores — fill them here so they work without the
+          // Federation tab having ever been opened.
+          ADMINDATA.getFederationRequests();
+          ADMINDATA.getFederation();
         }
       } catch (err) {
         if (quiet !== true) {
@@ -8370,6 +7900,25 @@ const discoveryView = Vue.component('discovery-view', {
         }
       }
       this.discoveryP2p.loaded = true;
+    },
+    // ── Federation-request hooks on the catalog ──────────────────────
+    // Relationship chip for a catalog row, derived purely client-side
+    // from the shared requests store. Priority: an existing pairing beats
+    // a pending inbound beats a live outbound.
+    fedReqStateFor: function(endpointId) {
+      const rows = this.fedRequests.list.filter((r) => r.peer_endpoint_id === endpointId);
+      if (rows.some((r) => r.state === 'completed')) { return 'federated'; }
+      if (rows.some((r) => r.direction === 'in' && ['received', 'accepted', 'granting'].includes(r.state))) { return 'theirs'; }
+      if (rows.some((r) => r.direction === 'out' && ['pending-delivery', 'delivered', 'granting'].includes(r.state))) { return 'sent'; }
+      return null;
+    },
+    openFederateModal: function(peer) {
+      ADMINDATA.federationComposeTarget.peer = { from: peer.from, name: peer.payload.name || null };
+      this.openModal('federation-request-compose-modal');
+    },
+    goToFederationTab: function() {
+      const el = document.querySelector('.side-nav-item[onclick*="federation-view"]');
+      if (el) { changeView('federation-view', el); }
     },
     discoveryFetchPeer: async function(endpointId) {
       try {
@@ -8663,7 +8212,7 @@ const irohView = Vue.component('iroh-view', {
 function _initialViewFromHash() {
   const valid = new Set([
     'folders-view','users-view','db-view','advanced-view','info-view',
-    'transcode-view','federation-view','dlna-view','subsonic-view','iroh-view',
+    'transcode-view','federation-view','dlna-view','iroh-view',
     'torrent-view','logs-view','rpn-view','security-view','backup-view',
     'lyrics-view','discovery-view',
   ]);
@@ -8683,7 +8232,6 @@ const vm = new Vue({
     'transcode-view': transcodeView,
     'federation-view': federationView,
     'dlna-view': dlnaView,
-    'subsonic-view': subsonicView,
     'iroh-view': irohView,
     'discovery-view': discoveryView,
     'torrent-view': torrentView,
@@ -10471,6 +10019,182 @@ const federationEditLimitsModal = Vue.component('federation-edit-limits-modal', 
   },
 });
 
+// Accept modal for a federation request: the New Ticket modal reshaped
+// around a known counterparty — accepting IS minting, plus one decision
+// about their offer. Nothing is pre-checked (they initiated; the operator
+// chooses deliberately, unlike compose where we pre-check our own offer).
+// Row context rides ADMINDATA.federationRequestTarget, same pattern as the
+// edit-limits modal above.
+const federationRequestAcceptModal = Vue.component('federation-request-accept-modal', {
+  data() {
+    const d = ADMINDATA.federationParams.limitDefaults || { streamKbps: 8000, dailyMb: 2048, maxStreams: 3 };
+    return {
+      r: ADMINDATA.federationRequestTarget.row || {},
+      directories: ADMINDATA.folders,
+      selected: [],
+      streamKbps: d.streamKbps,
+      dailyMb: d.dailyMb,
+      maxStreams: d.maxStreams,
+      expireDays: 0,
+      acceptTheirOffer: true,
+      submitPending: false,
+    };
+  },
+  computed: {
+    peerFp() { return String(this.r.peer_endpoint_id || '').slice(0, 12) + '…'; },
+    theirOffer() { return Array.isArray(this.r.offered_libraries) ? this.r.offered_libraries : []; },
+  },
+  template: `
+    <form @submit.prevent="accept">
+      <div class="modal-content">
+        <h4>Accept — share libraries with {{ r.peer_name || '(unnamed server)' }}</h4>
+        <p style="margin:0 0 6px;font-family:monospace;font-size:0.8em;color:#757575">{{ peerFp }}</p>
+        <p v-if="r.message" style="font-size:0.9em;color:#616161;background:#f5f5f5;padding:8px 10px;border-radius:3px">“{{ r.message }}”</p>
+        <p style="margin:14px 0 4px"><b>Libraries they can read:</b></p>
+        <p v-for="(cfg, vpath) in directories" :key="vpath" style="margin:4px 0">
+          <label><input type="checkbox" v-model="selected" :value="vpath"/><span>{{ vpath }}</span></label>
+        </p>
+        <p style="margin:16px 0 4px"><b>Bandwidth limits</b> <span style="color:#777;font-size:0.85em">— 0 means unlimited</span></p>
+        <div class="row" style="margin-bottom:0">
+          <div class="input-field col s3">
+            <input id="fedreq-limit-kbps" type="number" min="0" v-model.number="streamKbps"/>
+            <label for="fedreq-limit-kbps" class="active">Stream rate (kbps)</label>
+          </div>
+          <div class="input-field col s3">
+            <input id="fedreq-limit-daily" type="number" min="0" v-model.number="dailyMb"/>
+            <label for="fedreq-limit-daily" class="active">Daily quota (MB)</label>
+          </div>
+          <div class="input-field col s3">
+            <input id="fedreq-limit-streams" type="number" min="0" v-model.number="maxStreams"/>
+            <label for="fedreq-limit-streams" class="active">Max streams</label>
+          </div>
+          <div class="input-field col s3">
+            <input id="fedreq-limit-expire" type="number" min="0" v-model.number="expireDays"/>
+            <label for="fedreq-limit-expire" class="active">Expires (days)</label>
+          </div>
+        </div>
+        <p v-if="theirOffer.length" style="margin:14px 0 4px">
+          <label><input type="checkbox" v-model="acceptTheirOffer"/><span>Add their libraries too (<b>{{ theirOffer.join(', ') }}</b>) when they share back</span></label>
+        </p>
+      </div>
+      <div class="modal-footer">
+        <a href="#!" class="modal-close waves-effect btn-flat">Cancel</a>
+        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending || selected.length === 0">
+          {{ submitPending ? 'Accepting…' : 'Accept & Send Ticket' }}
+        </button>
+      </div>
+    </form>`,
+  methods: {
+    accept: async function() {
+      this.submitPending = true;
+      try {
+        const data = {
+          vpaths: this.selected,
+          streamKbps: Number(this.streamKbps) || 0,
+          dailyMb: Number(this.dailyMb) || 0,
+          maxStreams: Number(this.maxStreams) || 0,
+          acceptTheirOffer: this.acceptTheirOffer === true,
+        };
+        const days = Number(this.expireDays) || 0;
+        if (days > 0) { data.expiresAt = new Date(Date.now() + days * 86400000).toISOString(); }
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/federation/requests/${this.r.id}/accept`,
+          data,
+        });
+        M.Modal.getInstance(document.getElementById('admin-modal')).close();
+        iziToast.success({
+          title: 'Accepted',
+          message: 'Your ticket is on its way' + (this.acceptTheirOffer && this.theirOffer.length ? ' — their share-back will appear under Peers.' : '.'),
+          position: 'topCenter', timeout: 4000,
+        });
+      } catch (err) {
+        // 404/409 usually means the request was withdrawn or already
+        // handled meanwhile — the refetch below makes the table tell the truth.
+        iziToast.error({
+          title: 'Could not accept',
+          message: escHtml(err.response?.data?.error || 'The request may have been withdrawn.'),
+          position: 'topCenter', timeout: 4500,
+        });
+      } finally {
+        this.submitPending = false;
+        ADMINDATA.getFederationRequests();
+        ADMINDATA.getFederationKeys(); // accepting mints a key
+      }
+    },
+  },
+});
+
+// Compose modal: ask a discovered server to federate. Reached from the
+// catalog's "Federate…" action; peer context rides federationComposeTarget.
+// Every library is pre-checked (mutual-by-default with offer-at-compose);
+// unchecking all is a one-way ask. No credentials move at this step.
+const federationRequestComposeModal = Vue.component('federation-request-compose-modal', {
+  data() {
+    return {
+      p: ADMINDATA.federationComposeTarget.peer || {},
+      directories: ADMINDATA.folders,
+      selected: Object.keys(ADMINDATA.folders),
+      message: '',
+      submitPending: false,
+    };
+  },
+  computed: {
+    peerLabel() { return this.p.name || (String(this.p.from || '').slice(0, 12) + '…'); },
+  },
+  template: `
+    <form @submit.prevent="send">
+      <div class="modal-content">
+        <h4>Ask {{ peerLabel }} to federate</h4>
+        <p style="font-size:0.9em;color:#616161;margin:0 0 14px">Sends a request over the discovery network. <b>No access is exchanged now</b> — they see your name, message, and offer, and libraries are only shared if they accept.</p>
+        <div class="input-field">
+          <textarea id="fedreq-compose-msg" class="materialize-textarea" v-model="message" maxlength="500" placeholder="Message (optional)"></textarea>
+          <div style="text-align:right;font-size:0.75em;color:#9e9e9e">{{ message.length }} / 500</div>
+        </div>
+        <p style="margin:8px 0 4px"><b>Libraries you'll share back if they accept:</b></p>
+        <p v-for="(cfg, vpath) in directories" :key="vpath" style="margin:4px 0">
+          <label><input type="checkbox" v-model="selected" :value="vpath"/><span>{{ vpath }}</span></label>
+        </p>
+      </div>
+      <div class="modal-footer">
+        <a href="#!" class="modal-close waves-effect btn-flat">Cancel</a>
+        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending">
+          {{ submitPending ? 'Sending…' : 'Send Request' }}
+        </button>
+      </div>
+    </form>`,
+  methods: {
+    send: async function() {
+      this.submitPending = true;
+      try {
+        const data = { endpointId: this.p.from, offerVpaths: this.selected };
+        if (this.message.trim()) { data.message = this.message.trim(); }
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/federation/requests`,
+          data,
+        });
+        M.Modal.getInstance(document.getElementById('admin-modal')).close();
+        iziToast.success({
+          title: 'Request sent',
+          message: `${escHtml(this.peerLabel)} will see it when they're online — track it on the Federation tab.`,
+          position: 'topCenter', timeout: 4000,
+        });
+      } catch (err) {
+        // Covers the duplicate guard (409 "already …") and federation-off.
+        iziToast.error({
+          title: 'Could not send the request',
+          message: escHtml(err.response?.data?.error || 'Unknown error'),
+          position: 'topCenter', timeout: 4500,
+        });
+      } finally {
+        this.submitPending = false;
+        ADMINDATA.getFederationRequests();
+      }
+    },
+  },
+});
+
 const nullModal = Vue.component('null-modal', {
   template: '<div>NULL MODAL ERROR: How did you get here?</div>'
 });
@@ -11045,6 +10769,8 @@ const modVM = new Vue({
     'lastfm-modal': lastFMModal,
     'federation-new-ticket-modal': federationNewTicketModal,
     'federation-edit-limits-modal': federationEditLimitsModal,
+    'federation-request-accept-modal': federationRequestAcceptModal,
+    'federation-request-compose-modal': federationRequestComposeModal,
     'edit-rust-player-port-modal': editRustPlayerPortModal,
     'edit-album-art-services-modal': editAlbumArtServicesModal,
     'edit-log-buffer-size-modal': editLogBufferSizeModal,

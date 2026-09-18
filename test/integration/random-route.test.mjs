@@ -31,7 +31,10 @@ import {
   expandCamelotCodes,
   buildBpmKeyFilter,
   buildGenreFilter,
-  applyTierFilter,
+  buildDurationFilter,
+  rankByTier,
+  PICK_LIMIT_MAX,
+  SIMPLE_POOL_LIMIT,
 } from '../../src/api/random.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -199,77 +202,88 @@ describe('buildBpmKeyFilter', () => {
   });
 });
 
-describe('applyTierFilter', () => {
+describe('rankByTier', () => {
   // Row helper — sparse fields only since classifyRow only reads bpm + musical_key.
   const r = (bpm, musical_key, id = 0) => ({ id, bpm, musical_key });
+  const ids = (rows) => rows.map((x) => x.id);
+  const inRange = { bpmRanges: [{ min: 120, max: 130 }] };
 
   test('no constraints → identity (returns rows unchanged)', () => {
     const rows = [r(120, 'Am'), r(null, null), r(80, 'C')];
-    assert.deepEqual(applyTierFilter(rows, {}), rows);
+    assert.deepEqual(rankByTier(rows, {}), rows);
   });
 
-  test('BPM in range → Tier 0; out of range → Tier 2 (dropped if Tier 0 exists)', () => {
+  test('keeps every row — it ranks, it does not filter', () => {
+    // A batch is served from the front of the ranking, so lower tiers
+    // must survive for the tail; a single pick only ever reads row 0.
+    const rows = [r(80, null, 1), r(125, null, 2), r(null, null, 3)];
+    const ranked = rankByTier(rows, inRange);
+    assert.equal(ranked.length, rows.length);
+    assert.deepEqual([...ids(ranked)].sort(), [1, 2, 3]);
+  });
+
+  test('BPM in range (Tier 0) ranks ahead of out of range (Tier 2)', () => {
     const rows = [
-      r(125, null, 1),   // Tier 0: BPM good, key NA
-      r(80,  null, 2),   // Tier 2: BPM wrong, key NA
+      r(80,  null, 1),   // Tier 2: BPM wrong, key NA
+      r(125, null, 2),   // Tier 0: BPM good, key NA
     ];
-    const filtered = applyTierFilter(rows, {
-      bpmRanges: [{ min: 120, max: 130 }],
-    });
-    assert.equal(filtered.length, 1);
-    assert.equal(filtered[0].id, 1);
+    assert.deepEqual(ids(rankByTier(rows, inRange)), [2, 1]);
   });
 
-  test('unknown BPM passes through as Tier 1 when no Tier 0 exists', () => {
+  test('unknown BPM (Tier 1) ranks between in-range and known-wrong', () => {
     const rows = [
-      r(80,  null, 1),    // Tier 2: BPM wrong
+      r(80,   null, 1),   // Tier 2: BPM wrong
       r(null, null, 2),   // Tier 1: BPM unknown
+      r(125,  null, 3),   // Tier 0: BPM good
     ];
-    const filtered = applyTierFilter(rows, {
-      bpmRanges: [{ min: 120, max: 130 }],
-    });
-    // No Tier 0 → fall back to Tier 1 (unknown BPM).
-    assert.equal(filtered.length, 1);
-    assert.equal(filtered[0].id, 2);
+    assert.deepEqual(ids(rankByTier(rows, inRange)), [3, 2, 1]);
   });
 
-  test('all rows Tier 2 → return them (no Tier 0/1 to prefer)', () => {
-    const rows = [
-      r(80,  null, 1),
-      r(200, null, 2),
-    ];
-    const filtered = applyTierFilter(rows, {
-      bpmRanges: [{ min: 120, max: 130 }],
-    });
-    assert.equal(filtered.length, 2);
+  test('stable within a tier — input order is the tiebreak', () => {
+    // finalisePick relies on this: it puts fresh rows ahead of cooled
+    // rows and expects the ranking to keep that order inside each tier.
+    const rows = [r(80, null, 1), r(125, null, 2), r(200, null, 3), r(128, null, 4)];
+    assert.deepEqual(ids(rankByTier(rows, inRange)), [2, 4, 1, 3]);
   });
 
-  test('combined BPM+key: good BPM + good key = Tier 0', () => {
+  test('combined BPM+key: one wrong dimension sinks the row to Tier 2', () => {
     const rows = [
-      r(125, 'A minor', 1), // bpm good, key good → Tier 0
-      r(125, 'Cmaj',    2), // bpm good, key wrong → Tier 2
-      r(80,  'A minor', 3), // bpm wrong, key good → Tier 2 (one wrong sinks it)
+      r(125, 'Cmaj',    1), // bpm good, key wrong → Tier 2
+      r(80,  'A minor', 2), // bpm wrong, key good → Tier 2 (one wrong sinks it)
+      r(125, 'A minor', 3), // bpm good, key good → Tier 0
     ];
-    const filtered = applyTierFilter(rows, {
+    const ranked = rankByTier(rows, {
       bpmRanges:   [{ min: 120, max: 130 }],
       musicalKeys: ['8A'], // expands to A minor / Am / Amin / 8A
     });
-    assert.equal(filtered.length, 1);
-    assert.equal(filtered[0].id, 1);
+    assert.deepEqual(ids(ranked), [3, 1, 2]);
   });
 
-  test('one good + one unknown = both Tier 0/1, picks Tier 0', () => {
-    // Per classifyRow: bpm=good and key=na → Tier 0. So if there's no
-    // key constraint, a known-good BPM row is Tier 0 regardless of key.
+  test('good BPM with no key constraint is Tier 0 regardless of key', () => {
+    // Per classifyRow: bpm=good and key=na → Tier 0.
     const rows = [
-      r(125, 'whatever', 1), // BPM good, no key constraint → Tier 0
-      r(null, 'whatever', 2), // BPM unknown → Tier 1
+      r(null, 'whatever', 1), // BPM unknown → Tier 1
+      r(125,  'whatever', 2), // BPM good, no key constraint → Tier 0
     ];
-    const filtered = applyTierFilter(rows, {
-      bpmRanges: [{ min: 120, max: 130 }],
-    });
-    assert.equal(filtered.length, 1);
-    assert.equal(filtered[0].id, 1);
+    assert.deepEqual(ids(rankByTier(rows, inRange)), [2, 1]);
+  });
+});
+
+describe('batch size invariants', () => {
+  test('PICK_LIMIT_MAX fits inside one bounded pool', () => {
+    // Every candidate query is `ORDER BY ... RANDOM() LIMIT SIMPLE_POOL_LIMIT`.
+    // If a batch could exceed that, a request would come back short while
+    // fresh candidates were still in scope — and the top-up logic assumes a
+    // short pool has already shown every fresh row.
+    assert.ok(PICK_LIMIT_MAX <= SIMPLE_POOL_LIMIT,
+      `PICK_LIMIT_MAX ${PICK_LIMIT_MAX} > SIMPLE_POOL_LIMIT ${SIMPLE_POOL_LIMIT}`);
+  });
+
+  test('two maximal batches fit in the cooldown', () => {
+    // The route caps the returned ignoreList at 50 (pinned by 'returned
+    // list is capped at 50, newest last' below). A maximal batch must leave
+    // the whole previous batch in it, or back-to-back batches could repeat.
+    assert.ok(PICK_LIMIT_MAX * 2 <= 50, `PICK_LIMIT_MAX ${PICK_LIMIT_MAX} > half the cooldown`);
   });
 });
 
@@ -333,6 +347,77 @@ describe('buildGenreFilter', () => {
   });
 });
 
+describe('buildDurationFilter', () => {
+  test('no bounds → no clauses', () => {
+    assert.deepEqual(buildDurationFilter({}), { clauses: [], params: [] });
+    assert.deepEqual(buildDurationFilter({ minDuration: undefined, maxDuration: null }),
+      { clauses: [], params: [] });
+  });
+
+  test('0 on both sides is the "no bound" sentinel, not a real window', () => {
+    // The webapp persists 0 for "no limit on this side" (mirrors
+    // djMinRating's "Any"). A literal 0-second floor would be
+    // meaningless anyway, so treating it as absent keeps a stale
+    // persisted zero from emitting a clause.
+    assert.deepEqual(buildDurationFilter({ minDuration: 0, maxDuration: 0 }),
+      { clauses: [], params: [] });
+  });
+
+  test('min only → one clause, lower bound bound once', () => {
+    const { clauses, params } = buildDurationFilter({ minDuration: 120 });
+    assert.equal(clauses.length, 1);
+    assert.match(clauses[0], /t\.duration >= \?/);
+    assert.doesNotMatch(clauses[0], /<=/);
+    assert.deepEqual(params, [120]);
+  });
+
+  test('max only → one clause, upper bound bound once', () => {
+    const { clauses, params } = buildDurationFilter({ maxDuration: 600 });
+    assert.equal(clauses.length, 1);
+    assert.match(clauses[0], /t\.duration <= \?/);
+    assert.doesNotMatch(clauses[0], />=/);
+    assert.deepEqual(params, [600]);
+  });
+
+  test('both bounds → single clause, params in min-then-max order', () => {
+    // Bind order has to match placeholder order or the window silently
+    // inverts. Asserting the array directly locks that in.
+    const { clauses, params } = buildDurationFilter({ minDuration: 120, maxDuration: 600 });
+    assert.equal(clauses.length, 1);
+    assert.match(clauses[0], /t\.duration >= \? AND t\.duration <= \?/);
+    assert.deepEqual(params, [120, 600]);
+  });
+
+  test('default excludes NULL duration', () => {
+    const { clauses } = buildDurationFilter({ minDuration: 120, maxDuration: 600 });
+    assert.match(clauses[0], /t\.duration IS NOT NULL/);
+    assert.doesNotMatch(clauses[0], /IS NULL/);
+  });
+
+  test('allowUnknownDuration adds an IS NULL alternative', () => {
+    const { clauses, params } = buildDurationFilter({
+      minDuration: 120, maxDuration: 600, allowUnknownDuration: true,
+    });
+    assert.equal(clauses.length, 1);
+    assert.match(clauses[0], /t\.duration IS NULL OR/);
+    // Params are unchanged — the NULL branch binds nothing.
+    assert.deepEqual(params, [120, 600]);
+  });
+
+  test('allowUnknownDuration without bounds is still a no-op', () => {
+    // "Allow unknowns" with no window to apply it to constrains
+    // nothing — it must not emit a bare `duration IS NULL` clause,
+    // which would invert into "only unknown-length tracks".
+    assert.deepEqual(buildDurationFilter({ allowUnknownDuration: true }),
+      { clauses: [], params: [] });
+  });
+
+  test('numeric strings are coerced (defence-in-depth for non-Joi callers)', () => {
+    const { params } = buildDurationFilter({ minDuration: '120', maxDuration: '600' });
+    assert.deepEqual(params, [120, 600]);
+  });
+});
+
 // ─────────────────────────────────────────────────────────────────────
 // Integration tests — booted server + seeded DB.
 // ─────────────────────────────────────────────────────────────────────
@@ -349,7 +434,9 @@ function findFreePort() {
   });
 }
 
-async function waitForReady(baseUrl, timeoutMs = 30_000) {
+// 90 s, not 30: the same loaded-CI-runner ceiling test/helpers/server.mjs
+// uses for this wait — a starved Windows shard has expired 30 s at boot.
+async function waitForReady(baseUrl, timeoutMs = 90_000) {
   const start = Date.now();
   let lastErr;
   while (Date.now() - start < timeoutMs) {
@@ -365,9 +452,8 @@ async function waitForReady(baseUrl, timeoutMs = 30_000) {
 async function bootMstream(tmpDir, musicDir) {
   const port = await findFreePort();
   const config = {
-    port, address: '127.0.0.1', ui: 'default',
+    port, address: '127.0.0.1',
     dlna:     { mode: 'disabled' },
-    subsonic: { mode: 'disabled' },
     folders:  { testlib: { root: musicDir } },
     storage: {
       albumArtDirectory:   path.join(tmpDir, 'image-cache'),
@@ -437,24 +523,33 @@ function seedDB(dbPath) {
 
   const insT = db.prepare(`
     INSERT INTO tracks (filepath, library_id, title, artist_id, album_id, year, format,
-                        file_hash, audio_hash, modified, scan_id, bpm, musical_key, bpm_source)
-    VALUES (?, ?, ?, ?, ?, 2020, 'flac', ?, ?, ?, 'seed', ?, ?, ?)
+                        file_hash, audio_hash, modified, scan_id, bpm, musical_key, bpm_source,
+                        duration)
+    VALUES (?, ?, ?, ?, ?, 2020, 'flac', ?, ?, ?, 'seed', ?, ?, ?, ?)
   `);
   let ts = 1700000000000;
+  // `duration` is SECONDS (REAL), spread so the track-length window
+  // tests below can carve clean, non-overlapping sets:
+  //   < 200s      : t1 (30)
+  //   200s-300s   : t6 (200), t3 (240), t4 (300)
+  //   150s        : t2 — inside a 120-300 window, outside 200-300
+  //   > 300s      : t8 (600), t5 (1800)
+  //   NULL        : t7 — the unknown-length row every allowUnknownDuration
+  //                 assertion pivots on.
   const rows = [
-    ['t1.flac', 't1', 124,  'A minor', 'tag'],
-    ['t2.flac', 't2', 125,  'Am',      'tag'],
-    ['t3.flac', 't3', 128,  'C major', 'tag'],
-    ['t4.flac', 't4', 140,  'A minor', 'tag'],
-    ['t5.flac', 't5', 200,  'A minor', 'tag'],
-    ['t6.flac', 't6', null, 'A minor', 'tag'],
-    ['t7.flac', 't7', 125,  null,      'tag'],
-    ['t8.flac', 't8', null, null,      null],
+    ['t1.flac', 't1', 124,  'A minor', 'tag', 30],
+    ['t2.flac', 't2', 125,  'Am',      'tag', 150],
+    ['t3.flac', 't3', 128,  'C major', 'tag', 240],
+    ['t4.flac', 't4', 140,  'A minor', 'tag', 300],
+    ['t5.flac', 't5', 200,  'A minor', 'tag', 1800],
+    ['t6.flac', 't6', null, 'A minor', 'tag', 200],
+    ['t7.flac', 't7', 125,  null,      'tag', null],
+    ['t8.flac', 't8', null, null,      null,  600],
   ];
   const trackIds = {};
   for (let i = 0; i < rows.length; i++) {
-    const [filepath, title, bpm, key, src] = rows[i];
-    const res = insT.run(filepath, lib1, title, aid, albId, `h${i}`, `a${i}`, ts++, bpm, key, src);
+    const [filepath, title, bpm, key, src, duration] = rows[i];
+    const res = insT.run(filepath, lib1, title, aid, albId, `h${i}`, `a${i}`, ts++, bpm, key, src, duration);
     trackIds[title] = Number(res.lastInsertRowid);
   }
 
@@ -619,6 +714,126 @@ describe('POST /api/v1/db/random-songs — BPM/key waterfall', () => {
     assert.equal(r.body.ignoreList.length, 50);
     assert.equal(r.body.ignoreList.at(-1), ids[pickedTitle(r)], 'picked id lands at the end');
     assert.equal(r.body.ignoreList[0], 900001, 'oldest entry shifted out');
+  });
+
+  // ── limit — batch picks ───────────────────────────────────────────
+  //
+  // `limit` returns up to N distinct songs from the same bounded pool a
+  // single pick uses. Fresh rows come first, repeats fill in only when
+  // the cooldown leaves fewer fresh candidates than asked for, and every
+  // song served lands in the returned ignoreList (newest last). A batch
+  // can come back short: fewer candidates in scope, or a waterfall step
+  // that wins with fewer matches — the chain never pads a batch from a
+  // more relaxed step.
+
+  const titlesOf = (r) => r.body.songs.map((s) => s.metadata.title);
+
+  test('limit omitted → one song (the pre-batch wire shape is unchanged)', async () => {
+    const r = await randomReq(server.baseUrl, { ignoreList: [] });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.songs.length, 1);
+    assert.equal(r.body.ignoreList.length, 1);
+  });
+
+  test('limit: 5 → five distinct songs, every served id in the cooldown in order', async () => {
+    const ids = trackIdsByTitle();
+    const r = await randomReq(server.baseUrl, { limit: 5, ignoreList: [] });
+    assert.equal(r.status, 200);
+    const titles = titlesOf(r);
+    assert.equal(titles.length, 5);
+    assert.equal(new Set(titles).size, 5, 'no duplicates within a batch');
+    assert.deepEqual(r.body.ignoreList, titles.map((t) => ids[t]),
+      'ignoreList gains every served id, in serving order');
+  });
+
+  test('limit beyond the in-scope pool returns everything in scope, once', async () => {
+    const r = await randomReq(server.baseUrl, { limit: PICK_LIMIT_MAX });
+    assert.equal(r.status, 200);
+    assert.deepEqual([...titlesOf(r)].sort(), ['t1', 't2', 't3', 't4', 't5', 't6', 't7', 't8']);
+    assert.equal(r.body.ignoreList.length, 8);
+  });
+
+  test('a batch serves fresh songs first, then tops up with repeats', async () => {
+    const ids = trackIdsByTitle();
+    // Cool down everything except t3 and t6, ask for five.
+    const cooled = Object.entries(ids).filter(([t]) => t !== 't3' && t !== 't6');
+    const r = await randomReq(server.baseUrl, {
+      limit: 5, ignoreList: cooled.map(([, id]) => id),
+    });
+    assert.equal(r.status, 200);
+    const titles = titlesOf(r);
+    assert.equal(titles.length, 5, 'topped up to the requested size');
+    assert.deepEqual([...titles.slice(0, 2)].sort(), ['t3', 't6'], 'the two fresh songs lead');
+    for (const t of titles.slice(2)) {
+      assert.ok(cooled.some(([c]) => c === t), `repeat '${t}' came from the cooled set`);
+    }
+    assert.equal(new Set(titles).size, 5, 'repeats are still distinct rows');
+    // Move-to-end for every served id: 6 sent − 3 re-served + 5 served = 8.
+    assert.equal(r.body.ignoreList.length, 8);
+    assert.deepEqual(r.body.ignoreList.slice(-5), titles.map((t) => ids[t]));
+  });
+
+  test('a batch honours the always-on filters and enriches every row', async () => {
+    // Funk is t1 + t3. Asking for five yields exactly those two, each
+    // carrying its genres — per-row enrichment, not just the first pick's.
+    const r = await randomReq(server.baseUrl, { limit: 5, genres: ['Funk'] });
+    assert.equal(r.status, 200);
+    assert.deepEqual([...titlesOf(r)].sort(), ['t1', 't3']);
+    for (const s of r.body.songs) {
+      assert.ok(s.metadata.genres.includes('Funk'), `${s.metadata.title} lost its genres`);
+    }
+  });
+
+  test('waterfall batch: the winning step is served whole, never padded from a relaxed step', async () => {
+    // 124-128 BPM holds t1, t2, t3, t7. Asking for six returns those four
+    // — the chain does not fall through to off-range songs to make six.
+    const r = await randomReq(server.baseUrl, { limit: 6, bpmRanges: [{ min: 124, max: 128 }] });
+    assert.equal(r.status, 200);
+    assert.deepEqual([...titlesOf(r)].sort(), ['t1', 't2', 't3', 't7']);
+    for (const s of r.body.songs) {
+      assert.ok(s.metadata.bpm >= 124 && s.metadata.bpm <= 128, `${s.metadata.title} is off-range`);
+    }
+  });
+
+  test('waterfall batch: tier ranking orders a relaxed step (unknown BPM before known-wrong)', async () => {
+    // Nothing is at 300-310 BPM, so every constrained step is empty and
+    // the unrestricted step wins with all eight rows. The batch must lead
+    // with the two unknown-BPM rows (Tier 1) before any known-wrong row.
+    const r = await randomReq(server.baseUrl, { limit: 4, bpmRanges: [{ min: 300, max: 310 }] });
+    assert.equal(r.status, 200);
+    const bpms = r.body.songs.map((s) => s.metadata.bpm);
+    assert.equal(bpms.length, 4);
+    assert.deepEqual(bpms.slice(0, 2), [null, null], 'unknown-BPM rows lead');
+    assert.ok(bpms.slice(2).every((b) => typeof b === 'number'), 'known-wrong rows trail');
+  });
+
+  test('waterfall batch: the id cooldown tops up within the winning step', async () => {
+    const ids = trackIdsByTitle();
+    // 124-125 BPM is {t1, t2, t7}; cool down t1 + t2 and ask for three:
+    // t7 leads and the two repeats come from the same step, never from
+    // outside the BPM window.
+    const r = await randomReq(server.baseUrl, {
+      limit: 3, bpmRanges: [{ min: 124, max: 125 }], ignoreList: [ids.t1, ids.t2],
+    });
+    assert.equal(r.status, 200);
+    const titles = titlesOf(r);
+    assert.equal(titles[0], 't7', 'the fresh song leads');
+    assert.deepEqual([...titles].sort(), ['t1', 't2', 't7']);
+  });
+
+  test('artist-cooldown batch flows through the bounded waterfall', async () => {
+    const r = await randomReq(server.baseUrl, { limit: 3, ignoreArtists: ['No Such Artist'] });
+    assert.equal(r.status, 200);
+    assert.equal(new Set(titlesOf(r)).size, 3);
+  });
+
+  test('limit validation: an integer from 1 to PICK_LIMIT_MAX', async () => {
+    for (const limit of [0, PICK_LIMIT_MAX + 1, 2.5, 'many', -1]) {
+      const r = await randomReq(server.baseUrl, { limit });
+      assert.equal(r.status, 400, `expected 400 for limit=${JSON.stringify(limit)}`);
+    }
+    assert.equal((await randomReq(server.baseUrl, { limit: 1 })).status, 200);
+    assert.equal((await randomReq(server.baseUrl, { limit: PICK_LIMIT_MAX })).status, 200);
   });
 
   // ── Bounded waterfall (no-BPM/key sessions) ───────────────────────
@@ -1320,6 +1535,170 @@ describe('POST /api/v1/db/random-songs — BPM/key waterfall', () => {
     assert.equal(r.status, 200);
     assert.equal(pickedTitle(r), 't8');
     assert.deepEqual(r.body.songs[0].metadata.genres, []);
+  });
+
+  // ── Track-length window (minDuration / maxDuration) ───────────────
+  //
+  // Seed durations: t1=30 t2=150 t3=240 t4=300 t5=1800 t6=200
+  //                 t7=NULL t8=600
+  //
+  // Each assertion samples several picks rather than one — the route
+  // picks randomly from the surviving pool, so a single 200 proves
+  // only that SOMETHING matched, not that the excluded rows are
+  // actually gone.
+
+  // Sample N picks and return the set of distinct titles served.
+  async function pickedTitlesOver(body, n = 20) {
+    const seen = new Set();
+    for (let i = 0; i < n; i++) {
+      const r = await randomReq(server.baseUrl, body);
+      assert.equal(r.status, 200, `pick ${i} failed: ${JSON.stringify(r.body)}`);
+      seen.add(pickedTitle(r));
+    }
+    return seen;
+  }
+
+  test('minDuration excludes shorter tracks', async () => {
+    const seen = await pickedTitlesOver({ minDuration: 200 });
+    // t1 (30) and t2 (150) are below the floor; t7 is NULL and
+    // excluded by default.
+    for (const excluded of ['t1', 't2', 't7']) {
+      assert.ok(!seen.has(excluded), `${excluded} survived minDuration=200 (saw ${[...seen]})`);
+    }
+    assert.ok(seen.size > 0);
+  });
+
+  test('maxDuration excludes longer tracks', async () => {
+    const seen = await pickedTitlesOver({ maxDuration: 300 });
+    for (const excluded of ['t5', 't8', 't7']) {
+      assert.ok(!seen.has(excluded), `${excluded} survived maxDuration=300 (saw ${[...seen]})`);
+    }
+    assert.ok(seen.size > 0);
+  });
+
+  test('both bounds narrow to the window', async () => {
+    // 200-300 inclusive → exactly {t6 (200), t3 (240), t4 (300)}.
+    const seen = await pickedTitlesOver({ minDuration: 200, maxDuration: 300 }, 30);
+    for (const title of seen) {
+      assert.ok(['t3', 't4', 't6'].includes(title),
+        `${title} is outside the 200-300s window`);
+    }
+  });
+
+  test('bounds are inclusive on both edges', async () => {
+    // A window of exactly [300, 300] must still match t4 (300s) — an
+    // off-by-one to `>` / `<` would empty the pool and 400.
+    const r = await randomReq(server.baseUrl, { minDuration: 300, maxDuration: 300 });
+    assert.equal(r.status, 200);
+    assert.equal(pickedTitle(r), 't4');
+  });
+
+  test('NULL-duration tracks are excluded by default', async () => {
+    // Cool down every known-duration track. Without a duration filter
+    // that forces t7 (the NULL row); WITH one, t7 is out of scope, so
+    // the route falls back to repeating a cooled-but-in-range row
+    // rather than serving t7.
+    const ids = trackIdsByTitle();
+    const ignore = Object.entries(ids).filter(([t]) => t !== 't7').map(([, id]) => id);
+    const seen = await pickedTitlesOver({ minDuration: 100, maxDuration: 2000, ignoreList: ignore }, 15);
+    assert.ok(!seen.has('t7'), `t7 (NULL duration) was served (saw ${[...seen]})`);
+  });
+
+  test('allowUnknownDuration lets NULL-duration tracks through', async () => {
+    // Same cooldown as above — now t7 is the only id-fresh row, so
+    // opting unknowns in must surface it.
+    const ids = trackIdsByTitle();
+    const ignore = Object.entries(ids).filter(([t]) => t !== 't7').map(([, id]) => id);
+    const seen = await pickedTitlesOver({
+      minDuration: 100, maxDuration: 2000, allowUnknownDuration: true, ignoreList: ignore,
+    }, 15);
+    assert.ok(seen.has('t7'), `t7 never served with allowUnknownDuration (saw ${[...seen]})`);
+  });
+
+  test('allowUnknownDuration does not widen the in-range rules', async () => {
+    // Opting unknowns in must add the NULL row, not relax the window
+    // for rows that DO have a duration.
+    const seen = await pickedTitlesOver({
+      minDuration: 200, maxDuration: 300, allowUnknownDuration: true,
+    }, 30);
+    for (const title of seen) {
+      assert.ok(['t3', 't4', 't6', 't7'].includes(title),
+        `${title} is outside the 200-300s window (+unknown)`);
+    }
+  });
+
+  test('allowUnknownDuration alone (no bounds) is a no-op', async () => {
+    // No window → nothing to allow into. The flag must not turn into
+    // "only unknown-length tracks", so a known-duration row still has
+    // to be reachable: cool everything except t4 and require it.
+    const ids = trackIdsByTitle();
+    const ignore = Object.entries(ids).filter(([t]) => t !== 't4').map(([, id]) => id);
+    const r = await randomReq(server.baseUrl, { allowUnknownDuration: true, ignoreList: ignore });
+    assert.equal(r.status, 200);
+    assert.equal(pickedTitle(r), 't4');
+  });
+
+  test('the window is never relaxed by the waterfall', async () => {
+    // This is the always-on contract. bpmRanges 999-1000 matches
+    // nothing, so the chain walks all the way down to its terminal
+    // `unrestricted` step — which drops BPM but must NOT drop the
+    // duration window. Only t5 (1800) is >= 1000s.
+    const seen = await pickedTitlesOver({
+      bpmRanges: [{ min: 999, max: 1000 }],
+      bpmRangesWide: [{ min: 990, max: 1000 }],
+      minDuration: 1000,
+    }, 15);
+    assert.deepEqual([...seen], ['t5'],
+      `waterfall relaxed the duration window (saw ${[...seen]})`);
+  });
+
+  test('an impossible window 400s rather than serving out-of-range', async () => {
+    // 3000s floor is above every seeded track. Failing loud is the
+    // point: a relaxed pick would break the user's stated promise.
+    const r = await randomReq(server.baseUrl, { minDuration: 3000 });
+    assert.equal(r.status, 400);
+  });
+
+  test('minDuration > maxDuration → 400', async () => {
+    // Backwards window is the common typo and produces a clause that
+    // matches nothing; rejected at the Joi boundary like a backwards
+    // bpmRange.
+    const r = await randomReq(server.baseUrl, { minDuration: 600, maxDuration: 60 });
+    assert.equal(r.status, 400);
+  });
+
+  test('0 bounds are treated as "no limit", not a zero-length window', async () => {
+    // The webapp persists 0 for an empty field. A naive filter would
+    // read {min:0,max:0} as "exactly zero seconds" and 400 every pick.
+    const r = await randomReq(server.baseUrl, { minDuration: 0, maxDuration: 0 });
+    assert.equal(r.status, 200);
+  });
+
+  test('out-of-range bounds are rejected', async () => {
+    for (const body of [{ minDuration: -1 }, { maxDuration: 86401 }]) {
+      const r = await randomReq(server.baseUrl, body);
+      assert.equal(r.status, 400, `expected 400 for ${JSON.stringify(body)}`);
+    }
+  });
+
+  test('duration params alone stay in simple mode and still cool down', async () => {
+    // No BPM/key/artist params → the route skips the waterfall
+    // entirely. The duration window rides on the base conditions, so
+    // the simple-mode ignoreList round-trip has to keep working.
+    const first = await randomReq(server.baseUrl, { minDuration: 200, ignoreList: [] });
+    assert.equal(first.status, 200);
+    assert.equal(first.body.ignoreList.length, 1);
+    const second = await randomReq(server.baseUrl, {
+      minDuration: 200, ignoreList: first.body.ignoreList,
+    });
+    assert.equal(second.status, 200);
+    assert.notEqual(pickedTitle(second), pickedTitle(first));
+  });
+
+  test('duration composes with the genre filter (both always-on)', async () => {
+    // Rock is t4 (300) and t5 (1800). A 300s ceiling leaves only t4.
+    const seen = await pickedTitlesOver({ genres: ['Rock'], maxDuration: 300 }, 15);
+    assert.deepEqual([...seen], ['t4']);
   });
 });
 

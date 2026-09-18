@@ -14,7 +14,6 @@ import { sweepVpathsForActiveClient } from '../torrent/vpath-sweep.js';
 import winston from 'winston';
 import * as dlnaSsdp from '../dlna/ssdp.js';
 import * as dlnaServer from '../dlna/dlna-server.js';
-import * as subsonicServer from '../subsonic/subsonic-server.js';
 import { getDirname } from './esm-helpers.js';
 import { launchWorker } from './worker-process.js';
 import { invalidateWhitelistCache } from './admin-network.js';
@@ -206,10 +205,8 @@ export async function deleteLibraryRows(d, libraryId) {
     if (changes === 0) { break; }
     await new Promise((resolve) => setImmediate(resolve));
   }
-  // CASCADE handles what's left: user_libraries, cue_points (indexed by
-  // V63), backup_destinations + their backup_history, and the SET NULL
-  // sweep over play_events.library_id (also indexed by V63 — this was a
-  // full ever-growing-table scan before).
+  // CASCADE handles what's left: user_libraries, backup_destinations +
+  // their backup_history.
   d.prepare('DELETE FROM libraries WHERE id = ?').run(libraryId);
 }
 
@@ -359,35 +356,11 @@ export async function editUserAccess(username, admin, allowMkdir, allowUpload, a
   db.invalidateCache();
 }
 
-// Set or clear the V35 opt-in Subsonic-specific password. Pass null/empty
-// to clear (revert the user to no token-auth, friendly error message
-// at /rest/* time). Used by both the admin endpoint and (by way of
-// the user-side endpoint) by users managing their own.
-//
-// Imports the encrypt helper lazily — the helper depends on
-// config.program.subsonicSecret which isn't populated until config.setup
-// runs, and admin.js is imported much earlier in the boot path.
-export async function setSubsonicPassword(username, plaintext) {
-  const user = db.getUserByUsername(username);
-  if (!user) { throw new Error(`'${username}' does not exist`); }
-
-  const d = db.getDB();
-  if (plaintext == null || plaintext === '') {
-    d.prepare('UPDATE users SET subsonic_password_encrypted = NULL WHERE id = ?').run(user.id);
-  } else {
-    const { encryptSubsonicPassword } = await import('./subsonic-password.js');
-    const encrypted = encryptSubsonicPassword(plaintext);
-    d.prepare('UPDATE users SET subsonic_password_encrypted = ? WHERE id = ?').run(encrypted, user.id);
-  }
-  db.invalidateCache();
-}
-
 // Set a user's stored Last.fm credentials — the V1 lastfm_user/lastfm_password
 // columns that live directly on the users row. Same lookup-then-UPDATE shape as
-// editUserPassword, and the same storage write the self-service /lastfm/connect
-// endpoint (velvet-stubs.js) uses. Registering the creds with the in-process
-// Scribble session map (warmScrobbleUser) is the route handler's job — that
-// singleton lives in the api layer, so util/ stays out of it.
+// editUserPassword. Registering the creds with the in-process Scribble session
+// map (warmScrobbleUser) is the route handler's job — that singleton lives in
+// the api layer, so util/ stays out of it.
 export async function setUserLastFM(username, lastfmUser, lastfmPassword) {
   const user = db.getUserByUsername(username);
   if (!user) { throw new Error(`'${username}' does not exist`); }
@@ -400,27 +373,6 @@ export async function setUserLastFM(username, lastfmUser, lastfmPassword) {
 }
 
 // ── Config file settings (server-level, stay in JSON) ───────────────────────
-
-export async function editUI(ui) {
-  if (config.program.ui === ui) { return; }
-  const loadConfig = await loadFile(config.configFile);
-  loadConfig.ui = ui;
-  // When switching TO ui='subsonic', auto-enable Subsonic same-port if
-  // it's currently disabled / separate-port. The bundled Refix SPA
-  // only works with same-port (its env.js SERVER_URL="" resolves to
-  // the current origin). Leaving the admin to manually fix subsonic
-  // mode after a UI switch produces a broken client with a silent
-  // failure mode — they see Refix's "couldn't reach server" error
-  // with no guidance. Flip it for them and log.
-  if (ui === 'subsonic') {
-    if (!loadConfig.subsonic) { loadConfig.subsonic = {}; }
-    if (loadConfig.subsonic.mode !== 'same-port') {
-      loadConfig.subsonic.mode = 'same-port';
-    }
-  }
-  await saveFile(loadConfig, config.configFile);
-  mStreamServer.reboot();
-}
 
 export async function editPort(port) {
   if (config.program.port === port) { return; }
@@ -1040,22 +992,6 @@ export async function editAdminAccess({ mode, whitelist }) {
   invalidateWhitelistCache();
 }
 
-// Legacy lock-api toggle, preserved for the velvet admin UI's existing
-// POST /api/v1/admin/lock-api endpoint. A thin shim over the richer
-// adminAccess setting. lock=true always fully disables (mode='none'). lock=false
-// (unlock) only relaxes to 'all' when currently fully locked — if the operator
-// has configured a richer mode ('localhost'/'whitelist'), a boolean unlock must
-// NOT silently strip their IP gate, since the boolean can't represent it.
-export async function lockAdminApi(val) {
-  if (val) {
-    await editAdminAccess({ mode: 'none' });
-    return;
-  }
-  if (config.program.adminAccess?.mode === 'none') {
-    await editAdminAccess({ mode: 'all' });
-  }
-}
-
 export async function editDlnaBrowse(browse) {
   const loadConfig = await loadFile(config.configFile);
   if (!loadConfig.dlna) { loadConfig.dlna = {}; }
@@ -1127,33 +1063,6 @@ export async function enableDlna(mode, port) {
   dlnaServer.stop();
   if (mode !== 'disabled') { dlnaSsdp.start(); }
   if (mode === 'separate-port') { dlnaServer.start(); }
-}
-
-export async function enableSubsonic(mode, port) {
-  const effectivePort = port !== undefined ? port : config.program.subsonic.port;
-  if (mode === config.program.subsonic.mode && effectivePort === config.program.subsonic.port) { return; }
-
-  const prevMode = config.program.subsonic.mode;
-
-  const loadConfig = await loadFile(config.configFile);
-  if (!loadConfig.subsonic) { loadConfig.subsonic = {}; }
-  loadConfig.subsonic.mode = mode;
-  if (port !== undefined) { loadConfig.subsonic.port = port; }
-  await saveFile(loadConfig, config.configFile);
-  config.program.subsonic.mode = mode;
-  if (port !== undefined) { config.program.subsonic.port = port; }
-
-  // same-port registers /rest/* routes on the main Express app, which needs a
-  // full reboot to take effect or be removed. Express doesn't support
-  // dynamic middleware removal.
-  if (mode === 'same-port' || prevMode === 'same-port') {
-    mStreamServer.reboot();
-    return;
-  }
-
-  // disabled ↔ separate-port: hot-swap the secondary server in place.
-  subsonicServer.stop();
-  if (mode === 'separate-port') { subsonicServer.start(); }
 }
 
 export async function removeSSL() {

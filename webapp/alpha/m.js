@@ -100,6 +100,145 @@ var programState = [];
 
 let curFileTracker;
 
+///////////////////////// Federation: which server the app is pointed at
+//
+// `peerContext` is the server the app is showing — null for this one, set by
+// the top-bar dropdown (see the server switcher further down). It is read
+// AMBIENTLY by the render helpers and by browseApi() below, so one set of
+// renderers and one set of browse calls serve both sides instead of a forked
+// peer universe.
+//
+// Every row a peer view renders also carries `data-peer`, and the CLICK
+// handlers read that attribute rather than the ambient context. Two
+// reasons: the DB-search panel mixes local and peer hits in one list, where
+// the ambient context is null and the attribute is the only truth; and a
+// row clicked after an async re-render is guaranteed to act on the peer it
+// was drawn for.
+//
+// Handlers that NAVIGATE (open an album, an artist, a folder) adopt the
+// row's peer first, which is what lets a peer album opened from search go
+// on browsing that peer. Handlers that merely QUEUE read the attribute and
+// leave the context alone — playing a peer track from a mixed search list
+// must not move the browser onto that peer.
+let peerContext = null;
+
+// Bumped whenever the app changes which server it points at (switchServer /
+// adoptPeer). A panel loader captures it before its await and bails if it
+// changed while the request was in flight, so a slow response from the old
+// server can't overwrite the new panel or get its rows stamped with the new
+// server's peer id.
+let browseGeneration = 0;
+
+// Same idea for the multi-server search fan-out: submitSearchForm bumps this,
+// and a peer answer from a superseded run is dropped instead of appended to the
+// current results. Re-submitting the SAME term would otherwise slip past the
+// term-only peerResultSlot check and duplicate every peer block.
+let searchGeneration = 0;
+// id -> { id, name }. addFederationSongWizard wants a display name for the
+// queue row and a row only carries the id. Filled by loadServerSwitcher()
+// and by anything else that learns a peer's name (e.g. search attribution).
+const knownPeers = new Map();
+
+function rememberPeer(peer) {
+  if (peer && peer.id !== undefined && peer.id !== null) {
+    knownPeers.set(Number(peer.id), { id: Number(peer.id), name: peer.name || 'peer' });
+  }
+  return peer;
+}
+
+// Rendered into every row while a peer view is open.
+function peerAttr(peer) {
+  const p = peer === undefined ? peerContext : peer;
+  return p ? ` data-peer="${escapeHtml(p.id)}"` : '';
+}
+
+// The peer a clicked row belongs to, or null when the row is local.
+function peerOf(el) {
+  const raw = el && el.getAttribute ? el.getAttribute('data-peer') : null;
+  if (!raw) { return null; }
+  const id = Number(raw);
+  return knownPeers.get(id) || { id: id, name: 'peer' };
+}
+
+// Point the app at whatever server the clicked row came from — used by the
+// handlers that NAVIGATE. A federated hit in a multi-server search result is
+// the one place a row can disagree with the dropdown, and following it moves
+// the whole app (dropdown, nav, read-only note) onto that server rather than
+// leaving a half-switched UI. The queueing handlers use peerOf() instead and
+// leave the context alone.
+function adoptPeer(el) {
+  const next = peerOf(el);
+  const changed = (next ? next.id : null) !== (peerContext ? peerContext.id : null);
+  peerContext = next;
+  if (changed) { browseGeneration++; applyServerContext(); }
+  return peerContext;
+}
+
+// One browse call, routed to the peer being browsed or to this server.
+// The peer wrappers in api.js mirror the local names exactly, so the only
+// difference at the call site is which server answers.
+function browseApi(name, postObject) {
+  if (peerContext) { return MSTREAMAPI.peer[name](peerContext.id, postObject); }
+  return MSTREAMAPI[name](postObject);
+}
+
+// vpaths to hide, for a LOCAL call only. The Auto-DJ folder filter names
+// vpaths in this library; a peer's namespace is its own, and the peer
+// already scopes every answer to the libraries our key was granted.
+function localIgnoreVPaths() {
+  if (peerContext) { return undefined; }
+  return Object.keys(MSTREAMPLAYER.ignoreVPaths).filter((vpath) => {
+    return MSTREAMPLAYER.ignoreVPaths[vpath] === true;
+  });
+}
+
+// Album-art URL for the panel being rendered: this server's /album-art, or
+// a peer's art through the proxy.
+function artUrl(artFile, compress) {
+  if (!artFile) { return null; }
+  if (peerContext) { return MSTREAMAPI.peerArtUrl(peerContext.id, artFile, compress); }
+  return `${MSTREAMAPI.currentServer.host}album-art/${escapeHtml(artFile)}?${compress ? `compress=${compress}&` : ''}token=${MSTREAMAPI.currentServer.token}`;
+}
+
+// The `aa` argument createMusicFileHtml expects: a full src attribute for
+// the panel's server, or the bundled default cover.
+function artImgAttr(artFile, compress) {
+  const url = artUrl(artFile, compress);
+  return url ? `src="${url}"` : 'src="assets/img/default.png"';
+}
+
+// Album-art URL for a specific SONG (queue row / now-playing card), which may
+// be a peer track. Unlike artUrl(), the peer identity comes from the song
+// itself (song.federation), not the ambient peerContext — a peer track can be
+// playing while the app is pointed back at this server. The caller guards the
+// no-art case (its two consumers differ: bundled default cover vs. null).
+function songArtUrl(artFile, song, compress) {
+  if (song && song.federation) {
+    return MSTREAMAPI.peerArtUrl(song.federation.peerId, artFile, compress);
+  }
+  const token = (song && song.authToken) || MSTREAMAPI.currentServer.token;
+  return `${MSTREAMAPI.currentServer.host}album-art/${artFile}?compress=${compress}&token=${token}`;
+}
+
+// Queue a row that may live on a peer. Peer tracks bypass addSongWizard
+// entirely (see addFederationSongWizard) — transcode, waveform prefetch,
+// live-playlist save and metadata lookup all resolve against the LOCAL
+// library, and this path is in the peer's namespace.
+function queueRow(peer, filepath, metadata, position) {
+  const meta = metadata || {};
+  const hasMeta = Object.keys(meta).length > 0;
+  if (peer) {
+    // autoPlayOff mirrors the local branch (!hasMeta): a peer row normally
+    // carries metadata, so it should autoplay onto an empty queue just like a
+    // local one. Hard-coding true left peer tracks loaded but paused.
+    VUEPLAYERCORE.addFederationSongWizard(peer, filepath, meta, !hasMeta, position);
+    return;
+  }
+  // lookupMetadata only when the row carried none — the same bargain
+  // searchFileClick strikes, and what the browse panels have always done.
+  VUEPLAYERCORE.addSongWizard(filepath, meta, !hasMeta, position);
+}
+
 const entityMap = {
   '&': '&amp;',
   '<': '&lt;',
@@ -118,11 +257,9 @@ function escapeHtml (string) {
 }
 
 function renderAlbum(id, artist, name, albumArtFile, year) {
-  const artSrc = albumArtFile
-    ? `${MSTREAMAPI.currentServer.host}album-art/${escapeHtml(albumArtFile)}?${VUEPLAYERCORE.altLayout.compressArt ? 'compress=l&' : ''}token=${MSTREAMAPI.currentServer.token}`
-    : null;
+  const artSrc = artUrl(albumArtFile, VUEPLAYERCORE.altLayout.compressArt ? 'l' : undefined);
 
-  return `<div class="album-grid-card" ${year ? `data-year="${escapeHtml(year)}"` : ''} ${artist ? `data-artist="${escapeHtml(artist)}"` : ''} ${id ? `data-album="${escapeHtml(id)}"` : ''} onclick="getAlbumsOnClick(this);">
+  return `<div class="album-grid-card"${peerAttr()} ${year ? `data-year="${escapeHtml(year)}"` : ''} ${artist ? `data-artist="${escapeHtml(artist)}"` : ''} ${id ? `data-album="${escapeHtml(id)}"` : ''} onclick="getAlbumsOnClick(this);">
     <div class="album-grid-art">
       ${artSrc
         ? `<img loading="lazy" src="${artSrc}">`
@@ -140,8 +277,16 @@ function renderAlbum(id, artist, name, albumArtFile, year) {
 
 function renderArtist(artist) {
   return `<li class="collection-item">
-      <div data-artist="${escapeHtml(artist)}" class="artistz" onclick="getArtistz(this)">${escapeHtml(artist)}</div>
+      <div data-artist="${escapeHtml(artist)}"${peerAttr()} class="artistz" onclick="getArtistz(this)">${escapeHtml(artist)}</div>
     </li>`;
+}
+
+function renderGenre(genre, trackCount) {
+  return `<li class="collection-item">
+    <div data-genre="${escapeHtml(genre)}"${peerAttr()} class="artistz" onclick="getGenreSongsList(this)">
+      ${escapeHtml(genre)} <span style="color:#888;font-size:13px;">(${escapeHtml(trackCount)})</span>
+    </div>
+  </li>`;
 }
 
 function renderFileWithMetadataHtml(filepath, lokiId, metadata) {
@@ -164,7 +309,7 @@ function renderFileWithMetadataHtml(filepath, lokiId, metadata) {
 
 function createMusicFileHtml(fileLocation, title, aa, rating, subtitle) {
   return `<li class="collection-item">
-    <div data-file_location="${escapeHtml(fileLocation)}" class="filez ${aa ? 'flex2' : ''}" onclick="onFileClick(this);">
+    <div data-file_location="${escapeHtml(fileLocation)}"${peerAttr()} class="filez ${aa ? 'flex2' : ''}" onclick="onFileClick(this);">
       ${aa ? `<img loading="lazy" class="album-art-box" ${aa}>` : '<svg class="music-image" height="18" width="18" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><path d="M9 37.5c-3.584 0-6.5-2.916-6.5-6.5s2.916-6.5 6.5-6.5a6.43 6.43 0 012.785.634l.715.34V5.429l25-3.846V29c0 3.584-2.916 6.5-6.5 6.5s-6.5-2.916-6.5-6.5 2.916-6.5 6.5-6.5a6.43 6.43 0 012.785.634l.715.34V11.023l-19 2.931V31c0 3.584-2.916 6.5-6.5 6.5z" fill="#8bb7f0"/><path d="M37 2.166V29c0 3.308-2.692 6-6 6s-6-2.692-6-6 2.692-6 6-6a5.93 5.93 0 012.57.586l1.43.68V10.441l-1.152.178-18 2.776-.848.13V31c0 3.308-2.692 6-6 6s-6-2.692-6-6 2.692-6 6-6a5.93 5.93 0 012.57.586l1.43.68V5.858l24-3.692M38 1L12 5v19.683A6.962 6.962 0 009 24a7 7 0 107 7V14.383l18-2.776v11.076A6.962 6.962 0 0031 22a7 7 0 107 7V1z" fill="#4e7ab5"/></svg>'} 
       <span>
         ${subtitle !== undefined ? `<b>` : ''}
@@ -173,10 +318,10 @@ function createMusicFileHtml(fileLocation, title, aa, rating, subtitle) {
       </span>
     </div>
     <div class="song-button-box">
-      <span title="Play Now" onclick="playNow(this);" data-file_location="${escapeHtml(fileLocation)}" class="songDropdown">
+      <span title="Play Now" onclick="playNow(this);" data-file_location="${escapeHtml(fileLocation)}"${peerAttr()} class="songDropdown">
         <svg xmlns="http://www.w3.org/2000/svg" height="14" width="14" viewBox="0 0 24 24"><path fill="none" d="M0 0h24v24H0z"/><path d="M15.5 5H11l5 7-5 7h4.5l5-7z"/><path d="M8.5 5H4l5 7-5 7h4.5l5-7z"/></svg>
       </span>
-      <span title="Add To Playlist" onclick="createPopper3(this);" data-file_location="${escapeHtml(fileLocation)}" class="fileAddToPlaylist">
+      <span title="Add To Playlist" onclick="createPopper3(this);" data-file_location="${escapeHtml(fileLocation)}"${peerAttr()} class="fileAddToPlaylist">
         <svg class="pop-f" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 292.362 292.362"><path class="pop-f" d="M286.935 69.377c-3.614-3.617-7.898-5.424-12.848-5.424H18.274c-4.952 0-9.233 1.807-12.85 5.424C1.807 72.998 0 77.279 0 82.228c0 4.948 1.807 9.229 5.424 12.847l127.907 127.907c3.621 3.617 7.902 5.428 12.85 5.428s9.233-1.811 12.847-5.428L286.935 95.074c3.613-3.617 5.427-7.898 5.427-12.847 0-4.948-1.814-9.229-5.427-12.85z"/></svg>
       </span>
     </div>
@@ -185,15 +330,15 @@ function createMusicFileHtml(fileLocation, title, aa, rating, subtitle) {
 
 function renderDirHtml(name) {
   return `<li class="collection-item">
-    <div data-directory="${escapeHtml(name)}" class="dirz" onclick="handleDirClick(this);">
+    <div data-directory="${escapeHtml(name)}"${peerAttr()} class="dirz" onclick="handleDirClick(this);">
       <svg class="folder-image" viewBox="0 0 48 48" version="1.0" xmlns="http://www.w3.org/2000/svg"><path fill="#FFA000" d="M38 12H22l-4-4H8c-2.2 0-4 1.8-4 4v24c0 2.2 1.8 4 4 4h31c1.7 0 3-1.3 3-3V16c0-2.2-1.8-4-4-4z"/><path fill="#FFCA28" d="M42.2 18H15.3c-1.9 0-3.6 1.4-3.9 3.3L8 40h31.7c1.9 0 3.6-1.4 3.9-3.3l2.5-14c.5-2.4-1.4-4.7-3.9-4.7z"/></svg>
       <span class="item-text">${escapeHtml(name)}</span>
     </div>
     <div class="song-button-box">
-      <span style="padding-top:1px;" title="Add All To Queue" class="songDropdown" onclick="recursiveAddDir(this);" data-directory="${escapeHtml(name)}">
+      <span style="padding-top:1px;" title="Add All To Queue" class="songDropdown" onclick="recursiveAddDir(this);" data-directory="${escapeHtml(name)}"${peerAttr()}>
         <svg xmlns="http://www.w3.org/2000/svg" height="10" width="10" viewBox="0 0 1280 1276"><path d="M6760 12747 c-80 -5 -440 -10 -800 -11 -701 -2 -734 -4 -943 -57 -330 -84 -569 -281 -681 -563 -103 -256 -131 -705 -92 -1466 12 -241 16 -531 16 -1232 l0 -917 -1587 -4 c-1561 -3 -1590 -3 -1703 -24 -342 -62 -530 -149 -692 -322 -158 -167 -235 -377 -244 -666 -43 -1404 -42 -1813 7 -2355 21 -235 91 -400 233 -548 275 -287 730 -389 1591 -353 1225 51 2103 53 2330 7 l60 -12 6 -1489 c6 -1559 6 -1548 49 -1780 100 -535 405 -835 933 -921 88 -14 252 -17 1162 -24 591 -4 1099 -4 1148 1 159 16 312 56 422 112 118 59 259 181 333 290 118 170 195 415 227 722 18 173 21 593 6 860 -26 444 -32 678 -34 1432 l-2 811 54 7 c30 4 781 6 1670 5 1448 -2 1625 -1 1703 14 151 28 294 87 403 168 214 159 335 367 385 666 15 85 29 393 30 627 0 105 4 242 10 305 43 533 49 1047 15 1338 -44 386 -144 644 -325 835 -131 140 -278 220 -493 270 -92 21 -98 21 -1772 24 l-1680 3 3 1608 c2 1148 0 1635 -8 1706 -49 424 -255 701 -625 841 -243 91 -633 124 -1115 92z" transform="matrix(.1 0 0 -.1 0 1276)"/></svg>
       </span>
-      <span data-directory="${escapeHtml(name)}" title="Download Directory" class="downloadDir" onclick="recursiveFileDownload(this);">
+      <span data-directory="${escapeHtml(name)}"${peerAttr()} title="Download Directory" class="downloadDir" onclick="recursiveFileDownload(this);">
         <svg width="13" height="13" viewBox="0 0 2048 2048" xmlns="http://www.w3.org/2000/svg"><path d="M1803 960q0 53-37 90l-651 652q-39 37-91 37-53 0-90-37l-651-652q-38-36-38-90 0-53 38-91l74-75q39-37 91-37 53 0 90 37l294 294v-704q0-52 38-90t90-38h128q52 0 90 38t38 90v704l294-294q37-37 90-37 52 0 91 37l75 75q37 39 37 91z"/></svg>
       </span>
     </div>
@@ -244,8 +389,10 @@ function setBrowserRootPanel(panelName, showBar) {
   document.getElementById('upload_btn').classList.add('super-hide');
   document.getElementById('mkdir_btn').classList.add('super-hide');
 
+  // Inside a peer view every panel says whose library it is showing.
+  const label = peerContext ? `${escapeHtml(peerContext.name)} &middot; ${panelName}` : panelName;
   ([...document.getElementsByClassName('panel_one_name')]).forEach(el => {
-    el.innerHTML = panelName;
+    el.innerHTML = label;
   });
 
   currentBrowsingList = [];
@@ -267,8 +414,12 @@ async function senddir(root) {
   const directoryString = root === true ? '~' : getFileExplorerPath();
   document.getElementById('filelist').innerHTML = getLoadingSvg();
 
+  const gen = browseGeneration;
   try {
-    const response = await MSTREAMAPI.dirparser(directoryString);
+    const response = peerContext
+      ? await MSTREAMAPI.peer.dirparser(peerContext.id, directoryString)
+      : await MSTREAMAPI.dirparser(directoryString);
+    if (gen !== browseGeneration) { return; }
     // document.getElementById('directoryName').innerHTML = escapeHtml(response.path);
 
     // const formattedPath = response.path.replaceAll("/", "/<wbr>");
@@ -298,7 +449,9 @@ async function senddir(root) {
     // Show upload and mkdir buttons only when inside a vpath (not at root)
     const uploadBtn = document.getElementById('upload_btn');
     const mkdirBtn = document.getElementById('mkdir_btn');
-    if (fileExplorerArray.length > 0) {
+    // Both are writes, and a federation key carries no write permission —
+    // the peer's allowlist stops at reads, so never offer them there.
+    if (fileExplorerArray.length > 0 && !peerContext) {
       uploadBtn.classList.remove('super-hide');
       if (MSTREAMAPI.currentServer.noMkdir === true) {
         mkdirBtn.classList.add('super-hide');
@@ -330,12 +483,17 @@ function printdir(response) {
   }
 
   for (const file of response.files) {
-    currentBrowsingList.push({ type: file.type, name: file.name })
+    // .m3u playlists resolve against THIS library's paths and there is no peer
+    // wrapper to load, queue, or download one — skip them on a peer rather than
+    // render rows whose handlers would call local APIs with a peer path.
+    if (file.type === 'm3u' && peerContext) { continue; }
+    const filePath = file.path || response.path + file.name;
+    const title = file.artist != null || file.title != null ? file.artist + ' - ' + file.title : file.name;
+    currentBrowsingList.push({ type: file.type, name: file.name, path: filePath, title });
     if (file.type === 'm3u') {
       filelist += createFileplaylistHtml(file.name);
     } else {
-      const title = file.artist != null || file.title != null ? file.artist + ' - ' + file.title : file.name;
-      filelist += createMusicFileHtml(file.path || response.path + file.name, title);
+      filelist += createMusicFileHtml(filePath, title);
     }
   }
 
@@ -368,6 +526,7 @@ if (typeof(Storage) !== "undefined" && localStorage.getItem("token")) {
 }
 
 function handleDirClick(el){
+  adoptPeer(el);
   fileExplorerArray.push(el.getAttribute('data-directory'));
   programState.push({
     state: 'fileExplorer',
@@ -394,47 +553,65 @@ function boilerplateFailure(err) {
 }
 
 function onFileClick(el) {
+  const peer = peerOf(el);
   // Sonic Path song-capture: an armed picker takes the next SINGLE row
   // click; bulk actions never come through here, so they queue normally.
   if (VUEPLAYERCORE.songCapture) {
+    // A peer track can't seed a path — the arc is computed from embeddings
+    // in the LOCAL index, and this filepath is in the peer's namespace.
+    // Say so and leave the picker armed for a local row.
+    if (peer) {
+      iziToast.warning({ title: t('sonicPath.federatedTrack'), position: 'topCenter', timeout: 3000 });
+      return;
+    }
     const capture = VUEPLAYERCORE.songCapture;
     VUEPLAYERCORE.songCapture = null;
     capture({ filepath: el.getAttribute("data-file_location") });
     return;
   }
-  VUEPLAYERCORE.addSongWizard(el.getAttribute("data-file_location"), {}, true);
+  queueRow(peer, el.getAttribute("data-file_location"));
 }
 
-// Metadata for the current DB-search results, keyed by (raw) filepath. The
-// search API returns the full canonical metadata object inline on track hits,
-// so the search-result handlers below enqueue with it directly and skip the
-// per-click /api/v1/db/metadata round-trip that the shared onFileClick/playNow
-// (used by the file browser, which has no inline metadata) still perform.
-// Rebuilt on every search in submitSearchForm().
+// Metadata for the current DB-search results, keyed by (peer, raw filepath).
+// The search API returns the full canonical metadata object inline on track
+// hits, so the search-result handlers below enqueue with it directly and skip
+// the per-click /api/v1/db/metadata round-trip that the shared
+// onFileClick/playNow (used by the file browser, which has no inline
+// metadata) still perform. Rebuilt on every search in submitSearchForm().
+//
+// The peer is part of the key because results from several servers share one
+// list, and two libraries can easily hold the same "music/Artist/01.flac".
 let searchResultMetadata = {};
 
+function searchKey(peerId, filepath) {
+  return `${peerId === undefined || peerId === null ? '' : peerId}:${filepath}`;
+}
+
 // Search-result variants of onFileClick / playNow: enqueue with the inline
-// metadata when we have it (so addSongWizard skips the lookup), else fall back
-// to a server lookup (lookupMetadata=true) for safety.
+// metadata when we have it (so the wizard skips the lookup), else fall back
+// to a server lookup for safety. A row from a peer queues over the bridge.
 function searchFileClick(el) {
+  const peer = peerOf(el);
   const fp = el.getAttribute("data-file_location");
-  const meta = searchResultMetadata[fp];
-  VUEPLAYERCORE.addSongWizard(fp, meta || {}, !meta);
+  queueRow(peer, fp, searchResultMetadata[searchKey(peer && peer.id, fp)]);
 }
 
 function searchPlayNow(el) {
+  const peer = peerOf(el);
   const fp = el.getAttribute("data-file_location");
-  const meta = searchResultMetadata[fp];
-  VUEPLAYERCORE.addSongWizard(fp, meta || {}, !meta, MSTREAMPLAYER.positionCache.val + 1);
+  queueRow(peer, fp, searchResultMetadata[searchKey(peer && peer.id, fp)], MSTREAMPLAYER.positionCache.val + 1);
 }
 
 async function recursiveAddDir(el) {
+  const peer = adoptPeer(el);
   try {
     const directoryString = getDirectoryString2(el);
-    const res = await MSTREAMAPI.recursiveScan(directoryString);
-    addAllSongs(res);
+    const res = peer
+      ? await MSTREAMAPI.peer.recursiveScan(peer.id, directoryString)
+      : await MSTREAMAPI.recursiveScan(directoryString);
+    res.forEach(fp => queueRow(peer, fp));
   } catch(err) {
-    boilerplateFailure(err);   
+    boilerplateFailure(err);
   }
 }
 
@@ -476,7 +653,7 @@ async function addFilePlaylist(el) {
 
 function addAll() {
   ([...document.getElementsByClassName('filez')]).forEach(el => {
-    VUEPLAYERCORE.addSongWizard(el.getAttribute("data-file_location"), {}, true);
+    queueRow(peerOf(el), el.getAttribute("data-file_location"));
   });
 }
 
@@ -490,17 +667,18 @@ async function queueAlbum(cardEl) {
   const album = cardEl.getAttribute('data-album') || null;
   const artist = cardEl.getAttribute('data-artist') || null;
   const year = cardEl.getAttribute('data-year') || null;
+  const peer = adoptPeer(cardEl);
 
   try {
-    const response = await MSTREAMAPI.albumSongs({
+    const response = await browseApi('albumSongs', {
       album,
       artist,
       year,
-      ignoreVPaths: Object.keys(MSTREAMPLAYER.ignoreVPaths).filter(v => MSTREAMPLAYER.ignoreVPaths[v] === true)
+      ignoreVPaths: localIgnoreVPaths()
     });
 
     response.forEach(song => {
-      VUEPLAYERCORE.addSongWizard(song.filepath, song.metadata || {}, true);
+      queueRow(peer, song.filepath, song.metadata || {});
     });
 
     iziToast.success({
@@ -515,7 +693,7 @@ async function queueAlbum(cardEl) {
 }
 
 function playNow(el) {
-  VUEPLAYERCORE.addSongWizard(el.getAttribute("data-file_location"), {}, true, MSTREAMPLAYER.positionCache.val + 1);
+  queueRow(peerOf(el), el.getAttribute("data-file_location"), undefined, MSTREAMPLAYER.positionCache.val + 1);
 }
 
 async function init() {
@@ -556,6 +734,11 @@ async function init() {
     // only when the server has the route (never probed).
     MSTREAMAPI.currentServer.discoveryPath = response.discoveryPath === true;
     document.getElementById('nav-sonic-path').classList.toggle('super-hide', response.discoveryPath !== true);
+
+    // Federation: is there another server to point this app at? The flag
+    // means "federation is on AND at least one peer is paired" — no probing.
+    MSTREAMAPI.currentServer.federationBrowse = response.federationBrowse === true;
+    if (MSTREAMAPI.currentServer.federationBrowse) { loadServerSwitcher(); }
 
     if (response.transcode) {
       MSTREAMPLAYER.transcodeOptions.serverEnabled = true;
@@ -620,6 +803,14 @@ async function init() {
 // never appeared. Removed entirely.
 
 function createPopper3(el) {
+  // Playlists store paths against THIS library — a peer's path would save
+  // as a row that resolves to nothing. Say so instead of opening a picker
+  // whose every option fails on submit (the same bargain the rating popper
+  // strikes on peer tracks in vp.js).
+  if (peerOf(el)) {
+    iziToast.info({ title: t('peers.noPlaylist'), position: 'topCenter', timeout: 2500 });
+    return;
+  }
   if (curFileTracker === el.getAttribute("data-file_location")) {
     curFileTracker = undefined;
     document.getElementById("pop-f").style.visibility = "hidden";
@@ -2427,6 +2618,11 @@ async function addToPlaylistUI(playlist) {
 
 /////////////// Download Playlist
 function downloadPlaylist() {
+  // A peer track's rawFilePath resolves only on the peer; posting it to our
+  // local /download/zip would silently drop it, yielding a dishonest archive.
+  // Refuse a mixed queue outright, as savePlaylist/submitShareForm do.
+  if (refuseMixedQueue('download.cannotDownloadMixed')) { return; }
+
   // Loop through array and add each file to the playlist
   const downloadFiles = [];
   for (let i = 0; i < MSTREAMPLAYER.playlist.length; i++) {
@@ -2453,6 +2649,13 @@ function downloadPlaylist() {
 }
 
 function recursiveFileDownload(el) {
+  // /api/v1/download/directory zips a path in THIS library. Downloading a
+  // peer's folder would need a second proxy (and the peer's own consent);
+  // until then, be honest rather than serve an empty archive.
+  if (peerOf(el)) {
+    iziToast.info({ title: t('peers.noDownload'), position: 'topCenter', timeout: 2500 });
+    return;
+  }
   const directoryString = getDirectoryString2(el);
   document.getElementById('downform').action = "api/v1/download/directory?token=" + MSTREAMAPI.currentServer.token;
 
@@ -2863,12 +3066,9 @@ async function setLivePlaylist() {
         VUEPLAYERCORE.addSongWizard(value.filepath, value.metadata, false, undefined, false, true);
       });  
     } else {
-      // save current queue
-      const songs = [];
-      for (let i = 0; i < MSTREAMPLAYER.playlist.length; i++) {
-        songs.push(MSTREAMPLAYER.playlist[i].filepath);
-      }
-      MSTREAMAPI.savePlaylist(livePlaylistName, songs, true);
+      // Seed the empty playlist from the current queue (federated tracks left
+      // out — saveLiveQueue routes through localQueueFilepaths).
+      VUEPLAYERCORE.saveLiveQueue();
     }
 
     document.getElementById('set_live_playlist').classList.remove('green');
@@ -2885,7 +3085,28 @@ async function setLivePlaylist() {
   }
 }
 
+// Tracks in the queue that live on a federated server. Playlists and shares
+// both resolve paths against THIS library, so neither can carry one.
+function federatedTracksInQueue() {
+  return MSTREAMPLAYER.playlist.filter(song => song.federation);
+}
+
+// Refuse an action that would have to write federated paths, naming the
+// count so the user can find them. Returns true when it refused.
+function refuseMixedQueue(titleKey) {
+  const mixed = federatedTracksInQueue();
+  if (mixed.length === 0) { return false; }
+  iziToast.warning({
+    title: t(titleKey),
+    message: t('playlist.federatedCount', { count: mixed.length }),
+    position: 'topCenter',
+    timeout: 5000
+  });
+  return true;
+}
+
 async function savePlaylist() {
+  if (refuseMixedQueue('playlist.cannotSaveMixed')) { return; }
   if (MSTREAMPLAYER.playlist.length == 0) {
     iziToast.warning({
       title: t('toast.noPlaylistToSave'),
@@ -2934,12 +3155,10 @@ async function getAllArtists() {
   document.getElementById('filelist').innerHTML = getLoadingSvg();
   programState = [{ state: 'allArtists' }];
 
+  const gen = browseGeneration;
   try {
-    const response = await MSTREAMAPI.artists({
-      ignoreVPaths: Object.keys(MSTREAMPLAYER.ignoreVPaths).filter((vpath) => {
-        return MSTREAMPLAYER.ignoreVPaths[vpath] === true;
-      })
-    });
+    const response = await browseApi('artists', { ignoreVPaths: localIgnoreVPaths() });
+    if (gen !== browseGeneration) { return; }
 
     // parse through the json array and make an array of corresponding divs
     let artists = '<ul class="collection">';
@@ -2959,6 +3178,7 @@ async function getAllArtists() {
 }
 
 function getArtistz(el) {
+  adoptPeer(el);
   const artist = el.getAttribute('data-artist');
   programState.push({
     state: 'artist',
@@ -2975,19 +3195,16 @@ async function getArtistsAlbums(artist) {
   document.getElementById('directoryName').innerHTML = t('label.artist') + ' ' + escapeHtml(artist);
   document.getElementById('filelist').innerHTML = getLoadingSvg();
 
+  const gen = browseGeneration;
   try {
-    const response = await MSTREAMAPI.artistAlbums({
-      artist: artist,
-      ignoreVPaths: Object.keys(MSTREAMPLAYER.ignoreVPaths).filter((vpath) => {
-        return MSTREAMPLAYER.ignoreVPaths[vpath] === true;
-      })
-    });
+    const response = await browseApi('artistAlbums', { artist: artist, ignoreVPaths: localIgnoreVPaths() });
+    if (gen !== browseGeneration) { return; }
 
     let albums = '<div class="album-grid">';
     response.albums.forEach(value => {
       const albumString = value.name ? value.name : 'SINGLES';
       albums += renderAlbum(value.name, value.name === null ? artist : null, albumString, value.album_art_file, value.year);
-      currentBrowsingList.push({ type: 'album', name: value.name, artist: artist, album_art_file: value.album_art_file })
+      currentBrowsingList.push({ type: 'album', name: value.name, artist: artist, album_art_file: value.album_art_file, year: value.year })
     });
     albums += '</div>';
 
@@ -3006,17 +3223,15 @@ async function getAllGenres() {
   document.getElementById('filelist').innerHTML = getLoadingSvg();
   programState = [{ state: 'allGenres' }];
 
+  const gen = browseGeneration;
   try {
-    const response = await MSTREAMAPI.genres();
+    const response = await browseApi('genres', {});
+    if (gen !== browseGeneration) { return; }
 
     let html = '<ul class="collection">';
     response.genres.forEach(value => {
-      html += `<li class="collection-item">
-        <div data-genre="${escapeHtml(value.name)}" class="artistz" onclick="getGenreSongsList(this)">
-          ${escapeHtml(value.name)} <span style="color:#888;font-size:13px;">(${value.track_count})</span>
-        </div>
-      </li>`;
-      currentBrowsingList.push({ type: 'genre', name: value.name });
+      html += renderGenre(value.name, value.track_count);
+      currentBrowsingList.push({ type: 'genre', name: value.name, track_count: value.track_count });
     });
     html += '</ul>';
 
@@ -3027,6 +3242,7 @@ async function getAllGenres() {
 }
 
 function getGenreSongsList(el) {
+  adoptPeer(el);
   const genre = el.getAttribute('data-genre');
   programState.push({
     state: 'genre',
@@ -3042,19 +3258,18 @@ async function getGenreSongs(genre) {
   document.getElementById('directoryName').innerHTML = t('label.genre') + ' ' + escapeHtml(genre);
   document.getElementById('filelist').innerHTML = getLoadingSvg();
 
+  const gen = browseGeneration;
   try {
-    const response = await MSTREAMAPI.genreSongs({ genre: genre });
+    const response = await browseApi('genreSongs', { genre: genre });
+    if (gen !== browseGeneration) { return; }
 
     let songs = '<ul class="collection">';
     response.forEach(song => {
-      currentBrowsingList.push({ type: 'file', name: song.metadata.title ? song.metadata.title : song.filepath.split('/').pop() });
-      songs += createMusicFileHtml(
-        song.filepath,
-        song.metadata.title ? song.metadata.title : song.filepath.split('/').pop(),
-        undefined,
-        undefined,
-        song.metadata.artist ? song.metadata.artist : undefined
-      );
+      const title = song.metadata.title ? song.metadata.title : song.filepath.split('/').pop();
+      const subtitle = song.metadata.artist ? song.metadata.artist : undefined;
+
+      currentBrowsingList.push({ type: 'file', name: title, path: song.filepath, title, subtitle });
+      songs += createMusicFileHtml(song.filepath, title, undefined, undefined, subtitle);
     });
     songs += '</ul>';
 
@@ -3071,19 +3286,18 @@ async function getAllAlbums() {
   
   programState = [{ state: 'allAlbums' }];
 
+  const gen = browseGeneration;
   try {
-    const response = await MSTREAMAPI.albums({
-      ignoreVPaths: Object.keys(MSTREAMPLAYER.ignoreVPaths).filter((vpath) => {
-        return MSTREAMPLAYER.ignoreVPaths[vpath] === true;
-      })
-    });
+    const response = await browseApi('albums', { ignoreVPaths: localIgnoreVPaths() });
+    if (gen !== browseGeneration) { return; }
 
     let albums = '<div class="album-grid">';
     response.albums.forEach(value => {
       currentBrowsingList.push({
         type: 'album',
         name: value.name,
-        'album_art_file': value.album_art_file
+        'album_art_file': value.album_art_file,
+        year: value.year
       });
 
       albums += renderAlbum(value.name, undefined, value.name, value.album_art_file, value.year);
@@ -3100,6 +3314,7 @@ async function getAllAlbums() {
 }
 
 function getAlbumsOnClick(el) {
+  adoptPeer(el);
   getAlbumSongs(
     el.hasAttribute('data-album') ? el.getAttribute('data-album') : null,
     el.hasAttribute('data-artist') ? el.getAttribute('data-artist') : null,
@@ -3122,21 +3337,24 @@ async function getAlbumSongs(album, artist, year) {
 
   document.getElementById('localSearchBar').value = '';
 
+  const gen = browseGeneration;
   try {
-    const response = await MSTREAMAPI.albumSongs({
+    const response = await browseApi('albumSongs', {
       album,
       artist,
       year,
-      ignoreVPaths: Object.keys(MSTREAMPLAYER.ignoreVPaths).filter((vpath) => {
-        return MSTREAMPLAYER.ignoreVPaths[vpath] === true;
-      })
+      ignoreVPaths: localIgnoreVPaths()
     });
-  
+    if (gen !== browseGeneration) { return; }
+
     //parse through the json array and make an array of corresponding divs
     let files = '<ul class="collection">';
     response.forEach(song => {
-      currentBrowsingList.push({ type: 'file', name: song.metadata.title ? song.metadata.title : song.metadata.filename });
-      files += createMusicFileHtml(song.filepath, song.metadata.title ? song.metadata.title : song.metadata.filename, undefined, undefined, song.metadata.artist ? song.metadata.artist : undefined);
+      const title = song.metadata.title ? song.metadata.title : song.metadata.filename;
+      const subtitle = song.metadata.artist ? song.metadata.artist : undefined;
+
+      currentBrowsingList.push({ type: 'file', name: title, path: song.filepath, title, subtitle });
+      files += createMusicFileHtml(song.filepath, title, undefined, undefined, subtitle);
     });
     files += '</ul>';
 
@@ -3155,12 +3373,14 @@ async function getRatedSongs() {
   document.getElementById('filelist').innerHTML = getLoadingSvg();
   programState = [{ state: 'allRated' }];
 
+  const gen = browseGeneration;
   try {
     const response = await MSTREAMAPI.getRated({
       ignoreVPaths: Object.keys(MSTREAMPLAYER.ignoreVPaths).filter((vpath) => {
         return MSTREAMPLAYER.ignoreVPaths[vpath] === true;
       })
     });
+    if (gen !== browseGeneration) { return; }
     //parse through the json array and make an array of corresponding divs
     let files = '';
     response.forEach(value => {
@@ -3169,17 +3389,19 @@ async function getRatedSongs() {
         rating = rating.toFixed(1);
       }
 
+      const title = value.metadata.title ? value.metadata.title : value.filepath.split('/').pop();
+      const aa = artImgAttr(value.metadata['album-art'], 's');
+      const subtitle = value.metadata.artist ? value.metadata.artist : '';
+
       currentBrowsingList.push({
         type: 'file',
         name: value.metadata.artist ? value.metadata.artist + ' - ' + value.metadata.title : value.filepath,
-        metadata: value.metadata
+        metadata: value.metadata,
+        path: value.filepath,
+        title, aa, rating, subtitle
       });
 
-      files += createMusicFileHtml(value.filepath,
-        value.metadata.title ? value.metadata.title : value.filepath.split('/').pop(),
-        value.metadata['album-art'] ? `src="${MSTREAMAPI.currentServer.host}album-art/${escapeHtml(value.metadata['album-art'])}?compress=s&token=${MSTREAMAPI.currentServer.token}"` : `src="assets/img/default.png"`,
-        rating,
-        value.metadata.artist ? value.metadata.artist : '');
+      files += createMusicFileHtml(value.filepath, title, aa, rating, subtitle);
     });
 
     document.getElementById('filelist').innerHTML = `<ul class="collection">${files}</ul>`;
@@ -3204,26 +3426,30 @@ async function redoRecentlyPlayed() {
   currentBrowsingList = [];
   programState = [{ state: 'recentlyPlayed'}];
 
+  const gen = browseGeneration;
   try {
     const response = await MSTREAMAPI.getRecentlyPlayed(
       document.getElementById('recently-played-limit').value,
       Object.keys(MSTREAMPLAYER.ignoreVPaths).filter((vpath) => {
         return MSTREAMPLAYER.ignoreVPaths[vpath] === true;
       }));
+    if (gen !== browseGeneration) { return; }
 
     //parse through the json array and make an array of corresponding divs
     let filelist = '<ul class="collection">';
     response.forEach(el => {
+      const title = el.metadata.title ? `${el.metadata.title}`: el.filepath.split("/").pop();
+      const aa = artImgAttr(el.metadata['album-art'], 's');
+      const subtitle = el.metadata.artist ? el.metadata.artist : '';
+
       currentBrowsingList.push({
         type: 'file',
-        name: el.metadata.title ? el.metadata.artist + ' - ' + el.metadata.title : el.filepath.split("/").pop()
+        name: el.metadata.title ? el.metadata.artist + ' - ' + el.metadata.title : el.filepath.split("/").pop(),
+        path: el.filepath,
+        title, aa, subtitle
       });
 
-      filelist += createMusicFileHtml(el.filepath,
-        el.metadata.title ? `${el.metadata.title}`: el.filepath.split("/").pop(),
-        el.metadata['album-art'] ? `src="${MSTREAMAPI.currentServer.host}album-art/${escapeHtml(el.metadata['album-art'])}?compress=s&token=${MSTREAMAPI.currentServer.token}"` : `src="assets/img/default.png"`,
-        undefined,
-        el.metadata.artist ? el.metadata.artist : '');
+      filelist += createMusicFileHtml(el.filepath, title, aa, undefined, subtitle);
     });
 
     filelist += '</ul>'
@@ -3256,26 +3482,30 @@ async function redoMostPlayed() {
   currentBrowsingList = [];
   programState = [{ state: 'mostPlayed'}];
 
+  const gen = browseGeneration;
   try {
     const response = await MSTREAMAPI.getMostPlayed(
       document.getElementById('most-played-limit').value,
       Object.keys(MSTREAMPLAYER.ignoreVPaths).filter((vpath) => {
         return MSTREAMPLAYER.ignoreVPaths[vpath] === true;
       }));
+    if (gen !== browseGeneration) { return; }
 
     //parse through the json array and make an array of corresponding divs
     let filelist = '<ul class="collection">';
     response.forEach(el => {
+      const title = el.metadata.title ? `${el.metadata.title}`: el.filepath.split("/").pop();
+      const aa = artImgAttr(el.metadata['album-art'], 's');
+      const subtitle = el.metadata.artist ? `${el.metadata.artist} [${el.metadata['play-count']} plays]` : `[${el.metadata['play-count']} plays]`;
+
       currentBrowsingList.push({
         type: 'file',
-        name: el.metadata.title ? el.metadata.artist + ' - ' + el.metadata.title : el.filepath.split("/").pop()
+        name: el.metadata.title ? el.metadata.artist + ' - ' + el.metadata.title : el.filepath.split("/").pop(),
+        path: el.filepath,
+        title, aa, subtitle
       });
 
-      filelist += createMusicFileHtml(el.filepath,
-        el.metadata.title ? `${el.metadata.title}`: el.filepath.split("/").pop(),
-        el.metadata['album-art'] ? `src="${MSTREAMAPI.currentServer.host}album-art/${escapeHtml(el.metadata['album-art'])}?compress=s&token=${MSTREAMAPI.currentServer.token}"` : `src="assets/img/default.png"`,
-        undefined,
-        el.metadata.artist ? `${el.metadata.artist} [${el.metadata['play-count']} plays]` : `[${el.metadata['play-count']} plays]`);
+      filelist += createMusicFileHtml(el.filepath, title, aa, undefined, subtitle);
     });
 
     filelist += '</ul>'
@@ -3306,28 +3536,31 @@ function getRecentlyAdded() {
 
 async function redoRecentlyAdded() {
   currentBrowsingList = [];
-  programState = [{ state: 'recentlyAdded'}];
+  programState = [{ state: 'recentlyAdded' }];
 
+  const gen = browseGeneration;
   try {
-    const response = await MSTREAMAPI.getRecentlyAdded(
-      document.getElementById('recently-added-limit').value,
-      Object.keys(MSTREAMPLAYER.ignoreVPaths).filter((vpath) => {
-        return MSTREAMPLAYER.ignoreVPaths[vpath] === true;
-      }));
+    const limit = document.getElementById('recently-added-limit').value;
+    const response = peerContext
+      ? await MSTREAMAPI.peer.recentlyAdded(peerContext.id, limit)
+      : await MSTREAMAPI.getRecentlyAdded(limit, localIgnoreVPaths());
+    if (gen !== browseGeneration) { return; }
 
     //parse through the json array and make an array of corresponding divs
     let filelist = '<ul class="collection">';
     response.forEach(el => {
+      const title = el.metadata.title ? `${el.metadata.title}`: el.filepath.split("/").pop();
+      const aa = artImgAttr(el.metadata['album-art'], 's');
+      const subtitle = el.metadata.artist ? el.metadata.artist : '';
+
       currentBrowsingList.push({
         type: 'file',
-        name: el.metadata.title ? el.metadata.artist + ' - ' + el.metadata.title : el.filepath.split("/").pop()
+        name: el.metadata.title ? el.metadata.artist + ' - ' + el.metadata.title : el.filepath.split("/").pop(),
+        path: el.filepath,
+        title, aa, subtitle
       });
 
-      filelist += createMusicFileHtml(el.filepath,
-        el.metadata.title ? `${el.metadata.title}`: el.filepath.split("/").pop(),
-        el.metadata['album-art'] ? `src="${MSTREAMAPI.currentServer.host}album-art/${escapeHtml(el.metadata['album-art'])}?compress=s&token=${MSTREAMAPI.currentServer.token}"` : `src="assets/img/default.png"`,
-        undefined,
-        el.metadata.artist ? el.metadata.artist : '');
+      filelist += createMusicFileHtml(el.filepath, title, aa, undefined, subtitle);
     });
 
     filelist += '</ul>'
@@ -3420,6 +3653,10 @@ function toggleTranscoding(el, manual){
 
   // Convert playlist
   for (let i = 0; i < MSTREAMPLAYER.playlist.length; i++) {
+    // Peer tracks stream through the federation proxy: there is no transcode
+    // route on the peer, and their URL carries a 'media/' segment this replace
+    // would corrupt into an un-allowlisted path. Leave them untouched.
+    if (MSTREAMPLAYER.playlist[i].federation) { continue; }
     MSTREAMPLAYER.playlist[i].url = MSTREAMPLAYER.playlist[i].url.replace(a, b);
   }
 
@@ -3431,16 +3668,7 @@ function toggleTranscoding(el, manual){
 async function getMobilePanel(){
   setBrowserRootPanel(t('panel.mobileApps'), false);
 
-  // Probe whether Subsonic is enabled on this server. The panel always
-  // shows the app-store links + QR shortcut; the Subsonic sections are
-  // gated behind subsonic.mode !== 'disabled' (server-side config).
-  let subsonicEnabled = false;
-  try {
-    const info = await MSTREAMAPI.serverInfo();
-    subsonicEnabled = info?.features?.subsonic === true;
-  } catch (_) { /* server too old or offline; just hide Subsonic UI */ }
-
-  let html = `
+  const html = `
     <div class="mobile-links pad-6">
       <a target="_blank" href="https://play.google.com/store/apps/details?id=mstream.music&pcampaignid=MKT-Other-global-all-co-prtnr-py-PartBadge-Mar2515-1">
         <img alt='Get it on Google Play' src='https://play.google.com/intl/en_us/badges/images/generic/en_badge_web_generic.png'/>
@@ -3460,152 +3688,14 @@ async function getMobilePanel(){
     </div>
     -->`;
 
-  if (subsonicEnabled) {
-    const serverUrl = window.location.origin;
-    const username = MSTREAMAPI.currentServer.username || '';
-    html += `
-      <hr>
-      <div class="pad-6">
-        <h4>Subsonic Access</h4>
-        <p>Use any Subsonic-compatible client (Symfonium, DSub, substreamer, Sonixd, Feishin…) with these credentials.</p>
-        <p>
-          <b>Server URL:</b> <code id="subsonic-server-url">${serverUrl}</code><br>
-          <b>Username:</b> <code>${username}</code>
-        </p>
-
-        <h5>Subsonic Password</h5>
-        <p style="font-size: 0.9em; opacity: 0.85;">
-          Many Subsonic clients require a separately-stored password (the protocol's "token authentication" mode).
-          mStream protects your main password with strong one-way PBKDF2 hashing, which doesn't support that mode.
-          Set a Subsonic-specific password here to enable those clients.
-          <b>This password is stored in encrypted (recoverable) form on the server</b> — it's intentionally
-          less secure than your main password. We recommend a different value than your mStream login.
-        </p>
-        <div id="subsonic-password-status" style="margin-bottom: 0.5em;"><i>Loading…</i></div>
-        <div>
-          <input type="password" id="subsonic-password-input" placeholder="New Subsonic password" style="max-width: 280px;"/>
-          <button id="subsonic-password-set" onclick="setSubsonicPasswordFromForm()">Set / Update</button>
-          <button id="subsonic-password-clear" onclick="clearSubsonicPasswordFromForm()" style="display:none">Clear</button>
-        </div>
-
-        <h5 style="margin-top: 1.5em;">API Keys</h5>
-        <p style="font-size: 0.9em; opacity: 0.85;">
-          Modern Subsonic clients can also authenticate with an API key — no password needed.
-          The key is shown once at creation; copy it into your client immediately.
-        </p>
-        <div id="subsonic-api-keys-list" style="margin-bottom: 0.5em;"><i>Loading…</i></div>
-        <div>
-          <input type="text" id="subsonic-api-key-name" placeholder="Key name (e.g. iPhone Symfonium)" style="max-width: 280px;"/>
-          <button onclick="createSubsonicApiKeyFromForm()">Generate</button>
-        </div>
-        <div id="subsonic-api-key-just-created" style="margin-top: 0.75em;"></div>
-      </div>`;
-  }
-
   document.getElementById('filelist').innerHTML = html;
-
-  if (subsonicEnabled) {
-    refreshSubsonicPasswordStatus();
-    refreshSubsonicApiKeyList();
-  }
-}
-
-// ── Subsonic password helpers (mobile panel) ─────────────────────────────────
-async function refreshSubsonicPasswordStatus() {
-  try {
-    const { set } = await MSTREAMAPI.getSubsonicPasswordStatus();
-    const status = document.getElementById('subsonic-password-status');
-    const clearBtn = document.getElementById('subsonic-password-clear');
-    if (set) {
-      status.innerHTML = '<b style="color: #2e7d32;">Subsonic password is set.</b>';
-      if (clearBtn) { clearBtn.style.display = 'inline-block'; }
-    } else {
-      status.innerHTML = '<i>No Subsonic password set. Token-auth clients will not work until you set one.</i>';
-      if (clearBtn) { clearBtn.style.display = 'none'; }
-    }
-  } catch (err) {
-    boilerplateFailure(err);
-  }
-}
-
-async function setSubsonicPasswordFromForm() {
-  const input = document.getElementById('subsonic-password-input');
-  const password = input.value;
-  if (!password) { return; }
-  try {
-    await MSTREAMAPI.setSubsonicPassword(password);
-    input.value = '';
-    await refreshSubsonicPasswordStatus();
-  } catch (err) {
-    boilerplateFailure(err);
-  }
-}
-
-async function clearSubsonicPasswordFromForm() {
-  if (!confirm('Clear the Subsonic password? Token-auth Subsonic clients will stop working until you set a new one.')) {
-    return;
-  }
-  try {
-    await MSTREAMAPI.clearSubsonicPassword();
-    await refreshSubsonicPasswordStatus();
-  } catch (err) {
-    boilerplateFailure(err);
-  }
-}
-
-// ── Subsonic API key helpers (mobile panel) ──────────────────────────────────
-async function refreshSubsonicApiKeyList() {
-  try {
-    const keys = await MSTREAMAPI.listSubsonicApiKeys();
-    const list = document.getElementById('subsonic-api-keys-list');
-    if (!Array.isArray(keys) || keys.length === 0) {
-      list.innerHTML = '<i>No API keys yet.</i>';
-      return;
-    }
-    list.innerHTML = keys.map(k => `
-      <div style="display: flex; align-items: center; gap: 1em; margin-bottom: 0.25em;">
-        <code>${escapeHtml(k.name || '(unnamed)')}</code>
-        <span style="font-size: 0.85em; opacity: 0.7;">
-          ${k.last_used ? 'last used ' + new Date(k.last_used).toLocaleString() : 'never used'}
-        </span>
-        <button onclick="revokeSubsonicApiKey(${k.id})" style="margin-left: auto;">Revoke</button>
-      </div>
-    `).join('');
-  } catch (err) {
-    boilerplateFailure(err);
-  }
-}
-
-async function createSubsonicApiKeyFromForm() {
-  const input = document.getElementById('subsonic-api-key-name');
-  const name = input.value.trim();
-  if (!name) { return; }
-  try {
-    const { key } = await MSTREAMAPI.createSubsonicApiKey(name);
-    input.value = '';
-    document.getElementById('subsonic-api-key-just-created').innerHTML = `
-      <div style="background: #fff3cd; border: 1px solid #ffeaa7; padding: 0.75em; border-radius: 4px;">
-        <b>New API key (copy this — it won't be shown again):</b><br>
-        <code style="word-break: break-all; user-select: all;">${escapeHtml(key)}</code>
-      </div>`;
-    await refreshSubsonicApiKeyList();
-  } catch (err) {
-    boilerplateFailure(err);
-  }
-}
-
-async function revokeSubsonicApiKey(id) {
-  if (!confirm('Revoke this API key? Any client using it will stop working immediately.')) { return; }
-  try {
-    await MSTREAMAPI.revokeSubsonicApiKey(id);
-    await refreshSubsonicApiKeyList();
-  } catch (err) {
-    boilerplateFailure(err);
-  }
 }
 
 //////////////////////////  Share playlists
 async function submitShareForm() {
+  // A share serves LOCAL paths to an anonymous visitor with no federation
+  // key of their own — there is no way to hand a peer's track through it.
+  if (refuseMixedQueue('share.cannotShareMixed')) { return; }
   try {
     document.getElementById('share_it').disabled = true;
     const shareTimeInDays = document.getElementById('share_time').value;
@@ -4286,6 +4376,95 @@ async function autoDjPanel() {
       </div>
     </div>`;
 
+  // ── Track-length window ────────────────────────────────────────
+  //
+  // Toggle + two bounds + an unknown-length switch. AUTODJ stores
+  // SECONDS (wire units); the inputs are MINUTES because that's how
+  // people think about track length, and the handlers convert at the
+  // edge (Math.round(minutes * 60), so 0.5 → 30s).
+  //
+  // `step="any"` rather than a fixed grid: the conversion accepts any
+  // decimal, so a grid would mark perfectly valid entries like 1.25 or
+  // 0.1 as :invalid — asserting a constraint the code doesn't have,
+  // and one that would start rendering as an error the moment anything
+  // styles :invalid. The spinner arrows are hidden in CSS, so there is
+  // no stepping affordance a grid would serve anyway.
+  //
+  // An empty / 0 field means "no bound on this side", so a user can
+  // set only a floor or only a ceiling. Both empty is a no-op even
+  // with the toggle on — same "toggled on but nothing entered yet"
+  // grace the keyword and genre filters give.
+  //
+  // The unknown-length switch maps to the server's
+  // allowUnknownDuration. Default off = tracks the scanner never read
+  // a length from are excluded, which is the strict reading of the
+  // window; on = they ride along. Worth surfacing because a partially
+  // scanned library can otherwise lose far more of the pool than the
+  // user expects.
+  //
+  // It reuses the panel-wide `.toggle-sw` switch (text left, control
+  // right) rather than a native checkbox: every other on/off control
+  // in this panel is that switch, and .toggle-sw already carries the
+  // Materialize suppression a bare checkbox would need to re-solve.
+  // Like the other .toggle-sw rows the caption is a sibling div, not
+  // a wrapping <label>, so the input gets aria-labelledby.
+  const _secToMin = (s) => {
+    const n = Number(s);
+    if (!Number.isFinite(n) || n <= 0) { return ''; }
+    // Trim the float tail: 150s → 2.5, 120s → 2 (not 2.0).
+    return String(Math.round((n / 60) * 100) / 100);
+  };
+  const durationOn = AUTODJ.state.djDurationEnabled;
+  const durationFilterRow = `
+    <div class="autodj-opt-row autodj-opt-col">
+      <div class="dj-filter-head">
+        <div>
+          <div class="autodj-opt-label" id="dj-duration-label">${t('autoDJ.durationFilterLabel')}</div>
+          <div class="autodj-opt-hint">${t('autoDJ.durationFilterHint')}</div>
+        </div>
+        <label class="toggle-sw">
+          <input type="checkbox" id="dj-duration-on" aria-labelledby="dj-duration-label" ${durationOn ? 'checked' : ''}>
+          <span class="toggle-sw-track"><span class="toggle-sw-thumb"></span></span>
+        </label>
+      </div>
+      <div class="dj-duration-inputs">
+        <label class="dj-duration-field">
+          <span class="dj-duration-field-label">${t('autoDJ.durationMinLabel')}</span>
+          <input
+            type="number"
+            class="dj-filter-input dj-duration-num"
+            id="dj-duration-min"
+            min="0" max="1440" step="any"
+            placeholder="${escapeHtml(t('autoDJ.durationNoLimit'))}"
+            value="${escapeHtml(_secToMin(AUTODJ.state.djMinDuration))}"
+            ${durationOn ? '' : 'disabled'}
+            aria-label="${escapeHtml(t('autoDJ.durationMinInputLabel'))}">
+        </label>
+        <label class="dj-duration-field">
+          <span class="dj-duration-field-label">${t('autoDJ.durationMaxLabel')}</span>
+          <input
+            type="number"
+            class="dj-filter-input dj-duration-num"
+            id="dj-duration-max"
+            min="0" max="1440" step="any"
+            placeholder="${escapeHtml(t('autoDJ.durationNoLimit'))}"
+            value="${escapeHtml(_secToMin(AUTODJ.state.djMaxDuration))}"
+            ${durationOn ? '' : 'disabled'}
+            aria-label="${escapeHtml(t('autoDJ.durationMaxInputLabel'))}">
+        </label>
+      </div>
+      <div class="dj-duration-unknown">
+        <div>
+          <div class="dj-duration-unknown-label" id="dj-duration-unknown-label">${t('autoDJ.durationUnknownLabel')}</div>
+          <div class="autodj-opt-hint">${t('autoDJ.durationUnknownHint')}</div>
+        </div>
+        <label class="toggle-sw">
+          <input type="checkbox" id="dj-duration-unknown" aria-labelledby="dj-duration-unknown-label" ${AUTODJ.state.djAllowUnknownDuration ? 'checked' : ''} ${durationOn ? '' : 'disabled'}>
+          <span class="toggle-sw-track"><span class="toggle-sw-thumb"></span></span>
+        </label>
+      </div>
+    </div>`;
+
   // ── Sonic similarity (discovery embeddings) ─────────────────────
   //
   // Server capability comes from the ping response (same flag that
@@ -4342,6 +4521,17 @@ async function autoDjPanel() {
           <button type="button" class="dj-genre-mode-btn dj-sonic-anchor-btn" data-anchor="locked" aria-pressed="${anchorMode === 'locked'}">${t('autoDJ.sonicAnchorLocked')}</button>
         </div>
       </div>
+      ${MSTREAMAPI.currentServer.federationBrowse === true ? `
+      <div class="autodj-opt-row">
+        <div>
+          <div class="autodj-opt-label" id="dj-federated-label">${t('autoDJ.federatedLabel')}</div>
+          <div class="autodj-opt-hint">${t('autoDJ.federatedHint')}</div>
+        </div>
+        <label class="toggle-sw">
+          <input type="checkbox" id="dj-federated-on" aria-labelledby="dj-federated-label" ${AUTODJ.state.federatedEnabled ? 'checked' : ''}>
+          <span class="toggle-sw-track"><span class="toggle-sw-thumb"></span></span>
+        </label>
+      </div>` : ''}
       <div class="autodj-opt-row autodj-opt-col">
         <div>
           <div class="autodj-opt-label">${t('autoDJ.sonicSeedLabel')}</div>
@@ -4387,6 +4577,20 @@ async function autoDjPanel() {
           <select class="autodj-select browser-default" id="dj-min-rating">${ratingOptions}</select>
         </div>
 
+        <div class="autodj-opt-row">
+          <div>
+            <div class="autodj-opt-label" id="dj-limit-label">${t('autoDJ.limitLabel')}</div>
+            <div class="autodj-opt-hint">${t('autoDJ.limitHint', { max: AUTODJ.LIMIT_MAX })}</div>
+          </div>
+          <input
+            type="number"
+            class="autodj-select browser-default dj-limit-num"
+            id="dj-limit"
+            min="1" max="${AUTODJ.LIMIT_MAX}" step="1" inputmode="numeric"
+            value="${AUTODJ.state.djLimit}"
+            aria-labelledby="dj-limit-label">
+        </div>
+
         <h4 class="autodj-section-heading">${t('autoDJ.sectionContinuity')}</h4>
         ${similarRow}
         ${bpmContinuityRow}
@@ -4398,6 +4602,7 @@ async function autoDjPanel() {
         <h4 class="autodj-section-heading">${t('autoDJ.sectionFilters')}</h4>
         ${keywordFilterRow}
         ${genreFilterRow}
+        ${durationFilterRow}
       </div>
     </div>`;
 
@@ -4453,6 +4658,13 @@ async function autoDjPanel() {
     const val = Math.max(0, Math.min(10, parseInt(e.target.value, 10)));
     AUTODJ.setState({ djMinRating: val });
   };
+
+  // Songs per fetch. `change` (blur / Enter), not `input`, so "12" isn't
+  // clamped the moment the user types "1". AUTODJ owns the integer +
+  // range rule and hands back what it stored, which is written into the
+  // field so it always shows what the next request will send.
+  const limitEl = document.getElementById('dj-limit');
+  limitEl.onchange = () => { limitEl.value = AUTODJ.setLimit(limitEl.value); };
 
   // Similar-artists toggle (no-op while disabled, but the event still
   // fires on label-click in some browsers).
@@ -4536,6 +4748,15 @@ async function autoDjPanel() {
         t(mode === 'locked' ? 'autoDJ.sonicAnchorLockedHint' : 'autoDJ.sonicAnchorRollingHint');
     };
   });
+
+  // Federated session toggle — present only when the server advertises
+  // federationBrowse (rendered inside the sonic block, so it is already
+  // gated on sonic being on). A pure preference: the player decides per
+  // pick whether a cross-server pick can actually run.
+  const fedOnEl = document.getElementById('dj-federated-on');
+  if (fedOnEl) {
+    fedOnEl.onchange = (e) => { AUTODJ.setState({ federatedEnabled: !!e.target.checked }); };
+  }
 
   // Seed picker — title search against /api/v1/db/search (titles
   // only), debounced; picking a result stores the seed and, if
@@ -4821,6 +5042,62 @@ async function autoDjPanel() {
     _renderGenreTags();
   }, { signal: _autoDjPanelSignal });
 
+  // ── Track-length window ────────────────────────────────────────
+  //
+  // Four controls. The inputs are MINUTES and AUTODJ stores SECONDS,
+  // so this layer converts and AUTODJ.setDurationBounds does the
+  // clamping + backwards-window repair (it owns those rules so they
+  // hold for any caller, not just this panel).
+  const durOnEl      = document.getElementById('dj-duration-on');
+  const durMinEl     = document.getElementById('dj-duration-min');
+  const durMaxEl     = document.getElementById('dj-duration-max');
+  const durUnknownEl = document.getElementById('dj-duration-unknown');
+
+  // Minutes (as typed) → seconds. A blank field gives Number('') === 0,
+  // which is exactly the "no bound on this side" sentinel; the guard
+  // makes that intentional rather than incidental and also absorbs a
+  // typed '-' or 'e'.
+  function _minutesToSeconds(raw) {
+    const mins = Number(raw);
+    if (!Number.isFinite(mins) || mins <= 0) { return 0; }
+    return Math.round(mins * 60);
+  }
+
+  // `edited` names the side the user just changed — setDurationBounds
+  // keeps that one and pushes the other, so the repair never fights
+  // the field being typed in. Persisted values are written back so the
+  // inputs always show what the next request will actually send.
+  function _commitDuration(edited) {
+    const { min, max } = AUTODJ.setDurationBounds(
+      _minutesToSeconds(durMinEl.value),
+      _minutesToSeconds(durMaxEl.value),
+      edited === 'max' ? 'max' : 'min',
+    );
+    durMinEl.value = _secToMin(min);
+    durMaxEl.value = _secToMin(max);
+  }
+
+  // Toggle gates the three inputs. The bounds survive toggling so the
+  // user can flip the feature off and back on without re-entering
+  // them — same contract the keyword and genre filters give.
+  durOnEl.onchange = (e) => {
+    const on = !!e.target.checked;
+    AUTODJ.setState({ djDurationEnabled: on });
+    durMinEl.disabled = !on;
+    durMaxEl.disabled = !on;
+    durUnknownEl.disabled = !on;
+  };
+
+  // `change` (not `input`) so the commit fires on blur / Enter rather
+  // than mid-typing — otherwise "12" would clamp-and-rewrite the
+  // moment the user typed "1".
+  durMinEl.onchange = () => { _commitDuration('min'); };
+  durMaxEl.onchange = () => { _commitDuration('max'); };
+
+  durUnknownEl.onchange = (e) => {
+    AUTODJ.setState({ djAllowUnknownDuration: !!e.target.checked });
+  };
+
   // Initial sync — the `ignoreVPaths` legacy global IS still read by
   // every browse/search panel in m.js, so we keep it in lockstep with
   // AUTODJ.state.djVpaths. (The minRating legacy global is dead — see
@@ -4904,18 +5181,22 @@ function runLocalSearch(el) {
         filelist += renderPlaylist(x.name);
       } else if (x.type === 'album') {
         const albumString = x.name  ? x.name  : 'SINGLES';
-        filelist += renderAlbum(x.name, x.name === null ? x.artist : null, albumString, x.album_art_file);
+        filelist += renderAlbum(x.name, x.name === null ? x.artist : null, albumString, x.album_art_file, x.year);
       } else if (x.type === 'artist') {
         filelist += renderArtist(x.name);
+      } else if (x.type === 'genre') {
+        filelist += renderGenre(x.name, x.track_count);
       } else {
         if (programState[programState.length - 1].state === 'playlist') {
           filelist += renderFileWithMetadataHtml(x.filepath, x.lokiId, x.metadata);
         } else if (x.type == "m3u") {
           filelist += createFileplaylistHtml(x.name);
         } else {
-          const fileLocation = x.path || getFileExplorerPath() + x.name;
-          const title = x.artist != null || x.title != null ? x.artist + ' - ' + x.title : x.name;
-          filelist += createMusicFileHtml(fileLocation, title);
+          // Replay the args the panel itself passed to createMusicFileHtml.
+          // Deriving the path here (getFileExplorerPath() + x.name) only ever
+          // held for the file explorer, and silently rewrote every DB-panel
+          // row's data-file_location to a path that does not exist.
+          filelist += createMusicFileHtml(x.path, x.title, x.aa, x.rating, x.subtitle);
         }
       }
     }
@@ -4928,7 +5209,7 @@ function runLocalSearch(el) {
 
 //////////////////////// Search
 const searchToggles = (() => {
-  const defaults = { albums: true, artists: true, files: false, titles: true, lyrics: true };
+  const defaults = { albums: true, artists: true, files: false, titles: true, lyrics: true, federated: false };
   try {
     const saved = JSON.parse(localStorage.getItem('mstream-search-toggles'));
     // Merge OVER defaults so a toggle added in a later release (e.g. `lyrics`)
@@ -5014,6 +5295,12 @@ function setupSearchPanel(searchTerm) {
         <span>Lyrics</span>
       </label>
     </div>
+    ${federatedSearchOffered() ? `<div class="flex">
+      <label class="grow" for="search-federated">
+        <input ${(searchToggles.federated === true ? 'checked' : '')} id="search-federated" class="filled-in" type="checkbox">
+        <span>${escapeHtml(t('search.federated'))}</span>
+      </label>
+    </div>` : ''}
     <div id="search-results"></div>`;
 
   document.getElementById('search_folders').value = '';
@@ -5024,15 +5311,27 @@ function setupSearchPanel(searchTerm) {
   }
 }
 
+// The multi-server search is offered only while pointed at THIS server:
+// asking a peer to search its peers is not something federation does (and
+// the proxy is deliberately not chainable), so from a federated server the
+// search box searches that server alone.
+function federatedSearchOffered() {
+  return MSTREAMAPI.currentServer.federationBrowse === true && !peerContext;
+}
+
 async function submitSearchForm() {
   try {
+    // A new search supersedes any in-flight fan-out (and an out-of-order local
+    // render) from a previous submit — see searchGeneration.
+    const searchGen = ++searchGeneration;
     document.getElementById('search-results').innerHTML += '<div class="loading-screen"><svg class="spinner" width="65px" height="65px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg></div>'
 
     const postObject = {
       search: document.getElementById('search-term').value,
-      ignoreVPaths: Object.keys(MSTREAMPLAYER.ignoreVPaths).filter((vpath) => {
-        return MSTREAMPLAYER.ignoreVPaths[vpath] === true;
-      })
+      // Auto-DJ folder filter. localIgnoreVPaths() returns undefined on a peer
+      // (those vpaths name OUR libraries, so a name collision would silently
+      // empty the peer's results and leak our library names), so it's dropped.
+      ignoreVPaths: localIgnoreVPaths()
     };
     
     if (document.getElementById("search-in-artists") && document.getElementById("search-in-artists").checked === false) { postObject.noArtists = true; }
@@ -5045,63 +5344,315 @@ async function submitSearchForm() {
     searchToggles.titles = document.getElementById("search-in-titles").checked;
     if (document.getElementById("search-in-lyrics") && document.getElementById("search-in-lyrics").checked === false) { postObject.noLyrics = true; }
     searchToggles.lyrics = document.getElementById("search-in-lyrics").checked;
+    const fedBox = document.getElementById("search-federated");
+    if (fedBox) { searchToggles.federated = fedBox.checked; }
 
     try { localStorage.setItem('mstream-search-toggles', JSON.stringify(searchToggles)); } catch (_e) {}
 
-    const res = await MSTREAMAPI.search(postObject);
+    // Searching a federated server searches THAT server (localIgnoreVPaths()
+    // above already dropped the local folder filter for the peer case).
+    const res = await browseApi('search', postObject);
+    if (searchGen !== searchGeneration) { return; }
 
     if (programState[0].state === 'searchPanel') {
       programState[0].searchTerm = postObject.search;
     }
 
-    let noResultsFlag = true;
-
     // Reset the per-search metadata lookup the search-result handlers read.
     searchResultMetadata = {};
 
-    // Populate list
-    let searchList = '<ul class="collection">';
-    Object.keys(res).forEach((key) => {
-      res[key].forEach((value, i) => {
-        noResultsFlag = false;
+    // Only label the local block when there is something to tell it apart
+    // FROM — a plain single-server search should not grow a header.
+    const fanOut = federatedSearchOffered() && searchToggles.federated === true;
+    // browseApi('search') fetched from peerContext (null = this server), so the
+    // rows must carry that same peer or clicks queue peer paths as local.
+    const localHtml = renderSearchResults(res, peerContext);
+    const localHeader = (fanOut && localHtml) ? serverResultHeader(t('search.onThisServer')) : '';
 
-        // Track-level hits (title/files/lyrics) now carry the full metadata
-        // object inline — stash it so searchFileClick/searchPlayNow can
-        // enqueue without a second /api/v1/db/metadata round-trip.
-        if (value.filepath && value.metadata) {
-          searchResultMetadata[value.filepath] = value.metadata;
-        }
+    // Three slots: this server's results, a block per peer as each answers,
+    // and an empty-state that any result — local or remote — hides.
+    document.getElementById('search-results').innerHTML =
+      `<div id="search-results-local">${localHeader}${localHtml}</div>` +
+      '<div id="search-results-peers"></div>' +
+      `<div id="search-results-empty" class="${localHtml ? 'super-hide' : ''}"><h5>${t('search.noResults')}</h5></div>`;
 
-        // perform some operation on a value;
-        searchList += `<li class="collection-item">
-          <div onclick="${searchMap[key].func}(this);" data-${searchMap[key].data}="${escapeHtml(value.filepath ? value.filepath : value.name)}" class="${searchMap[key].class}">
-            <b>${searchMap[key].name}:</b> ${escapeHtml(value.name)}${key === 'lyrics' && value.snippet ? `<br><small class="grey-text">${escapeHtml(value.snippet)}</small>` : ''}
-          </div>
-          ${
-            key === 'files' || key === 'title' || key === 'lyrics' ? `<div class="song-button-box">
-            <span title="Play Now" onclick="searchPlayNow(this);" data-file_location="${escapeHtml(value.filepath)}" class="songDropdown">
-              <svg xmlns="http://www.w3.org/2000/svg" height="12" width="12" viewBox="0 0 24 24"><path fill="none" d="M0 0h24v24H0z"/><path d="M15.5 5H11l5 7-5 7h4.5l5-7z"/><path d="M8.5 5H4l5 7-5 7h4.5l5-7z"/></svg>
-            </span>
-            <span title="Add To Playlist" onclick="createPopper3(this);" data-file_location="${escapeHtml(value.filepath)}" class="fileAddToPlaylist">
-              <svg class="pop-f" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 292.362 292.362"><path class="pop-f" d="M286.935 69.377c-3.614-3.617-7.898-5.424-12.848-5.424H18.274c-4.952 0-9.233 1.807-12.85 5.424C1.807 72.998 0 77.279 0 82.228c0 4.948 1.807 9.229 5.424 12.847l127.907 127.907c3.621 3.617 7.902 5.428 12.85 5.428s9.233-1.811 12.847-5.428L286.935 95.074c3.613-3.617 5.427-7.898 5.427-12.847 0-4.948-1.814-9.229-5.427-12.85z"/></svg>
-            </span>
-          </div>` : ''
-          }
-        </li>`;
-      });
-    });
-
-    searchList += '</ul>'
-    
-    if (noResultsFlag === true) {
-      searchList = '<h5>No Results Found</h5>';
-    }
-
-    document.getElementById('search-results').innerHTML = searchList;
-
-    App.setFocusableElements();
+    // The same query, asked of every paired server. Fire-and-forget: this
+    // server's results are already on screen, so a slow or dead peer costs
+    // nothing but its own block.
+    if (fanOut) { searchPeers(postObject, searchGen); }
   }catch(err) {
     boilerplateFailure(err);
+  }
+}
+
+// Render one search response as a collection. `peer` null = this server;
+// otherwise every row carries the peer, so the queue handlers stream it
+// over the federation bridge instead of resolving the path locally.
+function renderSearchResults(res, peer) {
+  let rows = '';
+  Object.keys(res || {}).forEach((key) => {
+    // A peer may run a different version and answer with a category this
+    // build has no renderer for. Skip it rather than throw away the rest.
+    if (!searchMap[key]) { return; }
+    (res[key] || []).forEach((value) => {
+      // Track-level hits (title/files/lyrics) carry the full metadata object
+      // inline — stash it so searchFileClick/searchPlayNow can enqueue
+      // without a second metadata round-trip.
+      if (value.filepath && value.metadata) {
+        searchResultMetadata[searchKey(peer && peer.id, value.filepath)] = value.metadata;
+      }
+      rows += renderSearchRow(key, value, peer);
+    });
+  });
+  return rows ? `<ul class="collection">${rows}</ul>` : '';
+}
+
+function renderSearchRow(key, value, peer) {
+  const attr = peerAttr(peer || null);
+  const isTrack = key === 'files' || key === 'title' || key === 'lyrics';
+  return `<li class="collection-item">
+    <div onclick="${searchMap[key].func}(this);" data-${searchMap[key].data}="${escapeHtml(value.filepath ? value.filepath : value.name)}"${attr} class="${searchMap[key].class} left">
+      <b>${searchMap[key].name}:</b> ${escapeHtml(value.name)}${key === 'lyrics' && value.snippet ? `<br><small class="grey-text">${escapeHtml(value.snippet)}</small>` : ''}
+    </div>
+    ${isTrack ? `<div class="song-button-box">
+      <span title="Play Now" onclick="searchPlayNow(this);" data-file_location="${escapeHtml(value.filepath)}"${attr} class="songDropdown">
+        <svg xmlns="http://www.w3.org/2000/svg" height="12" width="12" viewBox="0 0 24 24"><path fill="none" d="M0 0h24v24H0z"/><path d="M15.5 5H11l5 7-5 7h4.5l5-7z"/><path d="M8.5 5H4l5 7-5 7h4.5l5-7z"/></svg>
+      </span>
+      <span title="Add To Playlist" onclick="createPopper3(this);" data-file_location="${escapeHtml(value.filepath)}"${attr} class="fileAddToPlaylist">
+        <svg class="pop-f" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 292.362 292.362"><path class="pop-f" d="M286.935 69.377c-3.614-3.617-7.898-5.424-12.848-5.424H18.274c-4.952 0-9.233 1.807-12.85 5.424C1.807 72.998 0 77.279 0 82.228c0 4.948 1.807 9.229 5.424 12.847l127.907 127.907c3.621 3.617 7.902 5.428 12.85 5.428s9.233-1.811 12.847-5.428L286.935 95.074c3.613-3.617 5.427-7.898 5.427-12.847 0-4.948-1.814-9.229-5.427-12.85z"/></svg>
+      </span>
+    </div>` : ''}
+  </li>`;
+}
+
+// Which server a result block came from. Every block gets one whenever the
+// search spans more than one server, this one included — an unlabelled block
+// next to labelled ones would be the ambiguous case.
+function serverResultHeader(title, note) {
+  return `<div class="search-server-header">
+    ${escapeHtml(title)}${note ? ` <span class="search-server-note">&mdash; ${escapeHtml(note)}</span>` : ''}
+  </div>`;
+}
+
+function peerSearchHeader(peer, note) {
+  return serverResultHeader(t('peers.searchHeader', { name: peer.name }), note);
+}
+
+// Ask every paired server the query the user just ran, and append each
+// answer under its own header. Never merged into one list: where a result
+// lives decides whether it can be queued as a local file, added to a
+// playlist, rated, or used as a Sonic Path seed — so the answer is always
+// on screen next to the result.
+async function searchPeers(postObject, searchGen) {
+  // Fast bail before the peer lookup: the search panel is not on screen.
+  if (!document.getElementById('search-results-peers')) { return; }
+
+  let peers = [];
+  try {
+    peers = (await MSTREAMAPI.federationPeers()).peers || [];
+    peers.forEach(rememberPeer);
+  } catch (err) {
+    console.warn('federation peers unavailable for search', err);
+    return;
+  }
+  if (peers.length === 0) { return; }
+
+  // ignoreVPaths names libraries in OUR config; a peer's namespace is its
+  // own, and it already scopes every answer to what our key was granted.
+  const body = { ...postObject };
+  delete body.ignoreVPaths;
+  const term = postObject.search;
+
+  await Promise.all(peers.map(async (peer) => {
+    let res;
+    try {
+      res = await MSTREAMAPI.peer.search(peer.id, body);
+    } catch (err) {
+      console.warn(`federation search failed on peer ${peer.id}`, err);
+      if (searchGen !== searchGeneration) { return; }
+      const failSlot = peerResultSlot(term);
+      if (!failSlot) { return; }
+      // An unreachable peer is a footnote on the results, not "no results" —
+      // name the missing peer AND hide the empty-state, so "No Results Found"
+      // never sits next to an "unreachable" note.
+      const failEmpty = document.getElementById('search-results-empty');
+      if (failEmpty) { failEmpty.classList.add('super-hide'); }
+      failSlot.insertAdjacentHTML('beforeend', peerSearchHeader(peer, t('peers.unreachable')));
+      return;
+    }
+
+    // The user may have moved on — a new query (searchGen), the same query
+    // re-run, or a different panel.
+    if (searchGen !== searchGeneration) { return; }
+    const slot = peerResultSlot(term);
+    if (!slot) { return; }
+    const html = renderSearchResults(res, peer);
+    if (!html) { return; }
+
+    const empty = document.getElementById('search-results-empty');
+    if (empty) { empty.classList.add('super-hide'); }
+    slot.insertAdjacentHTML('beforeend', peerSearchHeader(peer) + html);
+  }));
+}
+
+// Where a late-arriving peer answer should land, or null if it should be
+// dropped. Looked up FRESH each time: submitSearchForm rebuilds the results
+// DOM on every run, so a node captured before the fetch may already be
+// detached — and re-running the same term would otherwise pass a
+// value-only guard and append into nothing.
+function peerResultSlot(term) {
+  const input = document.getElementById('search-term');
+  if (!input || input.value !== term) { return null; }
+  return document.getElementById('search-results-peers');
+}
+
+///////////////////// Federation: the server switcher
+//
+// The app points at ONE server at a time. The top-bar dropdown chooses it;
+// everything else — the nav, the panels, the queue handlers — follows from
+// `peerContext`. There is no "peers" destination to visit: browsing a
+// federated server IS the normal app, pointed somewhere else.
+//
+// A federated server is READ-ONLY (a federation key carries no write
+// permission, and the peer's allowlist stops at reads) and answers only for
+// its own library — none of our playlists, none of our per-user stats. Nav
+// entries that depend on either are marked `.local-only` in index.html and
+// hidden while a peer is selected, so the UI never offers something that
+// cannot work. The left-nav note says why.
+//
+// The dropdown appears only when the ping's federationBrowse flag says
+// there is somewhere else to go (federation on, at least one peer).
+
+// Every top-level panel, keyed by the programState name it sets.
+const PANELS_BY_STATE = {
+  fileExplorer: () => loadFileExplorer(),
+  allPlaylists: () => getAllPlaylists(),
+  allAlbums: () => getAllAlbums(),
+  allArtists: () => getAllArtists(),
+  allGenres: () => getAllGenres(),
+  recentlyAdded: () => getRecentlyAdded(),
+  recentlyPlayed: () => getRecentlyPlayed(),
+  mostPlayed: () => getMostPlayed(),
+  allRated: () => getRatedSongs(),
+  searchPanel: () => setupSearchPanel(),
+};
+
+// Which of those a federated server can actually answer: its library, and
+// nothing that lives in our own user rows. Playlists and the three stats
+// panels are ours alone; the rest map onto routes on the peer's allowlist.
+const PEER_CAPABLE_STATES = new Set([
+  'fileExplorer', 'allAlbums', 'allArtists', 'allGenres', 'recentlyAdded', 'searchPanel',
+]);
+
+// Fill the top-bar dropdown. Called once from init(), only when the ping
+// advertised federationBrowse.
+async function loadServerSwitcher() {
+  const wrap = document.getElementById('server-select-wrap');
+  const select = document.getElementById('server-select');
+  if (!wrap || !select) { return; }
+
+  let peers = [];
+  try {
+    peers = (await MSTREAMAPI.federationPeers()).peers || [];
+  } catch (err) {
+    // Federation off or the route unreachable: leave the dropdown hidden
+    // and the app exactly as it was.
+    console.warn('federation peers unavailable for the server switcher', err);
+    return;
+  }
+  if (peers.length === 0) { return; }
+
+  peers.forEach(rememberPeer);
+  let html = `<option value="">${escapeHtml(t('server.thisServer'))}</option>`;
+  peers.forEach(p => {
+    html += `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`;
+  });
+  select.innerHTML = html;
+  wrap.classList.remove('super-hide');
+}
+
+function onServerChange(el) {
+  switchServer(el.value === '' ? null : Number(el.value));
+}
+
+// Point the app at a server. `peerId` null = this one.
+function switchServer(peerId) {
+  const next = peerId === null
+    ? null
+    : (knownPeers.get(Number(peerId)) || { id: Number(peerId), name: 'peer' });
+  if ((next ? next.id : null) === (peerContext ? peerContext.id : null)) { return; }
+
+  peerContext = next;
+  // Any browse load still in flight belongs to the old server; supersede it.
+  browseGeneration++;
+  applyServerContext();
+
+  // Stay on the same panel when the new server can answer it; otherwise
+  // fall back to the file explorer, which every server has.
+  const previous = programState[0];
+  const current = previous ? previous.state : 'fileExplorer';
+  const keep = PANELS_BY_STATE[current] && (!peerContext || PEER_CAPABLE_STATES.has(current));
+  const landing = keep ? current : 'fileExplorer';
+
+  // The explorer's breadcrumb is a path in the OLD server's namespace.
+  fileExplorerArray = [];
+  highlightNavPanel(landing);
+
+  // Carry a query across: switching servers with a search on screen means
+  // "run that again over there", not "start over with an empty box".
+  if (landing === 'searchPanel' && previous && previous.searchTerm) {
+    setupSearchPanel(previous.searchTerm);
+    return;
+  }
+  PANELS_BY_STATE[landing]();
+}
+
+// Move the sidebar's selected marker onto the entry that owns a panel, so a
+// server switch that had to change panels doesn't leave the old one lit.
+function highlightNavPanel(state) {
+  const target = document.querySelector(`.side-nav-item[data-panel="${state}"]`);
+  if (!target) { return; }
+  document.querySelectorAll('.side-nav-item').forEach(el => el.classList.remove('select'));
+  target.classList.add('select');
+}
+
+// Sync the chrome to `peerContext`: the dropdown's selection, the nav
+// entries a federated server cannot serve, and the read-only note. Derives
+// everything from the current context, so it is safe to call at any time.
+function applyServerContext() {
+  const select = document.getElementById('server-select');
+  const want = peerContext ? String(peerContext.id) : '';
+  if (select) {
+    // loadServerSwitcher() builds the <option>s once at init, so a peer paired
+    // later (adopted via a federated search hit) has none — then select.value =
+    // id leaves selectedIndex -1 and the dropdown blank. Add the option first.
+    if (peerContext && !Array.from(select.options).some(o => o.value === want)) {
+      const opt = document.createElement('option');
+      opt.value = want;
+      opt.textContent = peerContext.name;
+      select.appendChild(opt);
+    }
+    if (select.value !== want) { select.value = want; }
+  }
+
+  // One class does the whole job (see spa.css): it hides every .local-only
+  // nav entry and reveals the read-only note. A body class rather than a
+  // per-item toggle, so it composes with the flag gates that already hide
+  // some entries (Sonic Path) instead of un-hiding them on the way back.
+  document.body.classList.toggle('on-federated-server', !!peerContext);
+
+  const note = document.getElementById('nav-readonly-note');
+  if (note && peerContext) {
+    // Built as DOM nodes, never innerHTML — peerContext.name is peer-controlled.
+    // The "back" link is the only way home when the top bar (and its switcher)
+    // is hidden, since this note stays visible in the always-shown side-nav.
+    note.textContent = t('server.readOnlyNote', { name: peerContext.name });
+    const back = document.createElement('a');
+    back.className = 'nav-note-back';
+    back.textContent = t('server.backToThisServer');
+    back.onclick = () => switchServer(null);
+    note.appendChild(document.createElement('br'));
+    note.appendChild(back);
   }
 }
 
