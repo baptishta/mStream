@@ -7,7 +7,7 @@ import * as config from '../state/config.js';
 import * as db from './manager.js';
 import { addToKillQueue, removeFromKillQueue } from '../state/kill-list.js';
 import { writeScannerPidfile, clearScannerPidfile } from './scan-pidfile.js';
-import { SCHEMA_VERSION } from './schema.js';
+import { SCHEMA_VERSION, SCANNER_SCHEMA_CONTRACT } from './schema.js';
 import { HASH_GENERATION } from './audio-hash.js';
 import { getDirname, appRoot } from '../util/esm-helpers.js';
 import { launchWorker, workerReaperMarker } from '../util/worker-process.js';
@@ -140,12 +140,23 @@ let rustParserDisabled = false;
 // anything older falls into the main JSON-input path and exits non-zero
 // (→ null). Exported for the unit test in test/task-queue.test.mjs.
 export function probeHashGeneration(binPath) {
+  return probeIntFlag(binPath, '--hash-generation');
+}
+
+// V71: the schema version whose scanner WRITE CONTRACT the binary was built
+// for (album_key + the tags.tag_* consensus columns). Binaries answer via
+// `--schema-contract`; pre-probe builds exit non-zero → null → "too old".
+export function probeSchemaContract(binPath) {
+  return probeIntFlag(binPath, '--schema-contract');
+}
+
+function probeIntFlag(binPath, flag) {
   try {
-    const probe = child.spawnSync(binPath, ['--hash-generation'],
+    const probe = child.spawnSync(binPath, [flag],
       { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000 });
     if (probe.status !== 0) { return null; }
-    const gen = parseInt((probe.stdout || '').toString().trim(), 10);
-    return Number.isInteger(gen) ? gen : null;
+    const n = parseInt((probe.stdout || '').toString().trim(), 10);
+    return Number.isInteger(n) ? n : null;
   } catch (_) {
     return null;
   }
@@ -184,11 +195,27 @@ function findRustParser() {
   // catches up (CI rebuilds bin/ on merge; `npm run build-rust` locally).
   const generationCurrent = (binPath, label) => {
     const gen = probeHashGeneration(binPath);
-    if (gen === HASH_GENERATION) { return true; }
-    winston.warn(`${label} rust-parser at ${binPath} stamps hash generation `
-      + `${gen ?? 'unknown (pre-probe build)'} but this server is on generation ${HASH_GENERATION} — `
-      + `refusing it to protect track identities; scans use the JS scanner until the binary updates.`);
-    return false;
+    if (gen !== HASH_GENERATION) {
+      winston.warn(`${label} rust-parser at ${binPath} stamps hash generation `
+        + `${gen ?? 'unknown (pre-probe build)'} but this server is on generation ${HASH_GENERATION} — `
+        + `refusing it to protect track identities; scans use the JS scanner until the binary updates.`);
+      return false;
+    }
+    // V71 schema-contract gate, same shape: a binary built before the
+    // albums re-key would run happily against a V71 DB (its at-open guard
+    // only compares user_version to what the SERVER passes) and write
+    // key-less album rows through the forced migration rescan — every album
+    // re-fragmenting into rows no later scanner can match. Older contract →
+    // JS scanner until the binary catches up (CI rebuilds bin/ on merge;
+    // `cargo build --release` locally).
+    const contract = probeSchemaContract(binPath);
+    if (contract === null || contract < SCANNER_SCHEMA_CONTRACT) {
+      winston.warn(`${label} rust-parser at ${binPath} was built for scanner schema contract `
+        + `${contract ?? 'unknown (pre-probe build)'} but this server needs ${SCANNER_SCHEMA_CONTRACT} — `
+        + `refusing it to protect album identities; scans use the JS scanner until the binary updates.`);
+      return false;
+    }
+    return true;
   };
 
   // Check local build first (may be newer than prebuilt during
@@ -840,6 +867,13 @@ function handleScannerLine(scanObj, line) {
         if (evt.movedTracksRehomed > 0) {
           parts.push(`${evt.movedTracksRehomed} moved track(s) re-homed ` +
             `(${evt.movedRefsRehomed} reference(s) rewritten)`);
+        }
+        // V71 album aggregate refresh — same undefined-tolerance as above.
+        if (evt.albumsAggregated > 0) {
+          parts.push(`${evt.albumsAggregated} album(s) refreshed`);
+        }
+        if (evt.artistsAggregated > 0) {
+          parts.push(`${evt.artistsAggregated} artist(s) refreshed`);
         }
         const tail = evt.filesScanned != null ? ` (${evt.filesScanned} scanned)` : '';
         winston.info(`Scan complete: ${parts.join(', ')}${tail}`);
@@ -1903,6 +1937,12 @@ export function maybeEnqueueDiscovery() {
          LIMIT 1
       `).get(DISCOVERY_MIN_DURATION_SEC, DISCOVERY_MAX_DURATION_SEC,
         config.program.scanOptions.discoveryModel);
+      // Second kind of work (discovery.db v3): rows embedded before the
+      // catalogue columns existed whose library track HAS an album. Rows
+      // whose file simply carries no album tag are not counted — they can
+      // never be filled, and counting them would fork the worker on every
+      // drain forever. Index-only through idx_discovery_tracks_album_null.
+      if (!row && discoveryDb.hasFillableCatalogueRows('precheck_lib')) { row = { fill: 1 }; }
     } finally {
       ddb.exec('DETACH DATABASE precheck_lib');
     }
@@ -1976,6 +2016,9 @@ function runDiscoveryTask(taskObj) {
           if (evt.attempted > 0) {
             winston.info(`Discovery-embedding pass complete: ${evt.embedded} embedded, `
               + `${evt.errors} error(s) (${evt.attempted} attempted)`);
+          }
+          if (evt.filled > 0) {
+            winston.info(`Discovery catalogue fill: ${evt.filled} row(s) gained album/year/isrc/release-group`);
           }
           return;
         }
@@ -2311,6 +2354,9 @@ function runScan(scanObj) {
     // both fields.
     ignoreDotFiles: config.program.scanOptions.ignoreDotFiles === true,
     ignoreDotFolders: config.program.scanOptions.ignoreDotFolders === true,
+    // V73: artist names the scanners never delimiter-split (exact spelling,
+    // list order). Both scanners read it; old builds ignore the field.
+    artistSplitExceptions: config.program.scanOptions.artistSplitExceptions || [],
     // TRANSITION-ONLY fields: current scanners ignore both — waveform
     // generation moved to the post-scan waveform task (runWaveformTask)
     // and BPM analysis left the scanner entirely (it returns as the
