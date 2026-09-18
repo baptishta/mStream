@@ -25,24 +25,52 @@
 //
 // Modes (config: updates.mode, live-read so admin toggles need no reboot):
 //   notify - check only; every download/install is user-initiated
-//   stage  - (default) background-stage for managed installs and
-//            background-download the Windows installer; applying still takes
-//            a restart / a click
-//   auto   - additionally apply when idle: under the launcher, by flagging
-//            applyRequested in the status file (the launcher restarts into
-//            the staged version); headless, by exiting 0 — documented as
-//            "auto expects a process supervisor" (systemd/pm2 restart lands
-//            on the new version via the flipped `current` link)
+//   stage  - background-stage for managed installs and background-download
+//            the Windows installer; applying still takes a restart / a click
+//   auto   - (default) additionally apply when idle: under the launcher, by
+//            flagging applyRequested in the status file (the launcher
+//            restarts into the staged version); headless, by exiting 0 so
+//            the supervisor's restart lands on the new version via the
+//            flipped `current` link — but ONLY when a restart-on-clean-exit
+//            supervisor is actually detectable (detectSupervisor:
+//            MSTREAM_SUPERVISED, pm2, systemd with Restart=always/
+//            on-success). Unsupervised, auto degrades to stage-and-log:
+//            exiting would be an outage, not an apply. "Idle" means no
+//            in-flight responses, no scan, AND a quiet window since the
+//            last user request (IDLE_QUIET_MS) — auto became the default
+//            only once the full recovery ladder shipped (pre-flip
+//            --boot-probe refusal; the launcher and headless boot
+//            watchdogs' rollback-and-hold; supervision gating), so a bad
+//            release self-heals to the next good one at every stage.
+//
+// Boot-failure holds (update-hold.json, beside the status file): when an
+// applied update crashes before it ever serves, the launcher's boot
+// watchdog (rust-launcher/src/rollback.rs) re-points `current` at the
+// previous version and records the failed version here. This module's half
+// of that contract: never stage/apply a held version (or the next daily
+// check would re-flip onto the very release the watchdog backed out of),
+// keep `current` off held versions (enforceHold — the belt to the
+// launcher's suspenders), and drop entries once a version >= them boots:
+// the fixed release supersedes the hold, and a hand-re-applied version
+// that boots proves its hold stale. The admin settings expose clearHold as
+// the manual override.
 import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import winston from 'winston';
 import * as config from '../state/config.js';
 import { writeJsonAtomic } from './atomic-json.js';
 import { downloadToFile, computeFileChecksum } from './ffmpeg-bootstrap.js';
 import { appRoot, isBunStandalone, userDataHome, underSystemPrefix } from './esm-helpers.js';
+import { VERSION_RE, compareVersions, parseBundleName, HOLD_FILE, readHoldEntries } from './update-shared.js';
 import packageJson from '../../package.json' with { type: 'json' };
+
+// The pure halves live in update-shared.js so the pre-boot headless guard
+// (boot-watchdog.js) can speak the same contract without importing this
+// module's heavy dependencies; re-exported here so every existing consumer
+// (tests included) keeps its import path.
+export { compareVersions, parseBundleName } from './update-shared.js';
 
 const REPO = 'IrosTheBeggar/mStream';
 const LATEST_BASE = `https://github.com/${REPO}/releases/latest/download`;
@@ -56,25 +84,20 @@ const STAGE_TIMEOUT_MS = 30 * 60 * 1000; // a bundle download on a slow link
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // daily
 const BOOT_CHECK_DELAY_MS = 30 * 1000;
 const AUTO_APPLY_POLL_MS = 15 * 60 * 1000;
+// auto's idle gate demands QUIET, not merely "no bytes in flight": an
+// actively browsing user has no in-flight response at most instants, and a
+// restart under them is exactly the rudeness auto-by-default must not
+// have. The env override exists for the integration tests and for
+// operators who want snappier applies on a box nobody browses.
+const IDLE_QUIET_MS = 10 * 60 * 1000;
+function idleQuietMs() {
+  const v = Number(process.env.MSTREAM_UPDATE_IDLE_QUIET_MS);
+  return Number.isFinite(v) && v >= 0 ? v : IDLE_QUIET_MS;
+}
 
 // ── Pure helpers (unit-tested with injected fs) ─────────────────────────────
-
-const VERSION_RE = /^(\d+)\.(\d+)\.(\d+)$/;
-
-// Strict numeric-triple compare. Returns <0, 0, >0 — or null when either
-// side is not a plain X.Y.Z (prerelease-shaped strings are refused on
-// purpose: releases are always bare triples, so anything else in a manifest
-// is not a version to act on).
-export function compareVersions(a, b) {
-  const ma = VERSION_RE.exec(a);
-  const mb = VERSION_RE.exec(b);
-  if (!ma || !mb) { return null; }
-  for (let i = 1; i <= 3; i++) {
-    const d = Number(ma[i]) - Number(mb[i]);
-    if (d !== 0) { return d; }
-  }
-  return 0;
-}
+// compareVersions / parseBundleName / the hold-file readers live in
+// update-shared.js (see the import note above).
 
 // The release manifest contract (scripts/release-manifest.sh). `name` guards
 // against a non-mStream release capturing the GitHub "latest" pointer (the
@@ -92,12 +115,6 @@ export function validateManifest(m) {
     return { ok: false, reason: 'manifest assets are malformed' };
   }
   return { ok: true };
-}
-
-// mStream-<version>-<key>[.zip] -> { version, key }, or null.
-export function parseBundleName(name) {
-  const m = /^mStream-(\d+\.\d+\.\d+)-((?:darwin|linux|win)-[a-z0-9]+(?:-musl)?)(?:\.zip)?$/.exec(name);
-  return m ? { version: m[1], key: m[2] } : null;
 }
 
 // Where and how is this server installed? Decides what an update can DO:
@@ -183,7 +200,10 @@ export function detectInstallMethod({
 // ── Module state ────────────────────────────────────────────────────────────
 
 let _install = null;        // { method, root? } — detected once per process
-let _hooks = { hasBusySockets: () => false, isScanning: () => false };
+// msSinceActivity defaults to "forever quiet": a caller that wires no
+// activity clock (tests driving setup() directly) keeps pre-quiet-gate
+// behavior rather than never applying.
+let _hooks = { hasBusySockets: () => false, isScanning: () => false, msSinceActivity: () => Infinity };
 let _bootTimer = null;
 let _checkTimer = null;
 let _applyTimer = null;
@@ -213,10 +233,16 @@ const state = {
   error: null,
   notifyOnly: false,        // apiVersion from the future: check works, staging refused
   skipped: false,           // latest === updates.skipVersion: report, never act
+  held: false,              // latest failed to boot after a previous update: report, never act
+  heldVersions: [],         // every version the boot watchdog has held (update-hold.json)
+  // Headless managed installs in auto mode: how the exit-0 apply would be
+  // restarted ('env' | 'pm2' | 'systemd'), or 'none' — in which case auto
+  // stages but never self-exits. null until the question has come up.
+  headlessSupervisor: null,
 };
 
 function updatesConfig() {
-  return config.program?.updates || { check: true, mode: 'stage', skipVersion: '' };
+  return config.program?.updates || { check: true, mode: 'auto', skipVersion: '' };
 }
 
 // The operator held this version back (updates.skipVersion — the companion
@@ -231,8 +257,159 @@ function supervisedByLauncher() {
   return process.argv.includes('--supervised');
 }
 
+// ── Supervision detection (auto mode, headless) ─────────────────────────────
+// auto's headless apply is exit(0) + "the supervisor starts mStream again"
+// (scheduleHeadlessExit). With no supervisor that exit IS an outage — a
+// server someone runs in tmux would vanish mid-day, minutes after a release
+// ships. Detection is deliberately conservative: only signals that imply a
+// restart actually FOLLOWS a clean exit count.
+//
+//   MSTREAM_SUPERVISED  the operator's word (any value but '' / '0') — for
+//                       supervisors this list can't see (docker restart
+//                       policies, runit, a bespoke wrapper loop)
+//   pm2                 pm_id in the env; pm2 autorestarts by default
+//   systemd             INVOCATION_ID plus the unit's Restart= policy being
+//                       always/on-success (unit name read from
+//                       /proc/self/cgroup, policy from `systemctl show`).
+//                       A bare INVOCATION_ID is NOT enough: systemd's
+//                       default is Restart=no, where exit 0 leaves the unit
+//                       dead — the very outage this gate exists to prevent.
+//                       on-failure also doesn't count: exit 0 is a success.
+//
+// Injected for tests; production goes through supervisorInfo(), which
+// caches — none of these facts can change for the lifetime of our pid.
+export function detectSupervisor({
+  env = process.env,
+  platform = process.platform,
+  readCgroup = () => fs.readFileSync('/proc/self/cgroup', 'utf8'),
+  queryRestart = (unit, userScope) => {
+    const args = userScope
+      ? ['--user', 'show', '-p', 'Restart', '--value', unit]
+      : ['show', '-p', 'Restart', '--value', unit];
+    const r = spawnSync('systemctl', args, { timeout: 5000, encoding: 'utf8' });
+    return r.status === 0 ? String(r.stdout).trim() : null;
+  },
+} = {}) {
+  if (env.MSTREAM_SUPERVISED && env.MSTREAM_SUPERVISED !== '0') {
+    return { supervised: true, via: 'env' };
+  }
+  // pm2 numbers its processes from 0, so pm_id='0' counts; an exported-but-
+  // EMPTY variable reads as unset (the convention everywhere else here).
+  if (env.pm_id != null && env.pm_id !== '') {
+    return { supervised: true, via: 'pm2' };
+  }
+  if (platform === 'linux' && env.INVOCATION_ID) {
+    try {
+      // cgroup v2: "0::/system.slice/mstream.service" — the unit is the
+      // LAST .service segment (a Delegate= sub-cgroup can sit below it;
+      // .scope units have no restart policy and rightly never match).
+      const line = String(readCgroup()).split('\n').find((l) => l.includes('::')) || '';
+      const cgPath = line.slice(line.indexOf('::') + 2);
+      const segments = cgPath.split('/').filter(Boolean);
+      const unit = [...segments].reverse().find((s) => s.endsWith('.service') && !s.startsWith('user@'));
+      const userScope = segments.some((s) => s === 'user.slice' || s.startsWith('user@'));
+      const policy = unit ? queryRestart(unit, userScope) : null;
+      if (policy === 'always' || policy === 'on-success') {
+        return { supervised: true, via: 'systemd' };
+      }
+    } catch { /* no cgroup / no systemctl: fall through to undetected */ }
+  }
+  return { supervised: false, via: null };
+}
+
+let _supervisor = null;
+function supervisorInfo() {
+  if (!_supervisor) { _supervisor = detectSupervisor(); }
+  return _supervisor;
+}
+
 export function statusFilePath() {
   return path.join(userDataHome(), 'update-status.json');
+}
+
+export function holdFilePath() {
+  return path.join(userDataHome(), HOLD_FILE);
+}
+
+// A watchdog (the launcher's, or the headless boot guard's) wrote this
+// after rolling an update back. Tolerant parse lives in update-shared.js.
+function readHolds() {
+  return readHoldEntries(userDataHome());
+}
+
+// Cached in state.heldVersions (refreshHolds) so the status poll doesn't
+// hit the disk: the file only changes at rollback time (no server runs) or
+// through this module's own prune/clear, both of which refresh the cache.
+function isHeld(version) {
+  return !!version && state.heldVersions.includes(version);
+}
+
+function refreshHolds() {
+  state.heldVersions = readHolds().map((h) => h.version);
+  state.held = !!state.latest && state.available && state.heldVersions.includes(state.latest);
+}
+
+// Drop holds a healthy boot has disproven or superseded: we are RUNNING a
+// version >= the held one, so either the fixed release landed or the held
+// version was re-applied by hand and boots after all. Holds for versions
+// NEWER than the running one are the active ones and stay. Called from
+// doCheck — which fires no earlier than the post-listen boot check, so a
+// crash-during-boot can never clear the very hold that protects against it.
+async function pruneHolds() {
+  const holds = readHolds();
+  if (!holds.length) { return; }
+  const keep = holds.filter((h) => compareVersions(state.current, h.version) < 0);
+  if (keep.length === holds.length) { return; }
+  for (const h of holds) {
+    if (!keep.includes(h)) {
+      winston.info(`[update] Boot-failure hold on ${h.version} cleared (running ${state.current})`);
+    }
+  }
+  try {
+    if (!keep.length) { await fsp.unlink(holdFilePath()); }
+    else { await writeJsonAtomic(holdFilePath(), { schema: 1, held: keep }); }
+  } catch (err) {
+    winston.warn(`[update] Could not rewrite ${holdFilePath()}: ${err.message}`);
+  }
+}
+
+// Operator override (admin settings, clearHold: true): drop every hold and
+// let the next check treat the release feed at face value again.
+export async function clearHolds() {
+  await fsp.unlink(holdFilePath()).catch(() => { /* absent is cleared */ });
+  refreshHolds();
+  winston.info('[update] Boot-failure holds cleared by the operator');
+}
+
+// Belt to the launcher's suspenders: the watchdog re-points `current` when
+// it rolls back, but if that re-point failed (or a hold arrived without
+// one), `current` still aims at a version that cannot boot — and on the
+// layouts where the login item goes through `current`, so does the next
+// reboot. Same recovery as a skip: point `current` back at the running
+// version, restore the macOS ~/Applications copy, disarm anything staged.
+async function enforceHold() {
+  if (!state.heldVersions.length) { return; }
+  if (state.stagedVersion && state.heldVersions.includes(state.stagedVersion)) {
+    state.staged = false;
+    state.stagedVersion = null;
+    state.applyRequested = false;
+    state.applyRequestedAt = null;
+    state.installerPath = null;
+  }
+  const m = detectInstall();
+  if (m.method !== 'managed' || !m.root) { return; }
+  const linkVer = await stagedVersionFromRoot(m.root);
+  if (!linkVer || linkVer === state.current || !state.heldVersions.includes(linkVer)) { return; }
+  winston.warn(`[update] current points at held version ${linkVer} - re-pointing at the running version`);
+  let ok = await unstageCurrent(m.root, linkVer);
+  if (process.platform === 'darwin') {
+    ok = (await restoreAppsCopy()) && ok;
+  }
+  if (!ok) {
+    state.error = `Version ${linkVer} failed to start and is held back, but the previous version could not be fully restored - `
+      + `re-run the installer with MSTREAM_VERSION=v${state.current} to finish the rollback`;
+    winston.warn(`[update] ${state.error}`);
+  }
 }
 
 export function getStatus() {
@@ -329,6 +506,13 @@ async function doCheck(force) {
   const cfg = updatesConfig();
   if (!cfg.check && !force) { return getStatus(); }
   detectInstall();
+  // Boot-failure holds first, and independent of the feed being reachable:
+  // running this far past listen proves THIS version boots (prune), and a
+  // `current` still aiming at a held version must be re-pointed even when
+  // GitHub is down (enforce).
+  await pruneHolds();
+  refreshHolds();
+  await enforceHold();
   try {
     const manifest = await fetchManifest();
     const v = validateManifest(manifest);
@@ -355,14 +539,15 @@ async function doCheck(force) {
     state.latest = manifest.version;
     state.available = compareVersions(manifest.version, state.current) > 0;
     state.skipped = state.available && isSkipped(manifest.version);
+    state.held = state.available && isHeld(manifest.version);
     if (!state.available) {
       state.downloadUrl = null;
     } else {
       const m = detectInstall();
       state.downloadUrl = downloadUrlFor(m.method, manifest);
-      winston.info(`[update] mStream ${manifest.version} is available (running ${state.current}, install: ${m.method}${state.skipped ? ', SKIPPED by updates.skipVersion' : ''})`);
+      winston.info(`[update] mStream ${manifest.version} is available (running ${state.current}, install: ${m.method}${state.skipped ? ', SKIPPED by updates.skipVersion' : ''}${state.held ? ', HELD after a failed start' : ''})`);
       const mode = updatesConfig().mode;
-      if (mode !== 'notify' && !state.notifyOnly && !state.skipped
+      if (mode !== 'notify' && !state.notifyOnly && !state.skipped && !state.held
           && (m.method === 'managed' || m.method === 'inno')
           && (!state.staged || state.stagedVersion !== manifest.version)) {
         stageNow(manifest); // async, single-flight; errors land in state
@@ -398,6 +583,9 @@ export function stageNow(manifest = null) {
   if (state.notifyOnly) { return { error: 'update format changed - re-run the install command' }; }
   if (state.latest && isSkipped(state.latest)) {
     return { error: `version ${state.latest} is held back by updates.skipVersion` };
+  }
+  if (state.latest && isHeld(state.latest)) {
+    return { error: `version ${state.latest} failed to start after a previous update and is held back - it clears when a newer release ships, or clear the hold to retry` };
   }
   if (m.method === 'inno' || m.method === 'pkg') {
     if (!state.latest || !state.available) { return { error: 'no update available' }; }
@@ -637,8 +825,10 @@ async function pruneOldVersions(root) {
 // ── Applying ────────────────────────────────────────────────────────────────
 
 function idle() {
-  try { return !_hooks.hasBusySockets() && !_hooks.isScanning(); }
-  catch { return false; }
+  try {
+    return !_hooks.hasBusySockets() && !_hooks.isScanning()
+      && _hooks.msSinceActivity() >= idleQuietMs();
+  } catch { return false; }
 }
 
 // The human clicked "restart to update" in the webapp. Managed under the
@@ -653,6 +843,9 @@ export async function requestApply() {
   if (isSkipped(state.stagedVersion)) {
     return { error: `version ${state.stagedVersion} is held back by updates.skipVersion` };
   }
+  if (isHeld(state.stagedVersion)) {
+    return { error: `version ${state.stagedVersion} failed to start after a previous update and is held back` };
+  }
   if (m.method === 'pkg') {
     if (!state.installerPath || !fs.existsSync(state.installerPath)) { return { error: 'installer not downloaded yet' }; }
     spawn('open', [state.installerPath], { detached: true, stdio: 'ignore' }).unref();
@@ -662,6 +855,15 @@ export async function requestApply() {
   state.applyRequestedAt = new Date().toISOString();
   await writeStatus();
   if (m.method === 'managed' && !supervisedByLauncher()) {
+    // An explicit human click still exits — the admin asked for a restart
+    // and is watching — but with no supervisor detected the "restart" half
+    // is theirs to perform, so say it loudly first.
+    const sup = supervisorInfo();
+    state.headlessSupervisor = sup.supervised ? sup.via : 'none';
+    if (!sup.supervised) {
+      winston.warn('[update] Applying on an explicit admin request with NO supervisor detected - '
+        + 'mStream stays stopped until it is started again');
+    }
     scheduleHeadlessExit('an admin requested the update');
     return { exiting: true };
   }
@@ -679,14 +881,31 @@ function scheduleHeadlessExit(why) {
 }
 
 // auto mode: apply on our own once nothing is streaming and no scan runs.
+let _noSupervisorLoggedFor = null;
 function maybeAutoApply() {
   if (updatesConfig().mode !== 'auto' || !state.staged || state.applyRequested) { return; }
-  if (isSkipped(state.stagedVersion)) { return; }
+  if (isSkipped(state.stagedVersion) || isHeld(state.stagedVersion)) { return; }
   const m = detectInstall();
   if (m.method !== 'managed' && m.method !== 'inno') { return; }
   if (!idle()) { return; }
   if (m.method === 'managed' && !supervisedByLauncher()) {
-    scheduleHeadlessExit('auto mode, server idle');
+    // Headless apply = exit(0), which is only an APPLY when something
+    // restarts us afterwards. Without a detectable restart-on-clean-exit
+    // supervisor, exiting is an outage — so behave as `stage` instead
+    // (the update is staged and flipped; whatever restart comes next lands
+    // on it) and say so once per staged version, not every 15-minute poll.
+    const sup = supervisorInfo();
+    state.headlessSupervisor = sup.supervised ? sup.via : 'none';
+    if (!sup.supervised) {
+      if (_noSupervisorLoggedFor !== state.stagedVersion) {
+        _noSupervisorLoggedFor = state.stagedVersion;
+        winston.info(`[update] mStream ${state.stagedVersion} is staged and applies on the next restart. `
+          + 'Auto mode found no supervisor that would restart mStream after a self-exit '
+          + '(set MSTREAM_SUPERVISED=1 if one really is in charge).');
+      }
+      return;
+    }
+    scheduleHeadlessExit(`auto mode, server idle (supervisor: ${sup.via})`);
     return;
   }
   // Launcher-supervised (managed restart, or inno silent install): flag it;
@@ -855,8 +1074,9 @@ export function onSettingsChanged() {
     .then(() => {
       maybeAutoApply();
       const cfg = updatesConfig();
-      if (cfg.check && cfg.mode !== 'notify' && state.available && !state.skipped && !state.staged) {
-        // e.g. notify -> stage, or an unskip: start the withheld download.
+      if (cfg.check && cfg.mode !== 'notify' && state.available && !state.skipped && !state.held && !state.staged) {
+        // e.g. notify -> stage, an unskip, or a cleared hold: start the
+        // withheld download.
         checkNow(true).catch(() => {});
       }
     });
@@ -871,6 +1091,10 @@ export function onSettingsChanged() {
 export function setup(mstream, hooks = {}) {
   _hooks = { ..._hooks, ...hooks };
   detectInstall();
+  // Surface any boot-failure holds from the very first status write; the
+  // prune waits for the boot check (running that far past listen is the
+  // proof-of-boot that justifies clearing).
+  refreshHolds();
   // A staged flag from a PREVIOUS process run: if we ARE that version now,
   // clear it; if not (the restart didn't land on it), re-checking will
   // re-discover it within a day, or instantly via the boot check.
@@ -889,7 +1113,13 @@ export function setup(mstream, hooks = {}) {
   if (_bootTimer.unref) { _bootTimer.unref(); }
   _checkTimer = setInterval(() => { checkNow().catch(() => {}); }, CHECK_INTERVAL_MS);
   if (_checkTimer.unref) { _checkTimer.unref(); }
-  _applyTimer = setInterval(() => { maybeAutoApply(); }, AUTO_APPLY_POLL_MS);
+  // The apply poll paces itself to the idle gate's quiet window when that
+  // is the shorter of the two: once a server has been quiet for the window,
+  // the arm should land within roughly one more window — not up to 15
+  // minutes later. (Every request is activity — including "check now" —
+  // so the TIMER is what fires the arm on a genuinely idle box.)
+  _applyTimer = setInterval(() => { maybeAutoApply(); },
+    Math.max(1000, Math.min(AUTO_APPLY_POLL_MS, idleQuietMs())));
   if (_applyTimer.unref) { _applyTimer.unref(); }
 }
 
@@ -900,7 +1130,10 @@ export function stopForTests() {
   _install = null;
   _checking = null;
   _exiting = false;
-  state.skipped = false;
+  _supervisor = null;
+  _noSupervisorLoggedFor = null;
+  state.skipped = false; state.held = false; state.heldVersions = [];
+  state.headlessSupervisor = null;
   state.latest = null; state.available = false; state.staged = false;
   state.stagedVersion = null; state.applyRequested = false; state.applyRequestedAt = null; state.error = null;
   state.installerPath = null; state.downloadUrl = null; state.notifyOnly = false;

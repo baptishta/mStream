@@ -283,6 +283,215 @@ pub fn open_logs_terminal(logs_dir: &std::path::Path) -> Result<(), String> {
     }
 }
 
+/// Which wizard-family page a terminal launch opens. Each carries its own
+/// subcommand, window title, and scratch script name, so the Setup and
+/// Quick Connect tray items never clobber each other's launch files.
+#[derive(Clone, Copy)]
+pub enum WizardPage {
+    /// The full first-run wizard (`mstream-player setup`).
+    Setup,
+    /// The standalone Quick Connect page (`mstream-player qr`) — the
+    /// wizard's Done screen: pairing QR plus the app buttons.
+    QuickConnect,
+}
+
+impl WizardPage {
+    fn subcommand(self) -> &'static str {
+        match self {
+            WizardPage::Setup => "setup",
+            WizardPage::QuickConnect => "qr",
+        }
+    }
+    // Only the mac ghostty config (and this file's mac-gated tests) call
+    // this; allow, not cfg, keeps the enum's surface uniform across
+    // platforms.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn title(self) -> &'static str {
+        match self {
+            WizardPage::Setup => "mStream Setup",
+            WizardPage::QuickConnect => "mStream Quick Connect",
+        }
+    }
+    #[cfg(target_os = "macos")]
+    fn script_name(self) -> &'static str {
+        match self {
+            WizardPage::Setup => "setup-mstream.command",
+            WizardPage::QuickConnect => "quickconnect-mstream.command",
+        }
+    }
+}
+
+/// Run one of the terminal player's wizard-family pages in a fresh terminal
+/// window, pointed at this launcher's server. Same per-OS "what is a
+/// terminal" seams as open_logs_terminal; the caller logs a failure — a
+/// missing terminal emulator must never take the tray down. Ok carries
+/// WHICH surface opened (support surface: "it opened in Terminal, not the
+/// mStream console — why?" should be one log line away).
+///
+/// `console`: the bundled Ghostty (macOS bundles only, resolved by
+/// paths::find_console_app) — preferred over Terminal.app because Apple's
+/// terminal has no pixel protocol at all, so the wizard's wordmark and QR
+/// degrade to character art there. Ignored on the other platforms.
+pub fn open_wizard_terminal(
+    player_bin: &std::path::Path,
+    server_url: &str,
+    scratch_dir: &std::path::Path,
+    console: Option<&crate::paths::ConsoleLaunch>,
+    page: WizardPage,
+) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut console_note = String::new();
+        if let Some(c) = console {
+            match spawn_ghostty_page(c, player_bin, server_url, scratch_dir, page) {
+                Ok(()) => return Ok("bundled Ghostty console".into()),
+                // A broken bundled console must degrade to Terminal.app, not
+                // dead-end the button — but the reason rides along.
+                Err(e) => console_note = format!(" (bundled console failed: {e})"),
+            }
+        }
+        // Terminal.app opens an executable .command file as a document — no
+        // AppleEvents automation consent (see open_logs_terminal). The CSI 8
+        // resize asks for the window the wizard's two-column pages were
+        // designed around; Terminal.app honors it, and a terminal that
+        // doesn't just keeps its size (the wizard reflows).
+        let script = scratch_dir.join(page.script_name());
+        let body = format!(
+            "#!/bin/sh\n# Written by mStream's tray - safe to delete.\nprintf '\\033[8;42;120t'\nclear\nexec {player} {sub} --server {url}\n",
+            player = sh_quote(player_bin),
+            sub = page.subcommand(),
+            url = sh_quote_str(server_url),
+        );
+        std::fs::write(&script, body).map_err(|e| format!("write {}: {e}", script.display()))?;
+        let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+        std::process::Command::new("/usr/bin/open")
+            .arg(&script)
+            .spawn()
+            .map(|_| format!("Terminal.app{console_note}"))
+            .map_err(|e| format!("open {}: {e}", script.display()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = scratch_dir; // no script file on this path
+        // Windows Terminal first (App Execution Alias on PATH, preinstalled
+        // on Win11): it draws the wizard's pixel art via sixel. Without it,
+        // a fresh conhost window still runs the wizard — crossterm enables
+        // VT there and the art degrades to half-blocks.
+        let _ = console;
+        if std::process::Command::new("wt.exe")
+            .arg(player_bin)
+            .args([page.subcommand(), "--server", server_url])
+            .spawn()
+            .is_ok()
+        {
+            return Ok("wt.exe".into());
+        }
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        std::process::Command::new(player_bin)
+            .args([page.subcommand(), "--server", server_url])
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .spawn()
+            .map(|_| "conhost fallback".into())
+            .map_err(|e| format!("spawn {}: {e}", player_bin.display()))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = (scratch_dir, console); // no script file / no bundled console here
+        let cmd = format!(
+            "exec {player} {sub} --server {url}",
+            player = sh_quote(player_bin),
+            sub = page.subcommand(),
+            url = sh_quote_str(server_url),
+        );
+        let candidates = [
+            ("x-terminal-emulator", ["-e", "sh", "-c", cmd.as_str()]),
+            ("gnome-terminal", ["--", "sh", "-c", cmd.as_str()]),
+            ("konsole", ["-e", "sh", "-c", cmd.as_str()]),
+            ("xfce4-terminal", ["-x", "sh", "-c", cmd.as_str()]),
+            ("xterm", ["-e", "sh", "-c", cmd.as_str()]),
+        ];
+        for (bin, args) in candidates {
+            if std::process::Command::new(bin).args(args).spawn().is_ok() {
+                return Ok(bin.into());
+            }
+        }
+        Err("no terminal emulator found (tried x-terminal-emulator, gnome-terminal, \
+             konsole, xfce4-terminal, xterm)"
+            .to_string())
+    }
+}
+
+/// Write the config and launch the bundled Ghostty console running the
+/// wizard. Everything rides in the CONFIG FILE, never `-e`: Ghostty confirms
+/// argument-passed commands with an "Allow Ghostty to execute…" dialog (its
+/// anti-injection guard) but treats config-declared commands as user-trusted
+/// and prompts for nothing (probed 2026-08-24, player PLAN.md Phase 8).
+/// XDG_CONFIG_HOME is scoped to the spawn, so a user's own Ghostty install
+/// keeps its own configuration untouched.
+#[cfg(target_os = "macos")]
+fn spawn_ghostty_page(
+    console: &crate::paths::ConsoleLaunch,
+    player_bin: &std::path::Path,
+    server_url: &str,
+    scratch_dir: &std::path::Path,
+    page: WizardPage,
+) -> Result<(), String> {
+    let bin = console.ghostty_app.join("Contents").join("MacOS").join("ghostty");
+    if !bin.exists() {
+        return Err(format!("no ghostty binary at {}", bin.display()));
+    }
+    let cfg_home = scratch_dir.join("console-config");
+    let cfg_dir = cfg_home.join("ghostty");
+    std::fs::create_dir_all(&cfg_dir).map_err(|e| format!("mkdir {}: {e}", cfg_dir.display()))?;
+    let cfg = cfg_dir.join("config");
+    std::fs::write(&cfg, ghostty_page_config(console, player_bin, server_url, page))
+        .map_err(|e| format!("write {}: {e}", cfg.display()))?;
+    std::process::Command::new(&bin)
+        .env("XDG_CONFIG_HOME", &cfg_home)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("spawn {}: {e}", bin.display()))
+}
+
+/// The console's config, regenerated on every click so it always reflects
+/// this build's idea of the paths. `command` uses the explicit `shell:`
+/// prefix — the value runs via `/bin/sh -c`, so the sh-quoting handles the
+/// "Application Support" spaces every managed install has.
+/// `quit-after-last-window-closed` keeps the console from lingering in the
+/// Dock as a windowless app after the wizard exits; `macos-icon = custom`
+/// puts the mStream mark on that Dock tile while it lives.
+#[cfg(target_os = "macos")]
+fn ghostty_page_config(
+    console: &crate::paths::ConsoleLaunch,
+    player_bin: &std::path::Path,
+    server_url: &str,
+    page: WizardPage,
+) -> String {
+    let mut body = format!(
+        "# Written by mStream's tray - safe to delete.\n\
+         auto-update = off\n\
+         title = {title}\n\
+         window-width = 120\n\
+         window-height = 42\n\
+         confirm-close-surface = false\n\
+         quit-after-last-window-closed = true\n",
+        title = page.title(),
+    );
+    if let Some(icns) = &console.icon_icns {
+        // Config values run to end of line — a spaced path needs no quoting.
+        body.push_str(&format!("macos-icon = custom\nmacos-custom-icon = {}\n", icns.display()));
+    }
+    body.push_str(&format!(
+        "command = shell:{player} {sub} --server {url}\n",
+        player = sh_quote(player_bin),
+        sub = page.subcommand(),
+        url = sh_quote_str(server_url),
+    ));
+    body
+}
+
 /// Start the NEW launcher for the apply-update handoff, detached, and return
 /// so the caller can exit. Always passes `--takeover`: the new instance
 /// retries the single-instance lock briefly (we still hold it for the last
@@ -425,11 +634,63 @@ pub fn spawn_installer_detached(installer: &std::path::Path, silent: bool) -> Re
 /// home ("Application Support") guarantees a space.
 #[cfg(unix)]
 fn sh_quote(p: &std::path::Path) -> String {
-    format!("'{}'", p.display().to_string().replace('\'', "'\\''"))
+    sh_quote_str(&p.display().to_string())
+}
+
+#[cfg(unix)]
+fn sh_quote_str(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
+    #[test]
+    fn ghostty_config_quotes_spaced_paths_and_never_uses_dash_e() {
+        let c = crate::paths::ConsoleLaunch {
+            ghostty_app: "/tmp/x/Ghostty.app".into(),
+            icon_icns: Some("/App Root/Resources/mStream.icns".into()),
+        };
+        let cfg = super::ghostty_page_config(
+            &c,
+            std::path::Path::new("/Application Support/bin/mstream-player"),
+            "http://localhost:3000",
+            super::WizardPage::Setup,
+        );
+        // shell: + sh-quoting is what survives "Application Support" spaces;
+        // the command must live in the CONFIG, never a -e argument (consent
+        // dialog).
+        assert!(
+            cfg.contains("command = shell:'/Application Support/bin/mstream-player' setup --server 'http://localhost:3000'"),
+            "{cfg}"
+        );
+        // Config values run to end of line — the spaced icns path rides raw.
+        assert!(cfg.contains("macos-custom-icon = /App Root/Resources/mStream.icns\n"), "{cfg}");
+        assert!(cfg.contains("macos-icon = custom\n"), "{cfg}");
+        assert!(cfg.contains("auto-update = off\n"), "{cfg}");
+        assert!(cfg.contains("quit-after-last-window-closed = true\n"), "{cfg}");
+
+        let plain = crate::paths::ConsoleLaunch { ghostty_app: "/t/G.app".into(), icon_icns: None };
+        let cfg2 = super::ghostty_page_config(&plain, std::path::Path::new("/p"), "http://x:1", super::WizardPage::Setup);
+        assert!(!cfg2.contains("macos-icon"), "no icns means Ghostty keeps its own icon: {cfg2}");
+
+        // The Quick Connect page: same machinery, its own subcommand + title.
+        let qc = super::ghostty_page_config(&plain, std::path::Path::new("/p"), "http://x:1", super::WizardPage::QuickConnect);
+        assert!(qc.contains("command = shell:'/p' qr --server 'http://x:1'"), "{qc}");
+        assert!(qc.contains("title = mStream Quick Connect\n"), "{qc}");
+    }
+
+    #[test]
+    fn each_page_maps_to_its_own_subcommand_title_and_script() {
+        use super::WizardPage::*;
+        assert_eq!(Setup.subcommand(), "setup");
+        assert_eq!(QuickConnect.subcommand(), "qr");
+        assert_eq!(Setup.title(), "mStream Setup");
+        assert_eq!(QuickConnect.title(), "mStream Quick Connect");
+        // Distinct script files: the two tray items must never clobber
+        // each other's .command.
+        assert_ne!(Setup.script_name(), QuickConnect.script_name());
+    }
+
     #[test]
     #[ignore = "spawns a real Terminal window - run manually with --ignored"]
     fn manual_open_logs_terminal() {
@@ -438,5 +699,33 @@ mod tests {
         std::fs::write(dir.join("launcher.log"), "[demo] launcher.log content\n").unwrap();
         std::fs::write(dir.join("server-console.log"), "[demo] server-console.log content\n").unwrap();
         super::open_logs_terminal(&dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "spawns a real Terminal window - run manually with --ignored"]
+    fn manual_open_setup_terminal() {
+        // MSTREAM_DEMO_PLAYER = a real player binary; MSTREAM_DEMO_SERVER =
+        // the URL to point its wizard at; MSTREAM_DEMO_CONSOLE = optionally,
+        // a Ghostty.app to prefer (with MSTREAM_DEMO_ICNS for the Dock icon).
+        let player = std::path::PathBuf::from(
+            std::env::var("MSTREAM_DEMO_PLAYER").expect("set MSTREAM_DEMO_PLAYER"),
+        );
+        let url = std::env::var("MSTREAM_DEMO_SERVER")
+            .unwrap_or_else(|_| "http://localhost:3000".into());
+        let console = std::env::var("MSTREAM_DEMO_CONSOLE").ok().map(|app| {
+            crate::paths::ConsoleLaunch {
+                ghostty_app: std::path::PathBuf::from(app),
+                icon_icns: std::env::var("MSTREAM_DEMO_ICNS").ok().map(std::path::PathBuf::from),
+            }
+        });
+        let dir = std::env::temp_dir().join("mstream-setup-demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        // MSTREAM_DEMO_PAGE=qr opens the Quick Connect page instead.
+        let page = match std::env::var("MSTREAM_DEMO_PAGE").as_deref() {
+            Ok("qr") => super::WizardPage::QuickConnect,
+            _ => super::WizardPage::Setup,
+        };
+        let via = super::open_wizard_terminal(&player, &url, &dir, console.as_ref(), page).unwrap();
+        eprintln!("opened via {via}");
     }
 }

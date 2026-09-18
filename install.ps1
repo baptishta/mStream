@@ -241,6 +241,42 @@ try {
         }
     }
 
+    # The DEEP probe, for bundles that know it: --boot-probe loads the
+    # module graph, runs the existing config through the new build's schema,
+    # and opens the database read-only - the execs-but-cannot-boot classes
+    # -V is blind to. Exit 0 = would boot; nonzero WITH a "boot-probe:"
+    # sentinel = would not; nonzero with NO sentinel = a bundle that
+    # predates the flag (unknown option), which counts as a pass (-V
+    # vouched; manual rollbacks must keep installing old bundles). The
+    # local EAP=Continue window keeps native stderr as captured output -
+    # under Stop, PS 5.1 turns it into a terminating NativeCommandError.
+    $probeFail = $false
+    $probeLines = @()
+    if ($newServerV) {
+        $eap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $probeText = (& (Join-Path $final 'mstream-server.exe') --boot-probe 2>&1 | Out-String)
+        $probeCode = $LASTEXITCODE
+        $ErrorActionPreference = $eap
+        if ($probeCode -ne 0 -and $probeText -match 'boot-probe:') {
+            $probeFail = $true
+            $probeLines = @($probeText -split "`r?`n" | Where-Object { $_ -match '^boot-probe:' })
+        }
+    }
+    if ($probeFail) {
+        $curTarget = $null
+        if (Test-Path $current) {
+            $curItem = Get-Item $current -Force
+            if ($curItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { $curTarget = $curItem.Target | Select-Object -First 1 }
+        }
+        if ($curTarget -and (Test-Path $curTarget) -and ((Resolve-Path $curTarget).Path -ne $final)) {
+            throw ("the new mstream-server ($ver) would not BOOT on this system - keeping the existing install " +
+                   "($($probeLines -join '; '); current stays at $curTarget; the new copy is at $final)")
+        }
+        # First install / same-version re-run: nothing working is displaced.
+        Write-Warning "the boot probe flagged a problem this install may hit at first start: $($probeLines -join '; ')"
+    }
+
     # `current` as a junction (no admin needed, unlike a symlink), so a
     # shortcut and the PATH entry keep working across upgrades. A REAL
     # directory named current (older manual layout) is moved aside, not
@@ -331,11 +367,42 @@ try {
         } finally { $envKey.Close() }
     }
 
+    # A LAUNCHER this script manages is running the old version: ask IT to
+    # restart into the new one through the same armed-status-file contract
+    # the in-app updater uses - the tray polls update-status.json once a
+    # minute and performs the graceful stop + takeover itself, with its
+    # full guard set (never a held version, never its own version, only
+    # while its server is up). The installer itself still never kills
+    # anything; headless servers and copies we don't own keep the warning.
+    $relaunchArmed = $false
+    if ($installedFresh -and -not $env:MSTREAM_NO_RELAUNCH) {
+        $ownedLauncher = @(Get-Process mStream -ErrorAction SilentlyContinue | Where-Object {
+            $_.Path -and $_.Path.StartsWith("$root\", [StringComparison]::OrdinalIgnoreCase) -and
+            ((Split-Path $_.Path -Parent) -ne $final)
+        })
+        if ($ownedLauncher.Count -gt 0) {
+            $dataHome = Join-Path $env:LOCALAPPDATA 'mStream'
+            New-Item -ItemType Directory -Force $dataHome | Out-Null
+            $now = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            # No `current` field on purpose: the launcher treats an absent
+            # current as "staged version is new", and this script cannot
+            # know the running version.
+            $doc = '{"schema":1,"latest":"' + $ver + '","available":true,"method":"managed",' +
+                   '"staged":true,"stagedVersion":"' + $ver + '","applyRequested":true,' +
+                   '"applyRequestedAt":"' + $now + '"}'
+            $tmpStatus = Join-Path $dataHome ".update-status-installer-$PID"
+            Set-Content -Path $tmpStatus -Value $doc -Encoding ASCII
+            Move-Item -Force $tmpStatus (Join-Path $dataHome 'update-status.json')
+            $relaunchArmed = $true
+            Write-Host "  the running mStream restarts into $ver within a minute (its tray does the switch; set MSTREAM_NO_RELAUNCH=1 to leave it on the old version)"
+        }
+    }
+
     # An instance running from somewhere else stays on its own version until
     # it is restarted - the script never kills a user's server. Say so, with
     # the exact path, instead of letting "installed" imply "upgraded".
     $elsewhere = @($runningFrom | Where-Object { $_ -ne $final -and $_ -ne $current })
-    if ($elsewhere) {
+    if ($elsewhere -and -not $relaunchArmed) {
         Write-Warning ("mStream is currently running from $($elsewhere -join ', ') - it keeps running that version " +
                        "until you Quit it (tray icon) and start the new one; the Start Menu entry now points at $ver.")
     }

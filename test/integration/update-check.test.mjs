@@ -36,7 +36,7 @@ function hostKey() {
 
 let relDir; let relPort; let relServer; let tmpHome;
 
-function makeBundle(version, key, { broken = false } = {}) {
+function makeBundle(version, key, { broken = false, probeFail = false } = {}) {
   const b = `mStream-${version}-${key}`;
   const dir = path.join(relDir, b);
   const inner = key.startsWith('darwin')
@@ -46,9 +46,14 @@ function makeBundle(version, key, { broken = false } = {}) {
   const server = path.join(inner, 'mstream-server');
   // broken = a binary this host "cannot exec": the probe-before-flip in
   // install.sh must refuse it and the stager must report a failed stage.
+  // probeFail = the subtler bad release: -V answers (the exec probe
+  // passes), but the DEEP probe reports it would not boot - install.sh
+  // must refuse on the sentinel.
   const stub = broken
     ? `printf '#!/bin/sh\\nexit 1\\n' > '${server}'`
-    : `printf '#!/bin/sh\\n[ "$1" = -V ] && echo ${version}\\nexit 0\\n' > '${server}'`;
+    : probeFail
+      ? `printf '#!/bin/sh\\n[ "$1" = -V ] && { echo ${version}; exit 0; }\\n[ "$1" = --boot-probe ] && { echo "boot-probe: FAIL simulated boot regression"; exit 1; }\\nexit 0\\n' > '${server}'`
+      : `printf '#!/bin/sh\\n[ "$1" = -V ] && echo ${version}\\nexit 0\\n' > '${server}'`;
   spawnSync('bash', ['-c', `${stub} && chmod +x '${server}'`]);
   spawnSync('bash', ['-c', `echo 'fake bundle' > '${dir}/README.txt'`]);
   const zip = spawnSync('python3', ['-m', 'zipfile', '-c', `${b}.zip`, b], { cwd: relDir });
@@ -56,11 +61,11 @@ function makeBundle(version, key, { broken = false } = {}) {
   spawnSync('rm', ['-rf', dir]);
 }
 
-async function publish(version, { tamper = false, broken = false } = {}) {
+async function publish(version, { tamper = false, broken = false, probeFail = false } = {}) {
   for (const f of await fs.readdir(relDir)) {
     if (f.endsWith('.zip') || f === 'manifest.json') { await fs.rm(path.join(relDir, f)); }
   }
-  makeBundle(version, hostKey(), { broken });
+  makeBundle(version, hostKey(), { broken, probeFail });
   const gen = spawnSync('sh', [path.join(REPO_ROOT, 'scripts', 'release-manifest.sh'), version, relDir]);
   assert.equal(gen.status, 0, `manifest generation failed: ${gen.stderr}`);
   if (tamper) {
@@ -131,7 +136,8 @@ test('managed round-trip: check, auto-stage, current flip, tamper refusal, live 
     assert.equal(s.current, packageJson.version);
     assert.equal(s.staged, false);
 
-    // Check: finds 9.9.9 and (mode=stage default) starts staging on its own.
+    // Check: finds 9.9.9 and (default mode: staging is part of both stage
+    // and auto) starts the download on its own.
     const check = await (await fetch(`${srv.baseUrl}/api/v1/admin/update/check`, { method: 'POST' })).json();
     assert.equal(check.available, true);
     assert.equal(check.latest, '9.9.9');
@@ -233,6 +239,377 @@ test('managed round-trip: check, auto-stage, current flip, tamper refusal, live 
     assert.equal(bad.status, 400);
   } finally {
     await srv.stop();
+  }
+});
+
+// The per-OS data home under a redirected HOME — where update-status.json
+// and update-hold.json land (userDataHome() in src/util/esm-helpers.js).
+function dataHomeOf(home) {
+  return process.platform === 'darwin'
+    ? path.join(home, 'Library', 'Application Support', 'mStream')
+    : path.join(home, '.local', 'share', 'mstream');
+}
+
+function envFor(home) {
+  return {
+    HOME: home,
+    XDG_DATA_HOME: path.join(home, '.local', 'share'),
+    MSTREAM_RELEASE_BASE: `http://127.0.0.1:${relPort}`,
+    MSTREAM_UPDATE_ROOT: path.join(home, 'app'),
+  };
+}
+
+test('boot-failure holds: held version never stages, a newer release supersedes it, clearHold overrides', { skip: posixOnly }, async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'mstream-upd-hold-'));
+  try {
+    // As if the launcher's watchdog rolled 9.9.20 back before this boot.
+    const holdPath = path.join(dataHomeOf(home), 'update-hold.json');
+    await fs.mkdir(path.dirname(holdPath), { recursive: true });
+    await fs.writeFile(holdPath, JSON.stringify({
+      schema: 1,
+      held: [{ version: '9.9.20', at: 0, reason: 'server exited before it finished starting after an update' }],
+    }));
+    await publish('9.9.20');
+    const srv = await startServer({
+      waitForScan: false, env: envFor(home),
+      extraArgs: ['--supervised'], stdin: 'pipe',
+    });
+    try {
+      // The hold is visible from boot, before any check.
+      let s = await (await fetch(`${srv.baseUrl}/api/v1/admin/update`)).json();
+      assert.deepEqual(s.heldVersions, ['9.9.20']);
+
+      // The held version is reported but never staged (the default mode
+      // would otherwise download and flip on this very check).
+      s = await (await fetch(`${srv.baseUrl}/api/v1/admin/update/check`, { method: 'POST' })).json();
+      assert.equal(s.available, true);
+      assert.equal(s.latest, '9.9.20');
+      assert.equal(s.held, true);
+      assert.equal(s.staged, false);
+      await assert.rejects(fs.access(path.join(home, 'app', 'current')), 'a held version must never reach current');
+
+      // An explicit download is refused, with the reason.
+      const dl = await fetch(`${srv.baseUrl}/api/v1/admin/update/download`, { method: 'POST' });
+      assert.equal(dl.status, 409);
+      assert.match((await dl.json()).error, /failed to start .* held back/);
+
+      // A newer release supersedes the hold: it stages normally while the
+      // hold on the bad version stays on file (still newer than what runs).
+      await publish('9.9.21');
+      await fetch(`${srv.baseUrl}/api/v1/admin/update/check`, { method: 'POST' });
+      s = await pollStatus(srv.baseUrl, (x) => x.staged && x.stagedVersion === '9.9.21');
+      assert.equal(s.held, false);
+      assert.deepEqual(s.heldVersions, ['9.9.20']);
+
+      // Operator override: clearHold drops the record entirely.
+      const clear = await fetch(`${srv.baseUrl}/api/v1/admin/update/settings`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clearHold: true }),
+      });
+      assert.equal(clear.status, 200);
+      s = await pollStatus(srv.baseUrl, (x) => x.heldVersions.length === 0);
+      await assert.rejects(fs.access(holdPath), 'a cleared hold file must be gone');
+    } finally {
+      await srv.stop();
+    }
+  } finally {
+    await fs.rm(home, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('enforceHold re-points a current link left on a held version', { skip: posixOnly }, async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'mstream-upd-enforce-'));
+  try {
+    // The layout a half-finished rollback leaves: current still aims at the
+    // held version, while the previous (running) version's folder exists.
+    const root = path.join(home, 'app');
+    const heldDir = path.join(root, `mStream-9.9.20-${hostKey()}`);
+    const runningDir = path.join(root, `mStream-${packageJson.version}-${hostKey()}`);
+    await fs.mkdir(heldDir, { recursive: true });
+    await fs.mkdir(runningDir, { recursive: true });
+    await fs.symlink(heldDir, path.join(root, 'current'));
+    const holdPath = path.join(dataHomeOf(home), 'update-hold.json');
+    await fs.mkdir(path.dirname(holdPath), { recursive: true });
+    await fs.writeFile(holdPath, JSON.stringify({ schema: 1, held: [{ version: '9.9.20', at: 0, reason: 't' }] }));
+    await publish('9.9.20'); // the held version is also "latest": nothing may stage
+    const srv = await startServer({
+      waitForScan: false, env: envFor(home),
+      extraArgs: ['--supervised'], stdin: 'pipe',
+    });
+    try {
+      await fetch(`${srv.baseUrl}/api/v1/admin/update/check`, { method: 'POST' });
+      const start = Date.now();
+      let target = null;
+      while (Date.now() - start < 10_000) {
+        target = await fs.readlink(path.join(root, 'current')).catch(() => null);
+        if (target === runningDir) { break; }
+        await sleep(100);
+      }
+      assert.equal(target, runningDir, 'current must be re-pointed at the running version');
+      const s = await (await fetch(`${srv.baseUrl}/api/v1/admin/update`)).json();
+      assert.equal(s.held, true);
+      assert.equal(s.staged, false);
+    } finally {
+      await srv.stop();
+    }
+  } finally {
+    await fs.rm(home, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+// Supervision signals the RUNNER environment may carry (GitHub's runners
+// live under systemd) must not leak into the spawned server: exported-but-
+// empty reads as unset on the detection side.
+function scrubSupervision(env) {
+  return { ...env, MSTREAM_SUPERVISED: '', pm_id: '', INVOCATION_ID: '' };
+}
+
+test('a release that execs but would not boot is refused BEFORE the flip', { skip: posixOnly }, async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'mstream-upd-probe-'));
+  try {
+    await publish('9.9.40');
+    const srv = await startServer({
+      waitForScan: false, env: envFor(home),
+      extraArgs: ['--supervised'], stdin: 'pipe',
+    });
+    try {
+      // A good release stages and flips normally.
+      await fetch(`${srv.baseUrl}/api/v1/admin/update/check`, { method: 'POST' });
+      await pollStatus(srv.baseUrl, (x) => x.staged && x.stagedVersion === '9.9.40');
+      const root = path.join(home, 'app');
+      assert.equal(path.basename(await fs.readlink(path.join(root, 'current'))), `mStream-9.9.40-${hostKey()}`);
+
+      // The subtle bad release: -V answers, the deep probe says "would not
+      // boot". install.sh must refuse on the sentinel and leave `current`
+      // exactly where it was - the stage-time refusal that self-heals when
+      // the next release ships, with no watchdog ever needed.
+      await publish('9.9.41', { probeFail: true });
+      await fetch(`${srv.baseUrl}/api/v1/admin/update/check`, { method: 'POST' });
+      const s = await pollStatus(srv.baseUrl, (x) => (x.error || '').includes('would not BOOT'));
+      assert.match(s.error, /Staging failed/);
+      assert.equal(path.basename(await fs.readlink(path.join(root, 'current'))), `mStream-9.9.40-${hostKey()}`,
+        'a probe-refused release must never reach current');
+    } finally {
+      await srv.stop();
+    }
+  } finally {
+    await fs.rm(home, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('auto mode without a supervisor stages but never self-exits', { skip: posixOnly }, async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'mstream-upd-nosup-'));
+  try {
+    await publish('9.9.30');
+    const srv = await startServer({
+      waitForScan: true,   // the idle gate must be about supervision, not the boot scan
+      env: { ...scrubSupervision(envFor(home)), MSTREAM_UPDATE_IDLE_QUIET_MS: '0' },
+      extraConfig: { updates: { mode: 'auto', check: true } },
+    });
+    try {
+      await fetch(`${srv.baseUrl}/api/v1/admin/update/check`, { method: 'POST' });
+      // headlessSupervisor lands 'none' only after maybeAutoApply passed
+      // every earlier gate (staged, idle) and declined at supervision — so
+      // this both proves the decline AND that the decline was the only
+      // thing between the server and an exit.
+      const s = await pollStatus(srv.baseUrl, (x) => x.staged && x.stagedVersion === '9.9.30'
+        && x.headlessSupervisor === 'none');
+      assert.equal(s.mode, 'auto');
+      // The old behavior exited 0 about 1.5s after arming. Give it triple
+      // that, then require the server alive and still answering.
+      await sleep(5000);
+      assert.equal(srv.proc.exitCode, null, 'an unsupervised auto server must not self-exit');
+      const alive = await fetch(`${srv.baseUrl}/api/v1/admin/update`);
+      assert.equal(alive.status, 200);
+    } finally {
+      await srv.stop();
+    }
+  } finally {
+    await fs.rm(home, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('the idle gate holds an armed apply until a quiet window elapses', { skip: posixOnly }, async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'mstream-upd-quiet-'));
+  try {
+    await publish('9.9.60');
+    const srv = await startServer({
+      waitForScan: true,
+      // A short but real quiet window: recent activity must block the arm,
+      // and its expiry must release it. The status poll itself is excluded
+      // from the activity clock (GET /api/v1/admin/update), so polling for
+      // the outcome cannot keep the server "active".
+      env: { ...scrubSupervision(envFor(home)), MSTREAM_UPDATE_IDLE_QUIET_MS: '6000' },
+      extraArgs: ['--supervised'], stdin: 'pipe',
+      extraConfig: { updates: { mode: 'auto', check: true } },
+    });
+    try {
+      await fetch(`${srv.baseUrl}/api/v1/admin/update/check`, { method: 'POST' });
+      await pollStatus(srv.baseUrl, (x) => x.staged && x.stagedVersion === '9.9.60');
+      // Fresh activity (a normal request): the quiet window has not
+      // elapsed, so nothing may arm — the apply poll is paced to the
+      // window, so give it one full cycle to prove the restraint.
+      await fetch(`${srv.baseUrl}/api/`);
+      await sleep(2000);
+      let s = await (await fetch(`${srv.baseUrl}/api/v1/admin/update`)).json();
+      assert.equal(s.applyRequested, false, 'an active server must not arm the apply');
+      // Go quiet (only excluded status polls from here): the timer arms it
+      // within roughly one window past the quiet threshold.
+      s = await pollStatus(srv.baseUrl, (x) => x.applyRequested === true, 20_000);
+      assert.equal(s.stagedVersion, '9.9.60');
+    } finally {
+      await srv.stop();
+    }
+  } finally {
+    await fs.rm(home, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('supervised auto mode arms the launcher through the status file', { skip: posixOnly }, async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'mstream-upd-arm-'));
+  try {
+    await publish('9.9.50');
+    const srv = await startServer({
+      waitForScan: true,   // idle must gate on supervision state, not the boot scan
+      env: { ...scrubSupervision(envFor(home)), MSTREAM_UPDATE_IDLE_QUIET_MS: '0' },
+      extraArgs: ['--supervised'], stdin: 'pipe',
+      extraConfig: { updates: { mode: 'auto', check: true } },
+    });
+    try {
+      await fetch(`${srv.baseUrl}/api/v1/admin/update/check`, { method: 'POST' });
+      await pollStatus(srv.baseUrl, (x) => x.staged && x.stagedVersion === '9.9.50');
+      // The launcher contract: the on-disk file carries the arm plus a
+      // FRESH per-request token (the launcher retries a failed apply only
+      // when a new token appears - update-watchdog/apply smokes drive the
+      // consuming side with the real binary).
+      const statusPath = path.join(dataHomeOf(home), 'update-status.json');
+      const start = Date.now();
+      let doc = null;
+      while (Date.now() - start < 15_000) {
+        try {
+          doc = JSON.parse(await fs.readFile(statusPath, 'utf8'));
+          if (doc.applyRequested === true) { break; }
+        } catch { /* not written yet */ }
+        await sleep(150);
+      }
+      assert.equal(doc?.applyRequested, true, `status file never armed: ${JSON.stringify(doc)}`);
+      assert.equal(doc.stagedVersion, '9.9.50');
+      assert.ok(!Number.isNaN(Date.parse(doc.applyRequestedAt)), `token must be a timestamp: ${doc.applyRequestedAt}`);
+      // Supervised = the LAUNCHER restarts us; the server itself must not
+      // exit (that is the headless branch's move, gated separately).
+      await sleep(3000);
+      assert.equal(srv.proc.exitCode, null, 'a supervised server must never self-exit');
+    } finally {
+      await srv.stop();
+    }
+  } finally {
+    await fs.rm(home, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('auto mode with MSTREAM_SUPERVISED=1 applies by exiting 0', { skip: posixOnly }, async () => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'mstream-upd-sup-'));
+  try {
+    await publish('9.9.31');
+    const srv = await startServer({
+      waitForScan: true,
+      env: { ...scrubSupervision(envFor(home)), MSTREAM_SUPERVISED: '1', MSTREAM_UPDATE_IDLE_QUIET_MS: '0' },
+      extraConfig: { updates: { mode: 'auto', check: true } },
+    });
+    try {
+      const exited = new Promise((resolve) => srv.proc.once('exit', resolve));
+      await fetch(`${srv.baseUrl}/api/v1/admin/update/check`, { method: 'POST' });
+      await pollStatus(srv.baseUrl, (x) => x.staged && x.stagedVersion === '9.9.31')
+        .catch(() => { /* the exit can outrun the poll - the assert below decides */ });
+      const code = await Promise.race([
+        exited,
+        sleep(60_000).then(() => { throw new Error('supervised auto server never exited'); }),
+      ]);
+      assert.equal(code, 0, 'the headless apply is a clean exit for the supervisor to restart');
+      assert.equal(
+        path.basename(await fs.readlink(path.join(home, 'app', 'current'))),
+        `mStream-9.9.31-${hostKey()}`,
+        'the exit happened with the update staged behind current'
+      );
+    } finally {
+      await srv.stop();
+    }
+  } finally {
+    await fs.rm(home, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('install.sh over a running managed launcher arms the tray restart', { skip: posixOnly }, async (t) => {
+  // The fake "running launcher" must be a real binary at the owned path
+  // (argv[0] is what the ps scan matches) — compiled, never a copied
+  // system binary: AMFI SIGKILLs platform-signed binaries run from foreign
+  // trees, which silently vacates the test.
+  const cc = spawnSync('cc', ['--version']);
+  if (cc.status !== 0) { t.skip('no C compiler for the launcher stub'); return; }
+  // realpath'd: install.sh canonicalizes its ROOT (macOS /var ->
+  // /private/var), and the running-launcher ownership check is a string
+  // prefix on the stub's reported path — both sides must be canonical.
+  const home = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'mstream-inst-arm-')));
+  let stub = null;
+  try {
+    const root = path.join(home, 'app');
+    const oldBundle = path.join(root, `mStream-0.0.1-${hostKey()}`);
+    await fs.mkdir(oldBundle, { recursive: true });
+    const face = path.join(oldBundle, 'mstream-desktop');
+    const ccRun = spawnSync('sh', ['-c',
+      `printf '#include <unistd.h>\\nint main(void){for(;;)sleep(9);return 0;}\\n' | cc -x c - -o '${face}'`]);
+    assert.equal(ccRun.status, 0, `stub compile failed: ${ccRun.stderr}`);
+    const { spawn } = await import('node:child_process');
+    stub = spawn(face, [], { stdio: 'ignore', detached: true });
+    // unref, or the child handle keeps the test runner's event loop alive
+    // forever after the assertions pass (measured: the run hung at exit).
+    stub.unref();
+    await sleep(500);
+    assert.equal(stub.exitCode, null, 'the fake launcher must actually be running');
+
+    const env = {
+      ...process.env,
+      HOME: home,
+      XDG_DATA_HOME: path.join(home, '.local', 'share'),
+      MSTREAM_RELEASE_BASE: `http://127.0.0.1:${relPort}`,
+      MSTREAM_INSTALL_DIR: root,
+      MSTREAM_NO_DESKTOP: '1',
+    };
+    // ASYNC spawn, never spawnSync: the fake release feed serves from THIS
+    // process's event loop, and a sync wait deadlocks install.sh's curl
+    // against the very server it downloads from (measured: a permanent
+    // hang, immune even to spawnSync's timeout).
+    const runInstall = (extraEnv = {}) => new Promise((resolve) => {
+      const p = spawn('sh', [path.join(REPO_ROOT, 'install.sh')], { env: { ...env, ...extraEnv } });
+      let stdout = ''; let stderr = '';
+      p.stdout.on('data', (d) => { stdout += d; });
+      p.stderr.on('data', (d) => { stderr += d; });
+      const t = setTimeout(() => p.kill('SIGKILL'), 120_000);
+      p.on('close', (status) => { clearTimeout(t); resolve({ status, stdout, stderr }); });
+    });
+    await publish('9.9.70');
+    const r = await runInstall();
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /restarts into 9\.9\.70 within a minute/);
+    assert.doesNotMatch(r.stderr, /keeps running that version/);
+    const statusDoc = JSON.parse(await fs.readFile(path.join(dataHomeOf(home), 'update-status.json'), 'utf8'));
+    assert.equal(statusDoc.applyRequested, true);
+    assert.equal(statusDoc.stagedVersion, '9.9.70');
+    assert.equal(statusDoc.method, 'managed');
+    assert.ok(!Number.isNaN(Date.parse(statusDoc.applyRequestedAt)),
+      `token must be a timestamp: ${statusDoc.applyRequestedAt}`);
+
+    // Opt-out: MSTREAM_NO_RELAUNCH keeps today's told-not-touched note and
+    // leaves the status file un-armed for the new version.
+    await publish('9.9.71');
+    const r2 = await runInstall({ MSTREAM_NO_RELAUNCH: '1' });
+    assert.equal(r2.status, 0, r2.stdout + r2.stderr);
+    assert.match(r2.stderr, /keeps running that version/);
+    const statusDoc2 = JSON.parse(await fs.readFile(path.join(dataHomeOf(home), 'update-status.json'), 'utf8'));
+    assert.equal(statusDoc2.stagedVersion, '9.9.70', 'opt-out must not re-arm for the new version');
+  } finally {
+    if (stub && stub.exitCode === null) { stub.kill('SIGKILL'); }
+    await fs.rm(home, { recursive: true, force: true }).catch(() => {});
   }
 });
 

@@ -18,7 +18,7 @@ import * as subsonicServer from '../subsonic/subsonic-server.js';
 import { getDirname } from './esm-helpers.js';
 import { launchWorker } from './worker-process.js';
 import { invalidateWhitelistCache } from './admin-network.js';
-import { updateJsonAtomic, completedWrites } from './atomic-json.js';
+import { updateJsonAtomic, completedWrites, readJsonFile } from './atomic-json.js';
 
 const __dirname = getDirname(import.meta.url);
 
@@ -43,7 +43,7 @@ const __dirname = getDirname(import.meta.url);
 const loaded = new WeakMap();   // returned object -> { file, base (deep clone), writes }
 
 export async function loadFile(file) {
-  const doc = JSON.parse(await fs.readFile(file, 'utf-8'));
+  const doc = await readJsonFile(file);
   if (doc && typeof doc === 'object') {
     loaded.set(doc, { file: path.resolve(file), base: structuredClone(doc), writes: completedWrites(file) });
   }
@@ -82,9 +82,29 @@ function mergeChanges(current, base, mine) {
   return out;
 }
 
+// ── One-time onboarding marker ───────────────────────────────────────────────
+
+// Written the moment the FIRST library or FIRST user lands (both call this;
+// it self-no-ops after the first write). The launcher reads the raw config
+// file for this flag to decide whether to auto-open the setup wizard, and
+// the boot log's setup invitation keys off it too — one source of truth the
+// SERVER owns; the wizard itself never touches the config. updateJsonAtomic
+// so a racing settings save can't resurrect a pre-write document. The
+// in-memory mirror keeps this boot's invitation logic coherent without a
+// reboot; no reboot is requested — nothing running consumes the flag live.
+export async function markSetupComplete() {
+  if (config.program.setupComplete) { return; }
+  config.program.setupComplete = true;
+  await updateJsonAtomic(config.configFile, (current) => {
+    current.setupComplete = true;
+    return current;
+  });
+  winston.info('First-run setup marker written (setupComplete: true)');
+}
+
 // ── Directory / Library management (now in SQLite) ──────────────────────────
 
-export async function addDirectory(directory, vpath, autoAccess, isAudioBooks, mstream) {
+export async function addDirectory(directory, vpath, autoAccess, isAudioBooks, followSymlinks, mstream) {
   const stat = await fs.stat(directory);
   if (!stat.isDirectory()) { throw new Error(`${directory} is not a directory`); }
 
@@ -93,14 +113,16 @@ export async function addDirectory(directory, vpath, autoAccess, isAudioBooks, m
 
   const d = db.getDB();
   const type = isAudioBooks ? 'audio-books' : 'music';
-  // follow_symlinks is explicitly set to 0 here rather than relying
-  // on the column default: dev hosts that ran an earlier V21 variant
-  // (nullable column, no DEFAULT) would otherwise get NULL on new
-  // INSERTs. Reader code in task-queue.js is null-safe (`=== 1`) but
-  // we'd rather not leave dangling NULLs in the table.
+  // follow_symlinks is set explicitly (0 or 1, never omitted) rather
+  // than relying on the column default: dev hosts that ran an earlier
+  // V21 variant (nullable column, no DEFAULT) would otherwise get NULL
+  // on new INSERTs. Reader code in task-queue.js is null-safe (`=== 1`)
+  // but we'd rather not leave dangling NULLs in the table. Taking the
+  // flag at creation (not via a follow-up edit) matters because the
+  // caller queues the first scan immediately after this returns.
   const result = d.prepare(
-    'INSERT INTO libraries (name, root_path, type, follow_symlinks) VALUES (?, ?, ?, 0)'
-  ).run(vpath, directory, type);
+    'INSERT INTO libraries (name, root_path, type, follow_symlinks) VALUES (?, ?, ?, ?)'
+  ).run(vpath, directory, type, followSymlinks === true ? 1 : 0);
   const libraryId = Number(result.lastInsertRowid);
 
   if (autoAccess === true) {
@@ -112,6 +134,7 @@ export async function addDirectory(directory, vpath, autoAccess, isAudioBooks, m
   }
 
   db.invalidateCache();
+  await markSetupComplete();
 
   // Add to express routing
   mstream.use(`/media/${vpath}/`, express.static(directory));
@@ -283,6 +306,7 @@ export async function addUser(username, password, admin, vpaths, allowMkdir, all
   }
 
   db.invalidateCache();
+  await markSetupComplete();
 }
 
 export async function deleteUser(username) {
@@ -716,6 +740,17 @@ export async function editRotationDays(val) {
   loadConfig.discoveryP2p.rotationDays = val;
   await saveFile(loadConfig, config.configFile);
   config.program.discoveryP2p.rotationDays = val;
+}
+
+// RSS ceiling (MB) for the sidecar memory watchdog (0 = watchdog off).
+// Live: the mesh-health watch reads the config fresh every tick, so the
+// next tick enforces the new ceiling — no restart, no stack bounce.
+export async function editSidecarMaxRssMb(val) {
+  const loadConfig = await loadFile(config.configFile);
+  if (!loadConfig.discoveryP2p) { loadConfig.discoveryP2p = {}; }
+  loadConfig.discoveryP2p.sidecarMaxRssMb = val;
+  await saveFile(loadConfig, config.configFile);
+  config.program.discoveryP2p.sidecarMaxRssMb = val;
 }
 
 // Append a bootstrap peer (deduplicated) so a friend joined through the

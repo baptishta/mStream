@@ -199,7 +199,9 @@ describe('discovery p2p — route gating (no sidecar needed)', () => {
       ['POST', 'peer-dbs/fetch', { endpointId: 'a'.repeat(64) }],
       ['POST', 'peer-dbs/remove', { endpointId: 'a'.repeat(64) }],
       ['POST', 'description', { description: 'nope' }],
+      ['POST', 'sidecar-max-rss', { sidecarMaxRssMb: 512 }],
       ['GET', 'catalog', undefined],
+      ['GET', 'activity', undefined],
     ]) {
       const r = await fetch(`${server.baseUrl}/api/v1/admin/discovery/p2p/${route}`, {
         method,
@@ -226,6 +228,41 @@ describe('discovery p2p — enabled, validation contract', () => {
     const r = await fetch(`${server.baseUrl}/api/v1/ping`);
     assert.equal(r.status, 200);
     assert.equal((await r.json()).discoveryP2p, true);
+  });
+
+  test('status exposes neighborIds as an array — empty with no mesh', async () => {
+    // The panel's mesh map renders from this; before any peer joins (or
+    // where no sidecar binary exists at all) it must be a clean [] rather
+    // than absent, so the SVG math never branches on undefined.
+    const s = await (await fetch(`${server.baseUrl}/api/v1/admin/discovery/p2p/status`)).json();
+    assert.ok(Array.isArray(s.neighborIds), 'neighborIds is always an array');
+    assert.equal(s.neighborIds.length, 0, 'no mesh yet — nobody listed');
+  });
+
+  test('sidecar-max-rss: a valid ceiling saves live and reads back; junk is 400', async () => {
+    const url = `${server.baseUrl}/api/v1/admin/discovery/p2p/sidecar-max-rss`;
+    const post = (body) => fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    const ok = await post({ sidecarMaxRssMb: 384 });
+    assert.equal(ok.status, 200);
+    let s = await (await fetch(`${server.baseUrl}/api/v1/admin/discovery/p2p/status`)).json();
+    assert.equal(s.watchdog.maxRssMb, 384, 'the watchdog ceiling reflects the write immediately');
+
+    // 0 is the documented off switch, not an error.
+    assert.equal((await post({ sidecarMaxRssMb: 0 })).status, 200);
+    s = await (await fetch(`${server.baseUrl}/api/v1/admin/discovery/p2p/status`)).json();
+    assert.equal(s.watchdog.maxRssMb, 0, '0 = watchdog off');
+
+    for (const body of [{}, { sidecarMaxRssMb: -1 }, { sidecarMaxRssMb: 1.5 },
+      { sidecarMaxRssMb: 'lots' }, { sidecarMaxRssMb: 100001 }]) {
+      const r = await post(body);
+      assert.equal(r.status, 400, `body ${JSON.stringify(body)} should be 400`);
+    }
+    s = await (await fetch(`${server.baseUrl}/api/v1/admin/discovery/p2p/status`)).json();
+    assert.equal(s.watchdog.maxRssMb, 0, 'rejected writes change nothing');
   });
 
   test('publish and announce are 404 until an export snapshot has been built', async () => {
@@ -377,6 +414,29 @@ describe('discovery p2p — enabled, validation contract', () => {
     assert.equal(heard.payload.hash, ann.hash);
     assert.equal(heard.payload.name, 'Gossip Test Server');
     assert.ok(Number.isInteger(heard.payload.snapshotSeq));
+
+    // The server saw the same link from its side: the peer's endpoint id
+    // shows up in status.neighborIds (the panel's mesh map draws from
+    // this). Event-tracked, so poll — the neighbor event may land a beat
+    // after the announcement round-trips.
+    const withNeighbor = await pollUntil(async () => {
+      const s = await (await fetch(api('status'))).json();
+      return s.neighborIds.includes(peer.endpointId) ? s : null;
+    }, { what: 'the peer to appear in status.neighborIds' });
+    assert.ok(withNeighbor.neighbors >= 1, 'the count agrees a link exists');
+
+    // And the Activity feed heard about it: the dedicated p2p log ring
+    // carries the neighbor-up line — and ONLY prefixed discovery lines,
+    // even though this server has logged plenty of non-discovery lines
+    // since boot (the wash-in negative control).
+    const activity = await (await fetch(api('activity'))).json();
+    assert.ok(activity.entries.length > 0, 'the feed has entries');
+    assert.ok(activity.entries.every((e) => /^\[(discovery-|p2p-sidecar)/.test(e.message)),
+      'every feed entry is a discovery/p2p line — boot noise stays out');
+    assert.ok(activity.entries.some((e) =>
+      e.message.includes('mesh neighbor up') && e.message.includes(peer.endpointId.slice(0, 12))),
+    'the neighbor-up event for this peer is in the feed');
+    assert.ok(Number.isInteger(activity.lastSeq), 'delta-poll cursor present');
 
     // Ticketless fetch: hash + provider from the announcement, address
     // resolution via the peer's memory lookup (seeded by the join ticket).
@@ -1836,5 +1896,149 @@ describe('discovery seeds — unreachable list degrades gracefully', () => {
 
     // Idempotence: enabling while enabled is a clean no-op.
     assert.equal((await post('enabled', { enabled: true })).status, 200);
+  });
+});
+
+// ── Catalog listing: incompatible-model peers hide by default ────────────────
+// The "Stranger" filter: test networks' throwaway announcements (name
+// "Stranger", modelId test-model — the 2026-07-27 ghosts, and any test agent
+// still announcing) carry a model that cannot power this server's similar
+// search, so the catalog listing hides them by default instead of cluttering
+// every real panel. Held peers always show (they occupy the operator's
+// shelf), ?includeIncompatible=1 shows everything (the blocklist needs
+// eyes on the full catalog), and — covered by the suites above, where no
+// local model is ever established — unknown compatibility hides nothing.
+(SIDECAR_BIN ? describe : describe.skip)('discovery p2p — catalog hides incompatible-model peers', () => {
+  let server;
+  let dir;
+  let musicDir;
+  let strangerNode;
+  let friendNode;
+
+  // One embed-eligible (≥30s) track, so the collect pass actually runs and
+  // establishes the local model — the shared fixtures are all short tones,
+  // which leaves embedding_model_id unset forever (the zero-touch suite's
+  // writeSineWav precedent; the helper is scoped there, so a local copy).
+  function writeLongTone(filePath, seconds) {
+    const rate = 8000;
+    const n = rate * seconds;
+    const data = Buffer.alloc(n * 2);
+    for (let i = 0; i < n; i++) {
+      data.writeInt16LE(Math.round(Math.sin((2 * Math.PI * 440 * i) / rate) * 12000), i * 2);
+    }
+    const header = Buffer.alloc(44);
+    header.write('RIFF', 0); header.writeUInt32LE(36 + data.length, 4);
+    header.write('WAVE', 8); header.write('fmt ', 12);
+    header.writeUInt32LE(16, 16); header.writeUInt16LE(1, 20); header.writeUInt16LE(1, 22);
+    header.writeUInt32LE(rate, 24); header.writeUInt32LE(rate * 2, 28);
+    header.writeUInt16LE(2, 32); header.writeUInt16LE(16, 34);
+    header.write('data', 36); header.writeUInt32LE(data.length, 40);
+    fs.writeFileSync(filePath, Buffer.concat([header, data]));
+  }
+  const catalogOf = async (all) => {
+    const r = await fetch(
+      `${server.baseUrl}/api/v1/admin/discovery/p2p/catalog${all ? '?includeIncompatible=1' : ''}`);
+    return r.json();
+  };
+
+  before(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mstream-p2p-compat-'));
+    musicDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mstream-p2p-compat-lib-'));
+    writeLongTone(path.join(musicDir, 'long-tone.wav'), 35);
+    server = await startServer({
+      dlnaMode: 'disabled',
+      waitForScan: true, // the scan's collect pass establishes the local model
+      extraFolders: { compatlib: musicDir },
+      extraConfig: {
+        discoveryP2p: { enabled: true, serverName: 'Compat Filter Server' },
+        scanOptions: { collectDiscoveryData: true, discoveryModel: 'test-fake' },
+      },
+    });
+    strangerNode = new RawSidecar(SIDECAR_BIN, path.join(dir, 'stranger'));
+    friendNode = new RawSidecar(SIDECAR_BIN, path.join(dir, 'friend'));
+    await strangerNode.ready;
+    await friendNode.ready;
+
+    const status = await pollUntil(async () => {
+      const s = await (await fetch(`${server.baseUrl}/api/v1/admin/discovery/p2p/status`)).json();
+      return s.running && s.ticket ? s : null;
+    }, { what: 'server sidecar to boot' });
+    for (const node of [strangerNode, friendNode]) {
+      await node.rpc('join', { bootstrap: [status.ticket] });
+      await node.waitForEvent('neighbor', (e) => e.up === true);
+    }
+
+    // The Stranger publishes a REAL (fetchable, valid) snapshot so the
+    // held-peers-always-show rule can be proven end to end below.
+    const snap = makeSnapshotFile(path.join(dir, 'stranger.db'), {
+      modelId: 'test-model',
+      tracks: [{ artist: 'Ghost', title: 'Ghost Song', vec: [1, 0, 0, 0] }],
+    });
+    const pub = await strangerNode.rpc('publish', { path: snap });
+    await strangerNode.rpc('announce', {
+      payload: { hash: pub.hash, size: pub.size, rowCount: 1,
+        modelId: 'test-model', modelVersion: '1', snapshotSeq: 1, name: 'Stranger' },
+    });
+
+    // The embed pass establishes the local model well after waitForScan
+    // returns (enrichment drains in the background — the zero-touch suite's
+    // 90s precedent). Read the ESTABLISHED id from the route rather than
+    // assuming what test-fake stores, then announce the compatible peer
+    // with exactly that id — the compatibility contract under test, free of
+    // model-naming assumptions.
+    const localModelId = await pollUntil(async () => (await catalogOf(true)).localModelId,
+      { timeoutMs: 90000, what: 'the embed pass to establish the local model' });
+    assert.notEqual(localModelId, 'test-model', 'the Stranger must be genuinely incompatible');
+    await friendNode.rpc('announce', {
+      payload: { hash: 'f'.repeat(64), size: 4096, rowCount: 9,
+        modelId: localModelId, modelVersion: '1', snapshotSeq: 1, name: 'Friendly Peer' },
+    });
+
+    // Both announcements ingested — checked through the unfiltered view so
+    // the wait cannot depend on the filter under test.
+    await pollUntil(async () => {
+      const names = (await catalogOf(true)).peers.map((p) => p.payload.name);
+      return names.includes('Stranger') && names.includes('Friendly Peer') ? true : null;
+    }, { what: 'both announcements in the catalog' });
+  });
+
+  after(async () => {
+    if (strangerNode) { await strangerNode.stop(); }
+    if (friendNode) { await friendNode.stop(); }
+    if (server) { await server.stop(); }
+    if (dir) { fs.rmSync(dir, { recursive: true, force: true }); }
+    if (musicDir) { fs.rmSync(musicDir, { recursive: true, force: true }); }
+  });
+
+  test('the default listing hides the incompatible peer and counts it', async () => {
+    const c = await catalogOf(false);
+    const names = c.peers.map((p) => p.payload.name);
+    assert.ok(names.includes('Friendly Peer'), 'the compatible peer is listed');
+    assert.ok(!names.includes('Stranger'), 'the incompatible peer is hidden');
+    assert.equal(c.hiddenIncompatible, 1, 'and the panel is told how many it is not seeing');
+  });
+
+  test('?includeIncompatible=1 shows everything, correctly labeled', async () => {
+    const c = await catalogOf(true);
+    const stranger = c.peers.find((p) => p.payload.name === 'Stranger');
+    const friend = c.peers.find((p) => p.payload.name === 'Friendly Peer');
+    assert.ok(stranger, 'the incompatible peer is visible on request');
+    assert.equal(stranger.compatible, false);
+    assert.equal(friend.compatible, true);
+    assert.equal(c.hiddenIncompatible, 0, 'nothing hidden in the full view');
+  });
+
+  test('a HELD incompatible peer always shows — hiding owned shelf state would mislead', async () => {
+    const r = await fetch(`${server.baseUrl}/api/v1/admin/discovery/p2p/peer-dbs/fetch`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ endpointId: strangerNode.endpointId }),
+    });
+    assert.equal(r.status, 200, `manual fetch of the Stranger snapshot failed: ${await r.text()}`);
+
+    const c = await catalogOf(false);
+    const stranger = c.peers.find((p) => p.payload.name === 'Stranger');
+    assert.ok(stranger, 'held: visible despite the incompatible model');
+    assert.ok(stranger.fetched, 'and marked as on the shelf');
+    assert.equal(c.hiddenIncompatible, 0, 'nothing left hidden once the only incompatible peer is held');
   });
 });

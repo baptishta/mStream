@@ -570,6 +570,12 @@ export function setup(mstream) {
       ticket: discoveryP2p.getEndpointTicket(),
       joined,
       neighbors,
+      // Who those neighbors are (endpoint ids), tracked from the sidecar's
+      // neighbor events. Bounded by the gossip fan-out (hyparview active
+      // view), so never more than a handful. The panel's mesh map joins
+      // these against the catalog for names; `neighbors` above (the
+      // sidecar's own count) stays the authority for how many.
+      neighborIds: discoveryP2p.getNeighborIds(),
       // Sidecar memory + watchdog posture (#885): lastRssMb is the
       // mesh-health watch's most recent reading (null before the first
       // tick or where RSS can't be read), restarts counts watchdog kills
@@ -593,6 +599,16 @@ export function setup(mstream) {
       peerRetentionDays: config.program.discoveryP2p.peerRetentionDays,
       blockedPeers: config.program.discoveryP2p.blockedPeers,
     });
+  });
+
+  // The Discovery panel's Activity feed: the discovery/p2p slice of the log
+  // stream from its own fixed-size ring (logger.js) — mesh joins, snapshot
+  // fetches, rotation and recovery lines, immune to wash-out from chatty
+  // non-discovery logging. Same delta-poll contract as /admin/logs/recent;
+  // the two endpoints' seq cursors are independent.
+  mstream.get("/api/v1/admin/discovery/p2p/activity", (req, res) => {
+    requireP2pEnabled();
+    res.json(logger.getP2pActivity(req.query.since));
   });
 
   // The catalog: every peer we've heard a signed announcement from (newest
@@ -628,8 +644,22 @@ export function setup(mstream) {
     }).sort((a, b) => (b.seeders - a.seeders)
       || (b.online - a.online)
       || ((b.payload.rowCount || 0) - (a.payload.rowCount || 0)));
+    // Hide-by-default: an UNHELD catalog peer whose announced model cannot
+    // power the local similar search is dead weight in the listing — and
+    // test networks' throwaway announcements (the "Stranger" ghosts,
+    // modelId test-model) land exactly in this class, so they stop
+    // cluttering real servers' panels. Held/pinned peers always show
+    // (they occupy the operator's shelf; hiding owned state would
+    // mislead), unknown compatibility (no local model yet) hides nothing,
+    // and ?includeIncompatible=1 shows everything — the blocklist and
+    // debugging still need eyes on the full catalog.
+    const includeIncompatible = req.query.includeIncompatible === '1';
+    const visible = includeIncompatible
+      ? peers
+      : peers.filter((peer) => peer.compatible !== false || peer.fetched !== null);
     res.json({
-      peers,
+      peers: visible,
+      hiddenIncompatible: peers.length - visible.length,
       localModelId: localModel,
       autoFetch: config.program.discoveryP2p.autoFetch,
       storage: {
@@ -839,6 +869,21 @@ export function setup(mstream) {
     });
     joiValidate(schema, req.body);
     await admin.editRotationDays(req.body.rotationDays);
+    res.json({});
+  });
+
+  // RSS ceiling (MB) for the sidecar memory watchdog (#885); 0 turns the
+  // watchdog off. Live: the mesh-health watch reads the config fresh every
+  // tick, so the next tick enforces the new ceiling — no restart and no
+  // stack bounce. Bounds mirror the config Joi
+  // (discoveryP2pOptions.sidecarMaxRssMb).
+  mstream.post("/api/v1/admin/discovery/p2p/sidecar-max-rss", async (req, res) => {
+    requireP2pEnabled();
+    const schema = Joi.object({
+      sidecarMaxRssMb: Joi.number().integer().min(0).max(100000).required(),
+    });
+    joiValidate(schema, req.body);
+    await admin.editSidecarMaxRssMb(req.body.sidecarMaxRssMb);
     res.json({});
   });
 
@@ -1129,7 +1174,11 @@ export function setup(mstream) {
       // direct-API bypass. vpaths are URL path segments, so slug-only.
       vpath: Joi.string().pattern(/^[a-zA-Z0-9-]+$/).required(),
       autoAccess: Joi.boolean().default(false),
-      isAudioBooks: Joi.boolean().default(false)
+      isAudioBooks: Joi.boolean().default(false),
+      // Set at creation rather than via the follow-symlinks route so the
+      // FIRST scan (queued right below) already honors it — a post-add
+      // flag write races that scan and loses.
+      followSymlinks: Joi.boolean().default(false)
     });
     const input = joiValidate(schema, req.body);
 
@@ -1138,6 +1187,7 @@ export function setup(mstream) {
       input.value.vpath,
       input.value.autoAccess,
       input.value.isAudioBooks,
+      input.value.followSymlinks,
       mstream);
     res.json({});
 
@@ -1654,12 +1704,16 @@ export function setup(mstream) {
       check: Joi.boolean(),
       mode: Joi.string().valid('notify', 'stage', 'auto'),
       skipVersion: Joi.string().pattern(/^\d+\.\d+\.\d+$/).allow(''),
-    }).or('check', 'mode', 'skipVersion');
+      // Operator override for boot-failure holds (the launcher's watchdog
+      // rolled an update back): drop them all and let the next check retry.
+      clearHold: Joi.boolean(),
+    }).or('check', 'mode', 'skipVersion', 'clearHold');
     joiValidate(schema, req.body);
 
     if (req.body.check !== undefined) { await admin.editUpdatesCheck(req.body.check); }
     if (req.body.mode !== undefined) { await admin.editUpdatesMode(req.body.mode); }
     if (req.body.skipVersion !== undefined) { await admin.editUpdatesSkipVersion(req.body.skipVersion); }
+    if (req.body.clearHold === true) { await updateCheck.clearHolds(); }
     updateCheck.onSettingsChanged();
     res.json({});
   });

@@ -5,6 +5,7 @@
 import { watchSupervisorStdin } from './src/util/supervision.js';
 import { maybeRunWorker } from './src/util/worker-process.js';
 import { resolveDefaultConfig, ensureDesktopDefaultConfig } from './src/util/boot-config.js';
+import { guardHeadlessBoot } from './src/util/boot-watchdog.js';
 import pkg from './package.json' with { type: 'json' };
 
 const version = pkg.version;
@@ -26,7 +27,29 @@ if (await maybeRunWorker()) {
   // --portable is pre-scanned because it changes WHERE the default resolves,
   // which the parser needs for its help text.
   const resolved = resolveDefaultConfig({ portable: process.argv.includes('--portable') });
-  const { json, supervised, quickConnectOffByDefault } = parseArgs(process.argv.slice(2), resolved.path);
+  const { json, supervised, bootProbe, quickConnectOffByDefault } = parseArgs(process.argv.slice(2), resolved.path);
+
+  // The installers' deep pre-flip probe (src/util/boot-probe.js): validate
+  // that THIS build would boot with THIS machine's config and database,
+  // print the sentinel, and exit — before the first-run config generation
+  // below (the probe must never create anything) and before the boot
+  // watchdog (a probe is not a boot attempt, same purity rule as -V).
+  if (bootProbe) {
+    const probe = await import('./src/util/boot-probe.js');
+    await probe.runBootProbe(json); // exits; never returns
+  }
+
+  // Headless boot watchdog (src/util/boot-watchdog.js): on a managed
+  // install whose committed version keeps crashing during boot, roll
+  // `current` back and hand this invocation to the previous version's
+  // binary — in which case this await never resolves (exec semantics: the
+  // child inherits our stdio and its exit exits us). Sits HERE on purpose:
+  // after parseArgs, so the installers' `-V` exec probe stays pure and
+  // never touches the attempt counter, and before the config/db/module
+  // work where boot crashes actually happen. Supervised (tray-launcher)
+  // boots skip it — the launcher's own watchdog owns that recovery with
+  // better signals.
+  if (!supervised) { await guardHeadlessBoot(process.argv.slice(2)); }
 
   // First run of a standalone binary with no explicit config: create the
   // desktop-profile config (storage under the data home, Quick Connect on
@@ -76,6 +99,7 @@ if (await maybeRunWorker()) {
 function parseArgs(args, defaultJson) {
   let json = defaultJson;
   let supervised = false;
+  let bootProbe = false;
   let quickConnectOffByDefault = false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -102,11 +126,20 @@ Options:
   --supervised         exit when the launching process closes stdin (for
                        supervisors that run mStream as a managed child and
                        hold its stdin pipe open)
+  --boot-probe         check that this build would boot with this machine's
+                       config and database, print a "boot-probe:" line, and
+                       exit 0/1 without starting anything (the installers
+                       run this before switching an install to a new
+                       version)
   -h, --help           display help for command`);
       process.exit(0);
     }
     if (arg === '--supervised') {
       supervised = true;
+      continue;
+    }
+    if (arg === '--boot-probe') {
+      bootProbe = true;
       continue;
     }
     if (arg === '--portable') {
@@ -134,5 +167,5 @@ Options:
     console.error(`error: unknown option '${arg}'`);
     process.exit(1);
   }
-  return { json, supervised, quickConnectOffByDefault };
+  return { json, supervised, bootProbe, quickConnectOffByDefault };
 }

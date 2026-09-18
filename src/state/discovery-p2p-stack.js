@@ -17,8 +17,6 @@ let running = false;
 let starting = null;
 let stopping = null;
 
-export function isStackRunning() { return running; }
-
 // Crash-recovery state for the status route / admin panel. `attempts` spans
 // crash -> recovered (cancelRecovery zeroes it on success, stop, or
 // disable), so attempts > 0 reads as "recovery owns the sidecar right now";
@@ -91,6 +89,27 @@ function scheduleRecovery(why) {
       });
   }, delay);
   if (recoveryTimer.unref) { recoveryTimer.unref(); }
+}
+
+// Boot's catch calls this when the FIRST start of the session failed. The
+// ladder normally arms only after a start has succeeded (`running` = intent
+// was established), which left a transient boot failure — a flaky sidecar
+// download on a fresh install, a briefly wedged data dir, a slow relay
+// handshake past the ready timeout — disabling the feature for the whole
+// session: the last remaining path to "config says enabled, nothing
+// running, nothing retrying" (#880's open item 1). The config IS the
+// operator's intent at boot, so when it says enabled, a failed boot start
+// deserves the same never-give-up walk a crash gets. Setting `running`
+// before scheduling is honest under #881's semantics (running = intent) and
+// lets every existing guard do its job: the config gate vetoes if the
+// operator disables meanwhile, cancelRecovery clears on stop, and the
+// status route reports "reconnecting, attempt N" instead of the ambiguous
+// "not joined yet".
+export function armBootRetry(why) {
+  if (running || starting || stopping) { return; } // a later start beat us — nothing to arm
+  if (config.program.discoveryP2p.enabled !== true) { return; }
+  running = true;
+  scheduleRecovery(why);
 }
 
 export async function startDiscoveryP2pStack() {

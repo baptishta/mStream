@@ -8,7 +8,11 @@ runtime — no Node.js install.
 
 A bundle is a **folder**, not a single file: the desktop launcher, the server
 binary (`mstream-server`), `webapp/` (the UI), and `bin/` (sidecar binaries).
-Keep them together; the bundle itself can live anywhere.
+macOS bundles also carry `console/Ghostty.app` — a pinned, untouched copy of
+the [Ghostty](https://ghostty.org) terminal (MIT; its license ships beside it)
+that the tray's setup wizard opens in, because Apple's Terminal.app can't
+draw the wizard's pixel artwork. Keep them together; the bundle itself can
+live anywhere.
 
 ## Install with one command
 
@@ -43,34 +47,78 @@ mirrors). Older versions are kept beside `current` for rollback — once mStream
 is no longer running from one, delete it whenever you like.
 
 Re-running to upgrade re-points the app-menu / Start Menu entry and the
-login item at the new version, but never stops a running mStream: Quit it
-from the tray icon and start it again to switch. A copy you extracted by hand
-somewhere else (or run with `--portable`) is left untouched — the script only
-manages its own folder.
+login item at the new version — and if the tray app is running from a copy
+the script manages, it restarts itself into the new version within a
+minute (the script only asks; the tray performs its usual graceful stop
+and takeover — set `MSTREAM_NO_RELAUNCH=1` to leave it on the old version
+until you restart it yourself). The macOS `.pkg` and Windows `setup.exe`
+do the equivalent themselves. What is never touched: a headless
+`mstream-server` you started (any installer only ever tells you about it),
+and a copy you extracted by hand somewhere else (or run with `--portable`)
+— the script only manages its own folder.
 
 ## Automatic updates
 
 mStream checks the release feed once a day (plus once shortly after boot)
-and, by default, **downloads new versions in the background and applies them
-on the next restart**: installs made by the one-liner stage the new version
-beside the running one and flip `current`, so any restart — the tray menu,
-a reboot, a service restart — lands on it. Windows `setup.exe` installs
-download the verified installer; applying it is one click. The admin panel's
-About page shows the state and holds the controls:
+and, by default, **updates itself**: new versions download in the
+background, stage beside the running one behind `current`, and apply on
+their own once the server is genuinely idle — nothing streaming, no scan
+running, and a quiet stretch (about ten minutes) since the last request,
+so a restart never lands under someone actively browsing. Under the tray
+app the restart is seamless; a `.pkg` install downloads the verified
+installer and waits for your click (Installer.app needs a human). The
+admin panel's About page shows the state and holds the controls:
 
-- `updates.mode` — `notify` (report only, download nothing), `stage`
-  (the default, described above), or `auto` (additionally restart into the
-  update once the server is idle — no active streams, no scan running).
-  On a headless install, `auto` exits with code 0 after staging and expects
-  a process supervisor (systemd, pm2) configured to start mStream again.
+- `updates.mode` — `auto` (the default, described above), `stage`
+  (download and stage only; applying takes a restart or a click — the
+  previous default), or `notify` (report only, download nothing). A mode
+  set in the config stays exactly as set — the default only fills the
+  blank. On a headless install, `auto` applies by exiting with code 0 so
+  the process supervisor's restart lands on the new version — but only
+  when a supervisor that restarts on a clean exit is actually detectable:
+  pm2, or systemd with `Restart=always`/`on-success` (the default
+  `Restart=no` and `on-failure` don't restart an exit 0, so they don't
+  count). For supervisors mStream can't see — a docker `--restart` policy,
+  runit, your own wrapper loop — set `MSTREAM_SUPERVISED=1`. With nothing
+  detected, `auto` behaves like `stage` and says so in the log and the
+  admin panel: exiting would be an outage, not an apply.
 - `updates.check` — set `false` and mStream never phones home; the admin
   panel's "check now" button still works on demand.
+
+Auto became the default only once the whole recovery ladder was in place:
+a release is sha256-verified and boot-probed **before** it can take over a
+working install, and one that still crashes at first boot is rolled back
+and held automatically — by the tray app on desktops, by the server binary
+itself headless — until a newer release ships. A bad release followed by a
+fixed one heals end to end with no operator action.
 
 The check and the downloads honor `MSTREAM_RELEASE_BASE` for mirrors, verify
 every download against the release's `manifest.json` sha256s, and only ever
 stage into layouts the installer owns: package-manager installs (deb/rpm,
 the macOS `.pkg`), Docker, npm, and hand-extracted copies are told about
-updates but never touched.
+updates but never touched. Before switching an install to a freshly
+extracted version, the installers probe it twice: `-V` (does the binary
+run here at all) and `--boot-probe` (would it actually *boot* — the new
+build loads its module graph, runs your existing config through its
+schema, and opens the database read-only, all without writing anything).
+A version that fails either probe never takes over a working install: the
+stage fails loudly and the next release retries.
+
+If an applied update crashes before it ever serves, the desktop launcher's
+**boot watchdog** rolls it back on its own: after a failed retry it
+re-points `current` at the previous version (kept on disk for exactly this),
+restores the `~/Applications` copy on macOS, relaunches, and records the
+failed version in `update-hold.json` so the daily check doesn't re-stage it.
+The admin panel shows the held version; the hold clears automatically the
+moment a release newer than it ships (or by hand via the panel's
+"clear hold & retry"). Headless installs have their own watchdog built into
+the server binary itself: it counts boot attempts before any of the work
+that can crash, and on the third failed boot of the version `current` is
+committed to, it rolls `current` back, records the hold, and hands that
+very invocation over to the previous version's binary — no supervisor
+required (set `MSTREAM_BOOT_WATCHDOG=0` to disable it). The server-side
+guards back both watchdogs up: a held version is never staged or applied,
+and a `current` link left on one is re-pointed at the running version.
 
 Rolling back? Re-run the installer with `MSTREAM_VERSION=<old tag>`, restart,
 and then **skip the bad release** (the admin panel's skip link, or
@@ -91,9 +139,23 @@ directly, with `manifest.json` holding their sha256s:
 Windows, `mStream.app` on macOS, `mstream-desktop` on Linux — starts the
 server in the background, puts an mStream icon in your tray / menu bar
 (a status line — "Running · up 3h 12m", or Starting… / Stopped — then Open
-mStream · Quick Connect · Start at login · View logs · Restart server · Quit),
-and opens your browser at the player. Start-at-login is on by default; one
-click in the tray menu turns it off.
+Admin Panel · Quick Connect · Start at login · View logs ·
+Restart server · Quit). Boots are quiet once set up — re-click the app icon
+(or launch it again) whenever you want the player in your browser. Start-at-login
+is on by default; one click in the tray menu turns it off. On a **first
+install** the tray opens the guided setup wizard by itself (the bundled
+`mstream-player setup` — music folders, admin account, extras) in a real
+terminal: the bundled mStream console (Ghostty, with the mStream Dock icon)
+on macOS, which draws the wizard's artwork and Quick Connect QR as real
+pixels; Terminal.app without the console, and Windows Terminal on Windows.
+The wizard is one-time onboarding — the server records `setupComplete` in
+its config the moment the first folder or account lands, and everything
+after that lives in the admin panel. **Quick Connect** opens the same way on macOS and Windows —
+the wizard's pairing page (a scannable pixel QR plus the app links) in a
+terminal window; on Linux, or when an install has no player binary, it opens
+the web player's Quick Connect modal instead. Headless installs get the
+setup invitation as a boot log line whenever the server has no folders and
+no accounts yet.
 
 **Terminal users lose nothing.** The same desktop binary run from a terminal
 behaves exactly like the server itself (same flags, output, and exit codes) —

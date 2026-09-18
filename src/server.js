@@ -11,6 +11,7 @@ import https from 'https';
 import net from 'net';
 import crypto from 'crypto';
 import { dataRoot, usingFallbackDataRoot } from './util/esm-helpers.js';
+import { installedPlayerPath, playerLoadableHere } from './util/mstream-player-bootstrap.js';
 
 import * as dbApi from './api/db.js';
 import * as discoveryApi from './api/discovery.js';
@@ -57,10 +58,12 @@ import * as lyricsLrclib from './api/lyrics-cache.js';
 import * as backupApi from './api/backup.js';
 import * as backupManager from './backup/manager.js';
 // Velvet UI modules — dynamically imported only when ui='velvet' is active
-import WebError from './util/web-error.js';
+import { classifyError } from './util/web-error.js';
 import { isAdminAllowed } from './util/admin-network.js';
 import { writeJsonAtomic, completedWrites } from './util/atomic-json.js';
+import * as adminUtil from './util/admin.js';
 import * as updateCheck from './util/update-check.js';
+import * as bootWatchdog from './util/boot-watchdog.js';
 
 import packageJson from '../package.json' with { type: 'json' };
 
@@ -102,6 +105,10 @@ let configWritesAtRead = 0;
 // = "not fully booted yet", which idle() treats as busy — auto-apply never
 // fires into a half-started server).
 let taskQueueMod = null;
+// When a request last touched this server (the auto-update idle gate's
+// quiet-window clock — see the middleware that maintains it). Module scope
+// on purpose: a soft reboot() must not reset a user's recency to zero.
+let lastUserRequestAt = Date.now();
 // Bumped by every reboot(); each request tags its socket with the generation
 // serving it, so reboot()'s grace-period sweep can tell "still busy with an
 // OLD-app response" (destroy: that handler must not live on) from "idle
@@ -209,9 +216,14 @@ export async function serveIt(configFile, { relisten = null } = {}) {
     // (Desktop-launch users see the launcher's own boot-failure dialog; this
     // message is what its server log carries.)
     const denied = err.code === 'EROFS' || err.code === 'EACCES' || err.code === 'EPERM';
+    // EJSONPARSE (util/atomic-json.js readJsonFile): the config file itself
+    // is broken JSON — say so with the path, don't bury it under the generic
+    // validate line (a hand-edited config on Windows is the common case).
     winston.error(denied
       ? `mStream could not start — it can't write to ${configFile}: the location is read-only or permission was denied (${err.message})`
-      : 'Failed to validate config file', { stack: err });
+      : err.code === 'EJSONPARSE'
+        ? `mStream could not start — config file ${err.message}`
+        : 'Failed to validate config file', { stack: err });
     process.exit(1);
   }
 
@@ -357,6 +369,22 @@ export async function serveIt(configFile, { relisten = null } = {}) {
     );
     next();
   });
+  // Activity clock for auto-update's idle gate (update-check.js): an auto
+  // restart must wait out a QUIET window, not just "no bytes in flight" —
+  // an actively browsing user has no in-flight response at most instants.
+  // Every request refreshes the clock EXCEPT the admin card's own
+  // update-status poll (GET /api/v1/admin/update, every 5s while the About
+  // page is open): the surface that DISPLAYS an update must never be the
+  // reason it cannot apply. An idle player tab makes no periodic requests
+  // (the jukebox and server-audio polls only run while those modes are in
+  // use — which genuinely is activity), so an open-but-abandoned tab goes
+  // quiet on its own.
+  mstream.use((req, res, next) => {
+    if (!(req.method === 'GET' && req.path === '/api/v1/admin/update')) {
+      lastUserRequestAt = Date.now();
+    }
+    next();
+  });
   // Trust Proxy
   if (config.program.trustProxy) {
     mstream.set("trust proxy", true);
@@ -371,6 +399,26 @@ export async function serveIt(configFile, { relisten = null } = {}) {
 
   // Setup DB
   dbManager.initDB();
+
+  // Backfill the one-time onboarding marker for installs that predate it:
+  // any library or any user means this server was set up long ago, and the
+  // flag's absence must not greet an upgrader (or a config restored beside
+  // an existing database) with first-run behavior. Best-effort — a
+  // read-only config just means the boot log re-invites, which is noise,
+  // not damage.
+  if (!config.program.setupComplete
+      && (dbManager.getAllLibraries().length > 0 || dbManager.getAllUsers().length > 0)) {
+    // Awaited on purpose: the launcher reads the flag from the config file
+    // when its health probe reports the server up, and an upgrader's very
+    // first boot of a flag-aware build must have the backfill ON DISK
+    // before listen — a fire-and-forget write raced that read, and losing
+    // it would greet a years-old install with the first-run wizard.
+    try {
+      await adminUtil.markSetupComplete();
+    } catch (err) {
+      winston.warn(`could not backfill setupComplete: ${err.message}`);
+    }
+  }
 
   // The separate music-discovery DB opens at boot only when collection is
   // enabled (the admin toggle initializes it on demand otherwise). Failure
@@ -572,13 +620,17 @@ export async function serveIt(configFile, { relisten = null } = {}) {
   transcode.setup(mstream);
   updateCheck.setup(mstream, {
     // Idle = safe to restart into a staged update: no socket carrying an
-    // in-flight response (the same tagging reboot()'s drain sweep uses) and
-    // no scan running. Conservative before boot completes.
+    // in-flight response (the same tagging reboot()'s drain sweep uses),
+    // no scan running, AND a quiet window since the last user request (the
+    // activity-clock middleware above) — in-flight alone misses an actively
+    // browsing user, who has no response in flight at most instants.
+    // Conservative before boot completes.
     hasBusySockets: () => {
       for (const s of liveSockets) { if (s._mstreamBusy) { return true; } }
       return false;
     },
     isScanning: () => (taskQueueMod ? taskQueueMod.isScanning() : true),
+    msSinceActivity: () => Date.now() - lastUserRequestAt,
   });
   scrobblerApi.setup(mstream);
   remoteApi.setupAfterAuth(mstream, server);
@@ -684,21 +736,37 @@ export async function serveIt(configFile, { relisten = null } = {}) {
     return handler(req, res, next);
   });
 
-  // error handling
+  // Error handling — the terminal translator from thrown errors to HTTP
+  // responses, and the last place log severity gets decided (the policy
+  // itself is classifyError in util/web-error.js, unit-pinned). Handled
+  // rejections log as rejections at warn with ip + user-agent, so a
+  // misbehaving client names itself in the log line (attributing the /ping
+  // one took router logs; never again). Error level + a stack are reserved
+  // for what they imply: genuine server failures.
   mstream.use((error, req, res, _next) => {
-    winston.error(`Server error on route ${req.originalUrl}`, { stack: error });
+    const from = `${req.ip} ${String(req.headers['user-agent'] || '-').slice(0, 80)}`;
 
     // Schema validation failures are malformed-request errors: the client
     // sent a body/params we can't accept. That's 400 Bad Request, not 403
     // Forbidden (which means "authenticated but not permitted").
     if (error instanceof Joi.ValidationError) {
+      winston.warn(`Rejected ${req.method} ${req.originalUrl} (${from}) — 400: ${error.message}`);
       return res.status(400).json({ error: error.message });
     }
 
-    if (error instanceof WebError) {
-      return res.status(error.status).json({ error: error.message });
+    const c = classifyError(error);
+    if (c.kind === 'web') {
+      if (c.level === 'error') {
+        winston.error(`Request failed: ${req.method} ${req.originalUrl} (${from}) — ${c.status}: ${error.message}`);
+      } else {
+        winston.warn(`Rejected ${req.method} ${req.originalUrl} (${from}) — ${c.status}: ${error.message}`);
+      }
+      return res.status(c.status).json({ error: error.message });
     }
 
+    // Unchanged wording + stack metadata on purpose: this line now MEANS
+    // something again — anyone grepping for it finds only real crashes.
+    winston.error(`Server error on route ${req.originalUrl}`, { stack: error });
     res.status(500).json({ error: 'Server Error' });
   });
 
@@ -707,7 +775,28 @@ export async function serveIt(configFile, { relisten = null } = {}) {
   const onListening = async () => {
     currentBind = bind;
     rebootInFlight = false;   // a reboot's re-serve is complete
+    // A successful listen acknowledges this boot: the headless boot
+    // watchdog's attempt counter (armed pre-boot in cli-boot-wrapper.js)
+    // starts over. Cheap no-op everywhere the guard never ran.
+    bootWatchdog.markBootOk();
     winston.info(`Access mStream locally: ${protocol}://localhost:${config.program.port}`);
+
+    // First-boot invitation, keyed to the one-time setupComplete marker
+    // (util/admin.js markSetupComplete — written at the first library or
+    // first user, backfilled above for installs that predate the flag).
+    // The terminal-wizard line appears only when the
+    // player binary is already on this machine (bundles ship it; musl and
+    // docker hosts have no build and get the browser line alone) AND its
+    // libraries load here (headless linux without ALSA can't even run its
+    // --version) — checking is a stat plus at most one ldconfig, never a
+    // download.
+    if (!config.program.setupComplete) {
+      winston.info('This server is not set up yet — open the address above in a browser to add music folders and an admin account.');
+      const wizard = installedPlayerPath();
+      if (wizard && playerLoadableHere()) {
+        winston.info(`Prefer a guided terminal setup? Run: "${wizard}" setup --server ${protocol}://localhost:${config.program.port}`);
+      }
+    }
 
     // A settings change landed while the reboot above was already past its
     // config read (see rebootPending): go straight around again rather than
@@ -800,7 +889,17 @@ export async function serveIt(configFile, { relisten = null } = {}) {
           const stack = await import('./state/discovery-p2p-stack.js');
           await stack.startDiscoveryP2pStack();
         } catch (err) {
-          winston.error(`[discovery-p2p] catalog unavailable — feature disabled this boot: ${err.message}`);
+          // Not "disabled this boot" any more: the config says enabled, so
+          // the stack's crash-recovery ladder takes over — 5s/15s/60s/5min,
+          // never giving up, config-gated so a runtime disable still wins.
+          // The likely causes are transient (a flaky first-install sidecar
+          // download, a busy data dir, a slow relay handshake), and the ones
+          // that aren't stay loudly visible: one warn per attempt, and the
+          // admin panel shows "reconnecting" instead of an ambiguous
+          // "not joined yet".
+          winston.error(`[discovery-p2p] catalog unavailable at boot — retrying on the recovery ladder: ${err.message}`);
+          const stack = await import('./state/discovery-p2p-stack.js');
+          stack.armBootRetry('boot start failed');
         }
       })();
     }

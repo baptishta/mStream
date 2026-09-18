@@ -7,7 +7,7 @@
 // the EventLoopProxy. The server child lives in an Arc<Mutex<...>> shared
 // with the watcher; a generation counter keeps a stale watcher (from before
 // a restart) from reporting the new child's state.
-use crate::{autostart, paths, platform, server, LauncherArgs};
+use crate::{autostart, paths, platform, rollback, server, LauncherArgs};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,6 +20,11 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 const STOP_GRACE: Duration = Duration::from_secs(8);
 const BOOT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Spawns a crash-before-serving server gets before the boot watchdog steps
+/// in: the second attempt absorbs transient causes (a port released late, a
+/// filesystem hiccup) so a rollback is only ever answered to a REPEATED
+/// boot failure.
+const MAX_BOOT_ATTEMPTS: u32 = 2;
 /// How long a `--takeover` relaunch retries the single-instance lock: the
 /// old launcher holds it for at most its own stop_current (STOP_GRACE) plus
 /// process teardown, so this only needs to comfortably exceed that.
@@ -84,6 +89,17 @@ pub fn run(args: LauncherArgs) -> ! {
     let server_dir = bin.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     let config = paths::resolve_config_path(&args.server_args, &server_dir);
     let ep = paths::read_endpoint(&config);
+    // The terminal setup wizard the "Set up mStream" item runs — resolved
+    // once, like the server binary: an install doesn't gain or lose its
+    // bundled player mid-session.
+    let player_bin = paths::find_player_bin(&bin, &data_home);
+    // The bundled Ghostty console (macOS bundles stage it at console/ beside
+    // mStream.app; other platforms simply never find one). Its Dock icon is
+    // mStream's own icns out of the .app — cosmetic, so absence is fine.
+    let console = paths::find_console_app(&bin).map(|ghostty_app| {
+        let icns = server_dir.join("..").join("Resources").join("mStream.icns");
+        paths::ConsoleLaunch { ghostty_app, icon_icns: icns.exists().then_some(icns) }
+    });
 
     // ── Single instance: the lock lives in the data home, so two launchers
     // managing the same data/port exclude each other (two --portable
@@ -226,10 +242,34 @@ pub fn run(args: LauncherArgs) -> ! {
         });
     }
 
+    // ── Our own REAL location (canonicalized so a start through the
+    // `current` symlink still resolves to the versioned tree the walk-ups
+    // need) — the update surface below and the boot watchdog both key off it.
+    let exe_real = std::env::current_exe()
+        .ok()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p));
+    // A --server-bin/MSTREAM_SERVER_BIN override means a failing server is
+    // NOT the bundle's own build — a rollback would punish the wrong version.
+    let watchdog_eligible = args.server_bin.is_none();
+
     match spawn_generation(&shared, &bin, &args.server_args, &server_log, ep, &proxy, &log) {
         Ok(()) => {}
         Err(e) => {
             log.line(&format!("server failed to spawn: {e}"));
+            // A managed layout whose committed version cannot even SPAWN its
+            // server is the boot watchdog's case too — same recovery as a
+            // crash-before-serving, just caught one step earlier.
+            if watchdog_eligible {
+                if let Some(face) = attempt_boot_rollback(exe_real.as_deref(), &log) {
+                    match platform::relaunch(&face, &args.server_args) {
+                        Ok(()) => {
+                            log.line("update watchdog: handed off to the previous version");
+                            std::process::exit(0);
+                        }
+                        Err(re) => log.line(&format!("update watchdog: relaunch failed: {re}")),
+                    }
+                }
+            }
             platform::fatal_alert(&format!(
                 "mStream could not start its server process:\n{e}\n\nSee {}",
                 server_log.display()
@@ -256,6 +296,10 @@ pub fn run(args: LauncherArgs) -> ! {
     // server the probe could not verify (Phase::Unverified).
     let mut spawned_at = Instant::now();
     let mut ever_up = false;
+    // Crash-before-serving spawns for the CURRENT boot cycle (reset the
+    // moment a server proves alive): past MAX_BOOT_ATTEMPTS the boot
+    // watchdog decides whether a staged update gets rolled back.
+    let mut boot_failures: u32 = 0;
     let mut opened = false;
     // Update-awareness: the server's checker writes update-status.json in
     // the shared data home; the tray re-reads it on every minute tick.
@@ -275,11 +319,6 @@ pub fn run(args: LauncherArgs) -> ! {
     // version (the tray menu still lets a human retry) until a different
     // version stages.
     let mut apply_failures: Option<(String, u32)> = None;
-    // Our own REAL location (canonicalized so a start through the `current`
-    // symlink still resolves to the versioned tree the walk-up needs).
-    let exe_real = std::env::current_exe()
-        .ok()
-        .map(|p| std::fs::canonicalize(&p).unwrap_or(p));
     let url = paths::server_url(&ep);
     // A --takeover relaunch is mid-update, not a first run: never announce.
     let announce = !args.autostarted && !args.no_open && !args.takeover;
@@ -317,7 +356,7 @@ pub fn run(args: LauncherArgs) -> ! {
                     update_item_view(upd.as_ref(), &updates_dir(), relaunch_target_exists(exe_real.as_deref()));
                 let update = MenuItem::with_id("update", utext.clone(), uaction != UpdateAction::None, None);
                 upd_text = utext;
-                let open_item = MenuItem::with_id("open", "Open mStream", true, None);
+                let open_item = MenuItem::with_id("open", "Open Admin Panel", true, None);
                 let qc_item = MenuItem::with_id("quick-connect", "Quick Connect", true, None);
                 let auto_item =
                     CheckMenuItem::with_id("autostart", "Start at login", true, autostart::is_enabled(), None);
@@ -404,13 +443,23 @@ pub fn run(args: LauncherArgs) -> ! {
                         && upd.as_ref().is_some_and(|s| s.apply_requested)
                         && token.is_some()
                         && token != auto_apply_attempted
-                        // Never mid-boot: the takeover launcher's first poll
-                        // can land while the new server is still migrating,
+                        // Only while a server is actually alive. Not mid-boot
+                        // (Starting): the takeover launcher's first poll can
+                        // land while the new server is still migrating,
                         // reading a status file the OLD session armed — an
-                        // apply here kills a healthy boot. Once the server
-                        // is up (or the probe gave up on an SSL config) the
-                        // file is fresh again.
-                        && !matches!(phase, Phase::Starting)
+                        // apply here kills a healthy boot. And not Stopped:
+                        // a dead server cannot have MEANT the armed request
+                        // still in the file — acting on it from Stopped is
+                        // how a stale arm turns into a relaunch loop after a
+                        // crash (each relaunch is a fresh process whose
+                        // attempted-token starts empty).
+                        && matches!(phase, Phase::Running { .. } | Phase::Unverified { .. })
+                        // Never into a version the boot watchdog held after
+                        // a failed start (rollback.rs) — the hold outranks
+                        // whatever the status file still advertises.
+                        && !staged_ver
+                            .as_deref()
+                            .is_some_and(|v| rollback::held_versions(&paths::data_home()).iter().any(|h| h == v))
                         // Never into OURSELVES: after a successful handoff
                         // the stale file still says "apply X" until the new
                         // server rewrites it — but this launcher shipped IN
@@ -451,12 +500,35 @@ pub fn run(args: LauncherArgs) -> ! {
                 }
                 AppEvent::Menu(id) => match id.as_str() {
                     "open" => {
-                        let _ = open::that_detached(url.clone());
+                        // The admin panel, explicitly — the tray is the
+                        // operator's surface, and listening happens in the
+                        // apps/players. (The post-boot browser announce keeps
+                        // its own routing: paths::browse_target.)
+                        let _ = open::that_detached(format!("{url}/admin"));
                     }
                     "quick-connect" => {
-                        // The web UI opens its Quick Connect modal on this
-                        // hash (webapp/assets/js/quick-connect.js).
-                        let _ = open::that_detached(format!("{url}/#quick-connect"));
+                        // The wizard's Quick Connect page (pixel pairing QR)
+                        // in a real terminal on the desktop platforms; the
+                        // webapp's modal hash stays the linux behavior
+                        // (webapp/assets/js/quick-connect.js) and the
+                        // fallback when this install has no player binary or
+                        // the terminal launch itself fails.
+                        log.line("menu: quick connect");
+                        let mut opened = false;
+                        if cfg!(any(target_os = "macos", windows)) {
+                            if let Some(player) = player_bin.as_deref() {
+                                match platform::open_wizard_terminal(player, &url, &data_home, console.as_ref(), platform::WizardPage::QuickConnect) {
+                                    Ok(via) => {
+                                        log.line(&format!("quick connect opened via {via}"));
+                                        opened = true;
+                                    }
+                                    Err(e) => log.line(&format!("quick connect terminal failed: {e} - falling back to the webapp")),
+                                }
+                            }
+                        }
+                        if !opened {
+                            let _ = open::that_detached(format!("{url}/#quick-connect"));
+                        }
                     }
                     "autostart" => {
                         // muda toggles the checkbox before we hear about it,
@@ -483,6 +555,9 @@ pub fn run(args: LauncherArgs) -> ! {
                         log.line("menu: restart server");
                         stop_current(&shared_loop);
                         spawned_at = Instant::now();
+                        // A human-initiated restart is a fresh intent: the
+                        // watchdog's failure budget starts over.
+                        boot_failures = 0;
                         phase = match spawn_generation(
                             &shared_loop,
                             &bin,
@@ -570,6 +645,7 @@ pub fn run(args: LauncherArgs) -> ! {
                         .unwrap_or(false);
                     if child_alive && generation == shared_loop.generation.load(Ordering::SeqCst) {
                         ever_up = true;
+                        boot_failures = 0;
                         log.line("server is up");
                         // The booting server just rewrote the status file
                         // (its version, cleared staged flags) — pick that up
@@ -597,7 +673,39 @@ pub fn run(args: LauncherArgs) -> ! {
                         }
                         if announce && !opened {
                             opened = true;
-                            let _ = open::that_detached(target);
+                            // First install: open the guided terminal wizard
+                            // (browser admin panel as the fallback when no
+                            // player binary exists or the terminal launch
+                            // failed, and as the linux path). CONFIGURED
+                            // installs boot QUIETLY — the wizard quick-start
+                            // superseded the old open-the-player-on-every-
+                            // boot announce (operator decision, pre-6.24):
+                            // the player stays one deliberate gesture away
+                            // (re-click the app / second launch) and the
+                            // tray menu holds the admin panel. The announce
+                            // gates (--takeover, --autostarted, --no-open)
+                            // suppress the first-run open exactly like the
+                            // old browser pop — an update relaunch must
+                            // never pop a terminal.
+                            if target.ends_with("/admin") {
+                                let mut wizard_opened = false;
+                                if cfg!(any(target_os = "macos", windows)) {
+                                    if let Some(player) = player_bin.as_deref() {
+                                        match platform::open_wizard_terminal(player, &url, &data_home, console.as_ref(), platform::WizardPage::Setup) {
+                                            Ok(via) => {
+                                                log.line(&format!("first-run announce: setup wizard opened via {via}"));
+                                                wizard_opened = true;
+                                            }
+                                            Err(e) => log.line(&format!("first-run announce: wizard failed ({e}) - opening the admin panel")),
+                                        }
+                                    }
+                                }
+                                if !wizard_opened {
+                                    let _ = open::that_detached(target);
+                                }
+                            } else {
+                                log.line("boot announce: quiet (already set up)");
+                            }
                         }
                     }
                 }
@@ -624,6 +732,7 @@ pub fn run(args: LauncherArgs) -> ! {
                         // is "exited unexpectedly", not "stopped before it
                         // finished starting".
                         ever_up = true;
+                        boot_failures = 0;
                         log.line(&format!(
                             "server did not answer the identity probe within {}s but is still running - showing it as running (unverified); an SSL-only config or a bind the plaintext probe can't reach looks like this",
                             BOOT_TIMEOUT.as_secs()
@@ -638,16 +747,75 @@ pub fn run(args: LauncherArgs) -> ! {
                     let current = shared_loop.generation.load(Ordering::SeqCst);
                     if generation == current && !shared_loop.quitting.load(Ordering::SeqCst) {
                         log.line("server exited unexpectedly");
-                        phase = Phase::Stopped;
-                        show_status(status_item.as_ref(), tray.as_ref(), &phase, &url, &version_label(upd.as_ref()));
-                        if !ever_up {
-                            // Died before ever serving = a boot failure the
-                            // user would otherwise never see (no console).
-                            platform::fatal_alert(&format!(
-                                "The mStream server stopped before it finished starting.\n\nSee {}",
-                                server_log_loop.display()
-                            ));
+                        if ever_up {
+                            phase = Phase::Stopped;
+                        } else {
+                            // Died before ever serving = a boot failure. One
+                            // respawn absorbs transient causes; a repeated
+                            // failure goes to the boot watchdog, which rolls
+                            // a freshly applied update back to the previous
+                            // version (rollback.rs). Before the watchdog this
+                            // was a dead install: no server means no update
+                            // checker, so even a FIXED release could never
+                            // arrive on its own.
+                            boot_failures += 1;
+                            let mut exhausted = boot_failures >= MAX_BOOT_ATTEMPTS;
+                            if !exhausted {
+                                log.line(&format!(
+                                    "server died before serving (attempt {boot_failures}/{MAX_BOOT_ATTEMPTS}) - retrying"
+                                ));
+                                spawned_at = Instant::now();
+                                match spawn_generation(
+                                    &shared_loop, &bin, &args.server_args, &server_log_loop, ep, &proxy, &log,
+                                ) {
+                                    Ok(()) => phase = Phase::Starting,
+                                    Err(e) => {
+                                        log.line(&format!("retry spawn failed: {e}"));
+                                        exhausted = true;
+                                    }
+                                }
+                            }
+                            if exhausted {
+                                let face = if watchdog_eligible {
+                                    attempt_boot_rollback(exe_real.as_deref(), &log)
+                                } else {
+                                    None
+                                };
+                                if let Some(face) = face {
+                                    shared_loop.quitting.store(true, Ordering::SeqCst);
+                                    match platform::relaunch(&face, &args.server_args) {
+                                        Ok(()) => {
+                                            log.line("update watchdog: handed off to the previous version");
+                                            tray.take();
+                                            *control_flow = ControlFlow::Exit;
+                                            return;
+                                        }
+                                        Err(e) => {
+                                            // `current` is already re-pointed, so the
+                                            // next manual start (or reboot) lands on
+                                            // the good version despite this handoff
+                                            // failing.
+                                            shared_loop.quitting.store(false, Ordering::SeqCst);
+                                            log.line(&format!("update watchdog: relaunch failed: {e}"));
+                                            phase = Phase::Stopped;
+                                            platform::fatal_alert(&format!(
+                                                "The updated mStream could not start and was rolled back.\nStart mStream again to run the previous version.\n\nSee {}",
+                                                server_log_loop.display()
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    phase = Phase::Stopped;
+                                    // The dialog the user would otherwise
+                                    // never see (no console on a GUI launch).
+                                    platform::fatal_alert(&format!(
+                                        "The mStream server stopped before it finished starting.\n\nSee {}",
+                                        server_log_loop.display()
+                                    ));
+                                }
+                            }
                         }
+                        show_status(status_item.as_ref(), tray.as_ref(), &phase, &url, &version_label(upd.as_ref()));
                     }
                 }
             },
@@ -1036,6 +1204,34 @@ fn recover_after_failed_apply(
     }
 }
 
+/// The boot watchdog's decision + execution: roll a managed layout back to
+/// the previous version after repeated crash-before-serving boots (see
+/// rollback.rs for the full contract). Returns the launcher face to hand
+/// off to, or None when rollback does not apply (not a managed layout,
+/// `current` not committed to us, nothing usable to roll back to) — the
+/// caller then falls through to the Stopped-with-dialog behavior.
+fn attempt_boot_rollback(exe_real: Option<&Path>, log: &Logger) -> Option<PathBuf> {
+    let data_home = paths::data_home();
+    let plan = rollback::plan_rollback(
+        exe_real,
+        env!("MSTREAM_BUNDLE_VERSION"),
+        &paths::home_dir(),
+        &data_home,
+        &rollback::probe_server,
+    )?;
+    log.line(&format!(
+        "update watchdog: mStream {} cannot boot here - rolling back to {}",
+        plan.failed_version, plan.target_version
+    ));
+    match rollback::execute_rollback(&plan, &data_home, &|m| log.line(m)) {
+        Ok(face) => Some(face),
+        Err(e) => {
+            log.line(&format!("update watchdog: rollback failed: {e}"));
+            None
+        }
+    }
+}
+
 /// The server's lifecycle as the tray reports it. Running carries the
 /// instant the identity probe first answered (ServerUp), which is what the
 /// uptime counts from; Unverified is a child that outlived the probe's
@@ -1134,7 +1330,7 @@ fn load_icon() -> Icon {
         buf.truncate(info.buffer_size());
         let rgba = match info.color_type {
             png::ColorType::Rgba => buf,
-            png::ColorType::Rgb => buf.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+            png::ColorType::Rgb => buf.as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
             _ => return None,
         };
         Some((rgba, info.width, info.height))

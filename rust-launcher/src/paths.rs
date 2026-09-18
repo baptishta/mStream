@@ -123,9 +123,14 @@ pub struct Endpoint {
 /// run — the server generates it — and these defaults are exactly what that
 /// generated config yields.
 pub fn read_endpoint(config: &Path) -> Endpoint {
+    // trim_start_matches('\u{feff}'): PowerShell 5.1's `Set-Content -Encoding
+    // UTF8` writes a BOM and serde_json refuses it — the server side strips it
+    // too (util/atomic-json.js stripBom), and the two sides must read the SAME
+    // config the same way, or a BOM'd port lands the server on 8000 while the
+    // launcher probes the 3000 fallback forever.
     let v = std::fs::read_to_string(config)
         .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s.trim_start_matches('\u{feff}')).ok());
     let port = v
         .as_ref()
         .and_then(|v| v.get("port"))
@@ -182,29 +187,127 @@ pub fn server_url(ep: &Endpoint) -> String {
     }
 }
 
-/// Whether the config declares any music folders. Unreadable or absent
-/// config counts as unconfigured — on a true first run the file appears
-/// mid-boot, and the right answer is the same either way.
-pub fn library_is_configured(config: &Path) -> bool {
-    std::fs::read_to_string(config)
+/// Whether this install has been through first-run setup, per the config's
+/// one-time `setupComplete` marker — written by the SERVER the moment the
+/// first library or first user lands (util/admin.js markSetupComplete), and
+/// backfilled at boot for installs that predate it. The legacy `folders`
+/// check rides along as a belt: an older server never writes the flag, but
+/// old-style configs still carry their folders, so a new launcher over an
+/// old configured install doesn't re-run first-run behavior. Unreadable or
+/// absent config counts as not-set-up — on a true first run the file
+/// appears mid-boot, and the right answer is the same either way.
+pub fn setup_complete(config: &Path) -> bool {
+    let Some(v) = std::fs::read_to_string(config)
         .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.get("folders").and_then(|f| f.as_object().map(|o| !o.is_empty())))
-        .unwrap_or(false)
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s.trim_start_matches('\u{feff}')).ok())
+    else {
+        return false;
+    };
+    if v.get("setupComplete").and_then(|b| b.as_bool()) == Some(true) {
+        return true;
+    }
+    v.get("folders").and_then(|f| f.as_object().map(|o| !o.is_empty())).unwrap_or(false)
 }
 
 /// Where a launcher-initiated browser open should land (the announce after
-/// boot, a second instance yielding, a macOS reopen): the player when there
-/// is music, the ADMIN PANEL when the library has no folders yet — a fresh
-/// install's player is a dead end, and the admin panel is where folders get
-/// added. The tray's explicit "Open mStream" item stays literal (always the
-/// player) so the menu does what it says.
+/// boot, a second instance yielding, a macOS reopen): the player once setup
+/// has happened, the ADMIN PANEL before it — a fresh install's player is a
+/// dead end. (The post-boot announce goes further and opens the setup
+/// wizard itself on fresh installs; this is its browser fallback and every
+/// other gesture's routing.) The tray's explicit "Open Admin Panel" item
+/// does NOT route through this — it always opens /admin, literally what it
+/// says.
 pub fn browse_target(config: &Path, ep: &Endpoint) -> String {
-    if library_is_configured(config) {
+    if setup_complete(config) {
         server_url(ep)
     } else {
         format!("{}/admin", server_url(ep))
     }
+}
+
+/// The platform key of the terminal player binary — mirrors playerKey() in
+/// src/util/mstream-player-bootstrap.js (the manifest and the bundle are
+/// keyed by the full filename). No musl arm: launcher builds are glibc-only,
+/// and musl bundles are headless.
+pub fn player_key() -> String {
+    let plat = if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(windows) {
+        "win32"
+    } else {
+        "linux"
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        other => other,
+    };
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    format!("mstream-player-{plat}-{arch}{ext}")
+}
+
+/// The terminal player for the "Set up mStream" item: the copy build-bun
+/// stages next to the server binary in every desktop bundle, else one the
+/// server's runtime fetch installed in the shared data home. None disables
+/// the item — a greyed entry beats a terminal window that dies instantly.
+pub fn find_player_bin(server_bin: &Path, data_home: &Path) -> Option<PathBuf> {
+    let key = player_key();
+    let bundled = server_bin.parent()?.join("bin").join("mstream-player").join(&key);
+    if bundled.exists() {
+        return Some(bundled);
+    }
+    let managed = data_home.join("bin").join("mstream-player").join(&key);
+    managed.exists().then_some(managed)
+}
+
+/// What the macOS "Set up mStream" launch needs to prefer the bundled
+/// Ghostty console over Terminal.app. Constructed on every platform (the
+/// resolver just never finds one off-mac), read only by the macOS spawn.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub struct ConsoleLaunch {
+    /// console/Ghostty.app (the whole bundle; the launch execs its inner
+    /// binary directly — no LaunchServices, no Gatekeeper prompt).
+    pub ghostty_app: PathBuf,
+    /// mStream.icns inside mStream.app — becomes the console's Dock icon
+    /// (`macos-icon = custom`). None just keeps Ghostty's own icon.
+    pub icon_icns: Option<PathBuf>,
+}
+
+/// The bundled Ghostty console — macOS bundles stage it at
+/// console/Ghostty.app BESIDE mStream.app (never inside: both notarization
+/// seals stay independent; scripts/build-bun.mjs). Three layouts can hold
+/// one, checked most-specific first: running out of the versioned bundle dir
+/// itself (an ancestor of the server binary); the ~/Applications copy of
+/// mStream.app, whose versioned dir is wherever the install root's `current`
+/// link points; and the .pkg install, whose io.mstream.console component
+/// lands at the fixed system path (/Applications/mStream.app has no
+/// versioned dir or current link at all). None on the other platforms and
+/// on consoleless installs — the caller falls back to the Terminal.app path.
+pub fn find_console_app(server_bin: &Path) -> Option<PathBuf> {
+    find_console_app_in(
+        server_bin,
+        &data_home().join("app"),
+        Path::new("/Library/Application Support/mStream"),
+    )
+}
+
+fn find_console_app_in(server_bin: &Path, install_root: &Path, system_root: &Path) -> Option<PathBuf> {
+    let ghostty = |app: &Path| app.join("Contents").join("MacOS").join("ghostty");
+    let mut dir = server_bin.parent();
+    for _ in 0..6 {
+        let Some(d) = dir else { break };
+        let candidate = d.join("console").join("Ghostty.app");
+        if ghostty(&candidate).exists() {
+            return Some(candidate);
+        }
+        dir = d.parent();
+    }
+    let current = install_root.join("current").join("console").join("Ghostty.app");
+    if ghostty(&current).exists() {
+        return Some(current);
+    }
+    let system = system_root.join("console").join("Ghostty.app");
+    ghostty(&system).exists().then_some(system)
 }
 
 /// Escape a literal string for use inside a POSIX ERE (the pgrep -f
@@ -311,26 +414,30 @@ pub fn parse_update_status(doc: &str) -> Option<UpdateStatus> {
     })
 }
 
-/// The bundle-dir naming the installers create: mStream-<X.Y.Z>-<key>.
-/// Mirrors parseBundleName in src/util/update-check.js closely enough for
-/// target derivation (the final existence check is the real gate).
-pub fn is_bundle_dir_name(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix("mStream-") else { return false };
-    let Some(dash) = rest.find(|c: char| !(c.is_ascii_digit() || c == '.')) else { return false };
+/// The bundle-dir naming the installers create: mStream-<X.Y.Z>-<key> ->
+/// (version, key). Mirrors parseBundleName in src/util/update-check.js
+/// closely enough for target derivation (the final existence check is the
+/// real gate).
+pub(crate) fn parse_bundle_dir_name(name: &str) -> Option<(String, String)> {
+    let rest = name.strip_prefix("mStream-")?;
+    let dash = rest.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
     if dash == 0 || !rest[dash..].starts_with('-') {
-        return false;
+        return None;
     }
-    if sanitize_version(&rest[..dash]).is_none() {
-        return false;
-    }
+    let version = sanitize_version(&rest[..dash])?;
     let key = &rest[dash + 1..];
-    ["darwin-", "linux-", "win-"].iter().any(|p| key.starts_with(p))
+    let ok = ["darwin-", "linux-", "win-"].iter().any(|p| key.starts_with(p))
         && key.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && !key.ends_with('-')
+        && !key.ends_with('-');
+    ok.then(|| (version, key.to_string()))
+}
+
+pub fn is_bundle_dir_name(name: &str) -> bool {
+    parse_bundle_dir_name(name).is_some()
 }
 
 /// The launcher face's path inside a bundle, per platform.
-fn launcher_rel() -> &'static str {
+pub(crate) fn launcher_rel() -> &'static str {
     if cfg!(windows) {
         "mStream.exe"
     } else if cfg!(target_os = "macos") {
@@ -419,6 +526,139 @@ mod tests {
     }
 
     #[test]
+    fn player_key_matches_node_bootstrap_shape() {
+        // The manifest and the bundle are keyed by the full filename; this
+        // must stay in lockstep with playerKey() in
+        // src/util/mstream-player-bootstrap.js.
+        let key = player_key();
+        #[cfg(target_os = "macos")]
+        assert!(key.starts_with("mstream-player-darwin-"), "{key}");
+        #[cfg(windows)]
+        {
+            assert!(key.starts_with("mstream-player-win32-"), "{key}");
+            assert!(key.ends_with(".exe"), "{key}");
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        assert!(key.starts_with("mstream-player-linux-"), "{key}");
+        assert!(!key.contains("x86_64") && !key.contains("aarch64"), "node arch names, not Rust's: {key}");
+    }
+
+    #[test]
+    fn find_player_bin_prefers_bundled_then_managed() {
+        let root = env::temp_dir().join(format!("mstream-launcher-player-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bundle = root.join("bundle");
+        let home = root.join("home");
+        let key = player_key();
+        let server = bundle.join("mstream-server");
+        std::fs::create_dir_all(bundle.join("bin/mstream-player")).unwrap();
+        std::fs::create_dir_all(home.join("bin/mstream-player")).unwrap();
+
+        assert_eq!(find_player_bin(&server, &home), None, "neither copy exists yet");
+
+        let managed = home.join("bin/mstream-player").join(&key);
+        std::fs::write(&managed, b"x").unwrap();
+        assert_eq!(find_player_bin(&server, &home), Some(managed), "managed fallback");
+
+        let bundled = bundle.join("bin/mstream-player").join(&key);
+        std::fs::write(&bundled, b"x").unwrap();
+        assert_eq!(find_player_bin(&server, &home), Some(bundled), "bundled copy wins");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn setup_complete_reads_the_flag_with_a_legacy_folders_belt() {
+        let p = env::temp_dir().join(format!("mstream-launcher-setup-{}.json", std::process::id()));
+        // Absent config = a true first run (the server writes it mid-boot).
+        let _ = std::fs::remove_file(&p);
+        assert!(!setup_complete(&p));
+        // Fresh modern config: no flag, no folders.
+        std::fs::write(&p, "{ \"port\": 3000 }").unwrap();
+        assert!(!setup_complete(&p));
+        // The server wrote the one-time marker.
+        std::fs::write(&p, "{ \"setupComplete\": true }").unwrap();
+        assert!(setup_complete(&p));
+        // An explicit false stays false (never written by us, but honest).
+        std::fs::write(&p, "{ \"setupComplete\": false }").unwrap();
+        assert!(!setup_complete(&p));
+        // Legacy belt: an OLD server never writes the flag, but old-style
+        // configs still carry their folders.
+        std::fs::write(&p, "{ \"folders\": { \"m\": { \"root\": \"/x\" } } }").unwrap();
+        assert!(setup_complete(&p));
+        std::fs::write(&p, "{ \"folders\": {} }").unwrap();
+        assert!(!setup_complete(&p));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn find_console_app_walks_bundle_then_install_root() {
+        let root = env::temp_dir().join(format!("mstream-launcher-console-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bundle = root.join("mStream-9.9.9-darwin-arm64");
+        let server = bundle.join("mStream.app/Contents/MacOS/mstream-server");
+        let install_root = root.join("approot");
+        let system_root = root.join("syslib");
+        std::fs::create_dir_all(server.parent().unwrap()).unwrap();
+        assert_eq!(find_console_app_in(&server, &install_root, &system_root), None, "nothing staged yet");
+
+        let ghostty_bin_dir = bundle.join("console/Ghostty.app/Contents/MacOS");
+        std::fs::create_dir_all(&ghostty_bin_dir).unwrap();
+        std::fs::write(ghostty_bin_dir.join("ghostty"), b"x").unwrap();
+        assert_eq!(
+            find_console_app_in(&server, &install_root, &system_root),
+            Some(bundle.join("console/Ghostty.app")),
+            "ancestor walk finds the bundle's console"
+        );
+
+        // The .pkg layout: the server binary is inside /Applications'
+        // mStream.app, with NO versioned dir and NO current link — the
+        // io.mstream.console component's fixed system path is the answer.
+        let apps_copy = root.join("Applications/mStream.app/Contents/MacOS/mstream-server");
+        std::fs::create_dir_all(apps_copy.parent().unwrap()).unwrap();
+        assert_eq!(
+            find_console_app_in(&apps_copy, &install_root, &system_root),
+            None,
+            "no current link and no system console yet"
+        );
+        let sys_bin_dir = system_root.join("console/Ghostty.app/Contents/MacOS");
+        std::fs::create_dir_all(&sys_bin_dir).unwrap();
+        std::fs::write(sys_bin_dir.join("ghostty"), b"x").unwrap();
+        assert_eq!(
+            find_console_app_in(&apps_copy, &install_root, &system_root),
+            Some(system_root.join("console/Ghostty.app")),
+            "the pkg install resolves through the system path"
+        );
+
+        // The ~/Applications copy of a SCRIPT install: resolution goes
+        // through the install root's `current` link, which outranks the
+        // system path when both exist (unix-only mechanics, like the
+        // install).
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(&install_root).unwrap();
+            std::os::unix::fs::symlink(&bundle, install_root.join("current")).unwrap();
+            assert_eq!(
+                find_console_app_in(&apps_copy, &install_root, &system_root),
+                Some(install_root.join("current/console/Ghostty.app")),
+                "the current link outranks the pkg system path"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bom_from_powershell_utf8_is_tolerated() {
+        // PowerShell 5.1's `Set-Content -Encoding UTF8` prepends a BOM; the
+        // server strips it before parsing, so this side must too — a BOM'd
+        // port must not send the launcher probing the 3000 fallback.
+        let p = env::temp_dir().join(format!("mstream-launcher-bom-{}.json", std::process::id()));
+        std::fs::write(&p, "\u{feff}{ \"port\": 8123, \"setupComplete\": true }").unwrap();
+        assert_eq!(read_endpoint(&p).port, 8123);
+        assert!(setup_complete(&p));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn port_shapes_joi_accepts() {
         assert_eq!(ep(json!({"port": 8000})).port, 8000);
         assert_eq!(ep(json!({"port": "8000"})).port, 8000, "quoted port must match Joi's coercion");
@@ -483,26 +723,22 @@ mod tests {
 
     #[test]
     fn library_configured_detection() {
+        // Garbage shapes must read as not-set-up, never panic.
         let dir = env::temp_dir();
         let f = |name: &str, body: &str| {
             let p = dir.join(format!("mstream-lib-{}-{}.json", std::process::id(), name));
             std::fs::write(&p, body).unwrap();
             p
         };
-        assert!(!library_is_configured(Path::new("/definitely/not/there.json")), "absent config = unconfigured");
-        let empty = f("empty", "{}");
-        assert!(!library_is_configured(&empty), "no folders key = unconfigured");
-        let bare = f("bare", r#"{"folders":{}}"#);
-        assert!(!library_is_configured(&bare), "empty folders object = unconfigured");
         let garbage = f("garbage", r#"{"folders":"nope"}"#);
-        assert!(!library_is_configured(&garbage), "non-object folders = unconfigured");
-        let real = f("real", r#"{"folders":{"music":{"root":"/m"}}}"#);
-        assert!(library_is_configured(&real));
-        for p in [empty, bare, garbage, real] { let _ = std::fs::remove_file(p); }
+        assert!(!setup_complete(&garbage), "non-object folders = not set up");
+        let flag_garbage = f("flaggarbage", r#"{"setupComplete":"yes"}"#);
+        assert!(!setup_complete(&flag_garbage), "non-bool flag = not set up");
+        for p in [garbage, flag_garbage] { let _ = std::fs::remove_file(p); }
     }
 
     #[test]
-    fn browse_target_lands_on_admin_until_folders_exist() {
+    fn browse_target_lands_on_admin_until_setup_completes() {
         let ep = Endpoint { ip: IpAddr::V4(Ipv4Addr::LOCALHOST), port: 3000 };
         assert_eq!(browse_target(Path::new("/nope.json"), &ep), "http://localhost:3000/admin");
         let p = env::temp_dir().join(format!("mstream-bt-{}.json", std::process::id()));
@@ -555,6 +791,12 @@ mod tests {
         assert!(!is_bundle_dir_name("current"));
         assert!(!is_bundle_dir_name("mStream-latest-linux-x64"));
         assert!(!is_bundle_dir_name("mStream.app"));
+        // The parsed halves, for the rollback module's candidate scan.
+        assert_eq!(
+            parse_bundle_dir_name("mStream-6.21.2-linux-arm64-musl"),
+            Some(("6.21.2".to_string(), "linux-arm64-musl".to_string()))
+        );
+        assert_eq!(parse_bundle_dir_name("mStream-6.21.2-linux-x64.replaced-2026"), None);
     }
 
     #[test]

@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import Joi from 'joi';
 import winston from 'winston';
 import { appRoot, dataRoot } from '../util/esm-helpers.js';
+import { readJsonFile } from '../util/atomic-json.js';
 import { getTransCodecs, getTransBitrates } from '../api/transcode.js';
 import { CLIENT_TYPE, ENABLED_FOR } from '../torrent/constants.js';
 import { EMBEDDING_MODELS, DEFAULT_EMBEDDING_MODEL, RETIRED_EMBEDDING_MODELS }
@@ -343,14 +344,24 @@ const updatesOptions = Joi.object({
   // works, it is only the schedule that stops.
   check: Joi.boolean().default(true),
   // notify: report only, download nothing until a human clicks.
-  // stage (default): background-download the new version - managed installs
-  //   stage it behind $ROOT/current, Windows setup.exe installs download the
+  // stage: background-download the new version - managed installs stage it
+  //   behind $ROOT/current, Windows setup.exe installs download the
   //   verified installer - but applying still takes a restart or a click.
-  // auto: additionally apply when the server is idle (no busy connections,
-  //   no scan): under the tray launcher by asking it to restart into the
-  //   staged version; headless by exiting 0, which expects a process
-  //   supervisor (systemd/pm2) configured to start mStream again.
-  mode: Joi.string().valid('notify', 'stage', 'auto').default('stage'),
+  // auto (default): additionally apply once the server is genuinely idle
+  //   (no busy connections, no scan, and a quiet window since the last user
+  //   request): under the tray launcher by asking it to restart into the
+  //   staged version; headless by exiting 0 - but only when a supervisor
+  //   that restarts on a clean exit is detectable (pm2, systemd with
+  //   Restart=always/on-success, or MSTREAM_SUPERVISED=1) - otherwise auto
+  //   behaves like stage. Default flipped to auto only after the full
+  //   recovery ladder shipped: the installers' pre-flip --boot-probe
+  //   refusal, and the launcher/headless boot watchdogs that roll a
+  //   crash-at-boot release back and hold it until a fixed release ships -
+  //   a bad release self-heals to the next good one with no operator
+  //   action. A config that pins mode keeps its choice (Joi defaults never
+  //   override an explicit value); .pkg installs stay download-only under
+  //   auto by design (Installer.app needs a human).
+  mode: Joi.string().valid('notify', 'stage', 'auto').default('auto'),
   // Hold one version back: report it, never stage or apply it. The
   // companion of a manual rollback (docs/install.md) — without it the next
   // daily check would silently re-stage the very release the operator just
@@ -741,11 +752,24 @@ const schema = Joi.object({
   downloadSizeLimit: Joi.string().pattern(/^(0|[0-9]+(\.[0-9]+)?(KB|MB|GB))$/i).default('0'),
   db: dbOptions.default(dbOptions.validate({}).value),
   compression: compressionOptions.default(compressionOptions.validate({}).value),
+  // One-time onboarding marker: the launcher auto-opens the setup wizard
+  // while this is false/absent, and the server's boot log prints the setup
+  // invitation. Written true by util/admin.js markSetupComplete() the moment
+  // the FIRST library or FIRST user lands (and backfilled at boot for
+  // installs that predate the flag — see serveIt). Never unset: deleting
+  // every folder later must not resurrect first-run behavior.
+  setupComplete: Joi.boolean().default(false),
   folders: Joi.object().pattern(
     Joi.string(),
     Joi.object({
       root: Joi.string().required(),
       type: Joi.string().valid('music', 'audio-books').default('music'),
+      // Honored at library creation (the config→SQLite migration), so
+      // the FIRST scan already follows symlinks — config-managed
+      // installs get the same at-birth semantics as the admin API's
+      // followSymlinks parameter. Editable later per library from the
+      // admin Directories page.
+      followSymlinks: Joi.boolean().default(false),
     })
   ).default({}),
   users: Joi.object().pattern(
@@ -806,7 +830,7 @@ export async function setup(configFileArg) {
     winston.info(`Config file created: ${configFile}`);
   }
 
-  const programData = JSON.parse(await fs.readFile(configFileArg, 'utf8'));
+  const programData = await readJsonFile(configFileArg);
   configFile = configFileArg;
 
   // Verify paths are real
@@ -948,7 +972,7 @@ export async function setup(configFileArg) {
   // Persist a stable DLNA UUID so renderers recognise the server across reboots
   if (!program.dlna.uuid) {
     program.dlna.uuid = crypto.randomUUID();
-    const rawConfig = JSON.parse(await fs.readFile(configFileArg, 'utf8'));
+    const rawConfig = await readJsonFile(configFileArg);
     if (!rawConfig.dlna) { rawConfig.dlna = {}; }
     rawConfig.dlna.uuid = program.dlna.uuid;
     await fs.writeFile(configFileArg, JSON.stringify(rawConfig, null, 2), 'utf8');
@@ -992,7 +1016,7 @@ export async function setup(configFileArg) {
   // pattern as dlna.uuid above.
   if (!program.discovery.mdns.instanceId) {
     program.discovery.mdns.instanceId = crypto.randomUUID();
-    const rawConfig = JSON.parse(await fs.readFile(configFileArg, 'utf8'));
+    const rawConfig = await readJsonFile(configFileArg);
     if (!rawConfig.discovery) { rawConfig.discovery = {}; }
     if (!rawConfig.discovery.mdns) { rawConfig.discovery.mdns = {}; }
     rawConfig.discovery.mdns.instanceId = program.discovery.mdns.instanceId;

@@ -218,12 +218,71 @@ jobs:
           try { & .\install.ps1 *>&1 | Out-Null; throw "installed a bundle that cannot exec" } catch { if ("$_" -notmatch 'does not run on this system') { throw } }
           $j2 = Get-Item "$env:RUNNER_TEMP\app\current" -Force
           if (($j2.Target | Select-Object -First 1) -notmatch 'mStream-9\.9\.9-win-x64$') { throw "current moved off 9.9.9: $($j2.Target)" }
+          # the DEEP probe: a bundle that EXECS (-V answers, so the shallow
+          # probe passes) but reports it would not BOOT must be refused on
+          # the "boot-probe:" sentinel with current untouched. Needs a real
+          # exe — rustc is preinstalled on the runner; stderr to a file, not
+          # 2>&1 (under EAP=Stop native stderr becomes a terminating error).
+          $pb = 'mStream-9.9.11-win-x64'
+          Set-Content stub.rs 'fn main(){let a=std::env::args().nth(1);if a.as_deref()==Some("-V"){println!("9.9.11");return;}if a.as_deref()==Some("--boot-probe"){println!("boot-probe: FAIL simulated boot regression");std::process::exit(1);}}'
+          rustc -O --crate-name probestub stub.rs -o probe-stub.exe 2>rustc.err
+          if ($LASTEXITCODE -ne 0) { Get-Content rustc.err; throw "rustc stub build failed" }
+          Push-Location rel
+          New-Item -ItemType Directory -Force $pb | Out-Null
+          Copy-Item ..\probe-stub.exe "$pb\mstream-server.exe"
+          Set-Content "$pb\README.txt" 'probe'
+          python3 -m zipfile -c "$pb.zip" $pb
+          Remove-Item -Recurse -Force $pb
+          Pop-Location
+          Remove-Item rel\mStream-*.zip -Exclude "$pb.zip" -Force
+          Remove-Item rel\manifest.json -Force
+          bash scripts/release-manifest.sh 9.9.11 rel
+          try { & .\install.ps1 *>&1 | Out-Null; throw "installed a bundle that cannot boot" } catch { if ("$_" -notmatch 'would not BOOT') { throw } }
+          $j3 = Get-Item "$env:RUNNER_TEMP\app\current" -Force
+          if (($j3.Target | Select-Object -First 1) -notmatch 'mStream-9\.9\.9-win-x64$') { throw "current moved off 9.9.9 after probe refusal: $($j3.Target)" }
+          # relaunch arming: with a LAUNCHER this script owns running the
+          # old version, a fresh install must arm update-status.json for the
+          # tray to consume (never kill anything itself). Real exe required
+          # (a stopped/fake one skips the block silently); rustc again.
+          Set-Content idle.rs 'fn main(){loop{std::thread::sleep(std::time::Duration::from_secs(9));}}'
+          rustc -O --crate-name idlestub idle.rs -o "$env:RUNNER_TEMP\app\mStream-9.9.9-win-x64\mStream.exe" 2>rustc2.err
+          if ($LASTEXITCODE -ne 0) { Get-Content rustc2.err; throw "idle stub build failed" }
+          $stub = Start-Process -FilePath "$env:RUNNER_TEMP\app\mStream-9.9.9-win-x64\mStream.exe" -PassThru
+          Start-Sleep -Seconds 1
+          if ($stub.HasExited) { throw "seeded launcher stub is not running - the arming test would be vacuous" }
+          # The upgrade bundle's server must PASS -V and the deep probe, or
+          # the pre-flip refusals (correctly) fire before arming can happen.
+          Set-Content ok.rs 'fn main(){let a=std::env::args().nth(1);if a.as_deref()==Some("-V"){println!("9.9.12");return;}if a.as_deref()==Some("--boot-probe"){println!("boot-probe: ok");return;}}'
+          rustc -O --crate-name okstub ok.rs -o ok-server.exe 2>rustc3.err
+          if ($LASTEXITCODE -ne 0) { Get-Content rustc3.err; throw "ok stub build failed" }
+          $pb2 = 'mStream-9.9.12-win-x64'
+          Remove-Item rel\mStream-*.zip, rel\manifest.json -Force
+          Push-Location rel
+          New-Item -ItemType Directory -Force $pb2 | Out-Null
+          Copy-Item ..\ok-server.exe "$pb2\mstream-server.exe"
+          Set-Content "$pb2\README.txt" 'fake'
+          python3 -m zipfile -c "$pb2.zip" $pb2
+          Remove-Item -Recurse -Force $pb2
+          Pop-Location
+          bash scripts/release-manifest.sh 9.9.12 rel
+          $armOut = & .\install.ps1 *>&1 | Out-String
+          if ($armOut -notmatch 'restarts into 9\.9\.12 within a minute') { throw "arming note missing: $armOut" }
+          $armDoc = Get-Content "$env:LOCALAPPDATA\mStream\update-status.json" -Raw | ConvertFrom-Json
+          if (-not $armDoc.applyRequested -or $armDoc.stagedVersion -ne '9.9.12') { throw "status file not armed: $($armDoc | ConvertTo-Json -Compress)" }
+          Stop-Process -Id $stub.Id -Force
+          Start-Sleep -Seconds 1
           # uninstall
           $env:MSTREAM_UNINSTALL = '1'
           & .\install.ps1 *>&1 | Tee-Object -Variable un
           if (Test-Path "$env:RUNNER_TEMP\app") { throw "app root survived uninstall" }
           if (($un | Out-String) -notmatch 'left in place') { throw "no data-home note" }
           Write-Host "install.ps1 contract OK"
+          # The runner appends `exit $LASTEXITCODE` to pwsh steps, and the
+          # deep-probe stub's --boot-probe exit 1 is the last NATIVE exit
+          # code set (script invocations and cmdlets never reset it) — so a
+          # fully-passing run would end red. Every check above is a throw;
+          # reaching here IS the pass.
+          exit 0
 
       # The darwin-only paths: ~/Applications copy + sibling ownership marker,
       # login-item re-pointing through the RIGHT launcher, and the
@@ -1039,9 +1098,40 @@ jobs:
           # plist); ditto preserves the signed bundle bit-exactly.
           rm -rf pkgwork/root && mkdir -p pkgwork/root
           ditto "$APP" pkgwork/root/mStream.app
+          # postinstall (build/pkg-postinstall.sh): restart a RUNNING
+          # mStream into the freshly installed copy — terminate the
+          # launcher by exact path (the supervision pipe stops its server
+          # gracefully), relaunch as the console user with --takeover.
+          # Without it the pkg is a pure payload swap and the old version
+          # keeps serving until a manual Quit + reopen.
+          mkdir -p pkgwork/scripts
+          install -m 755 build/pkg-postinstall.sh pkgwork/scripts/postinstall
           pkgbuild --analyze --root pkgwork/root pkgwork/component.plist
           /usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" pkgwork/component.plist
-          pkgbuild --root pkgwork/root --component-plist pkgwork/component.plist --install-location /Applications --identifier io.mstream.server --version "$VER" pkgwork/component.pkg
+          pkgbuild --root pkgwork/root --component-plist pkgwork/component.plist --scripts pkgwork/scripts --install-location /Applications --identifier io.mstream.server --version "$VER" pkgwork/component.pkg
+          # Second component: the bundled Ghostty console (bin/ghostty/).
+          # Its payload root maps to /Library/Application Support/mStream -
+          # the fixed system path the launcher checks third
+          # (rust-launcher paths.rs find_console_app): a pkg install has no
+          # versioned bundle dir and no `current` link. The app ships
+          # byte-identical (ditto, relocatable=false, never re-signed), so
+          # Ghostty's own notarization rides along inside our pkg.
+          CONSOLE_LINE=""
+          CONSOLE_CHOICE=""
+          CONSOLE_REF=""
+          if [ -d "$D/console/Ghostty.app" ]; then
+            rm -rf pkgwork/console-root && mkdir -p pkgwork/console-root/console
+            ditto "$D/console/Ghostty.app" pkgwork/console-root/console/Ghostty.app
+            cp "$D/console/GHOSTTY-LICENSE.txt" pkgwork/console-root/console/
+            pkgbuild --analyze --root pkgwork/console-root pkgwork/console.plist
+            /usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" pkgwork/console.plist
+            pkgbuild --root pkgwork/console-root --component-plist pkgwork/console.plist --install-location "/Library/Application Support/mStream" --identifier io.mstream.console --version "$VER" pkgwork/console.pkg
+            CONSOLE_LINE='<line choice="io.mstream.console"/>'
+            CONSOLE_CHOICE='<choice id="io.mstream.console" visible="false"><pkg-ref id="io.mstream.console"/></choice>'
+            CONSOLE_REF="<pkg-ref id=\"io.mstream.console\" version=\"$VER\" onConclusion=\"none\">console.pkg</pkg-ref>"
+          else
+            echo "::warning::no console in the staged bundle - the pkg ships without io.mstream.console"
+          fi
           case "$KEY" in
             darwin-arm64) ARCHS="arm64" ;;
             *)            ARCHS="x86_64,arm64" ;;   # x64 payload runs under Rosetta
@@ -1053,9 +1143,10 @@ jobs:
             <options customize="never" require-scripts="false" hostArchitectures="$ARCHS"/>
             <volume-check><allowed-os-versions><os-version min="11.0"/></allowed-os-versions></volume-check>
             <domains enable_localSystem="true"/>
-            <choices-outline><line choice="default"><line choice="io.mstream.server"/></line></choices-outline>
+            <choices-outline><line choice="default"><line choice="io.mstream.server"/>$CONSOLE_LINE</line></choices-outline>
             <choice id="default"/>
             <choice id="io.mstream.server" visible="false"><pkg-ref id="io.mstream.server"/></choice>
+            $CONSOLE_CHOICE$CONSOLE_REF
             <pkg-ref id="io.mstream.server" version="$VER" onConclusion="none">component.pkg</pkg-ref>
           </installer-gui-script>
           EOF
@@ -1149,8 +1240,45 @@ jobs:
           set -euo pipefail
           VER=$(node -pe "require('./package.json').version")
           PKG="dist/installer/mStream-$VER-darwin-arm64.pkg"
+          # Seed a RUNNING "old version" at the exact path the payload
+          # replaces, so the postinstall's restart path (terminate old,
+          # relaunch new as the console user) is proven here — not just its
+          # nothing-running no-op. A COMPILED stub, never a copied system
+          # binary: AMFI SIGKILLs a platform-signed binary run from inside a
+          # foreign .app (measured — a copied /bin/sleep dies at exec with
+          # 137, which would make this whole seed silently vacuous).
+          printf '#include <unistd.h>\nint main(void){for(;;)sleep(9);return 0;}\n' | cc -x c - -o old-stub
+          sudo mkdir -p /Applications/mStream.app/Contents/MacOS
+          sudo cp old-stub /Applications/mStream.app/Contents/MacOS/mStream
+          /Applications/mStream.app/Contents/MacOS/mStream &
+          OLD_PID=$!
+          sleep 1
+          kill -0 "$OLD_PID" 2>/dev/null || { echo "::error::the seeded old instance is not running - the restart-path test would be vacuous"; exit 1; }
           sudo installer -pkg "$PKG" -target /
           test -d /Applications/mStream.app || { echo "::error::pkg install did not produce /Applications/mStream.app"; exit 1; }
+          CONSOLE_APP="/Library/Application Support/mStream/console/Ghostty.app"
+          test -d "$CONSOLE_APP" || { echo "::error::pkg install did not produce $CONSOLE_APP"; exit 1; }
+          codesign --verify --strict "$CONSOLE_APP" || { echo "::error::bundled console signature broken after pkg install"; exit 1; }
+          # File-first, not `--version | head -1`: this step runs under
+          # pipefail, and head closing the pipe early would fail a healthy
+          # multi-line --version with SIGPIPE.
+          "$CONSOLE_APP/Contents/MacOS/ghostty" --version > "$RUNNER_TEMP/console-version.txt" 2>&1
+          head -1 "$RUNNER_TEMP/console-version.txt"
+          if kill -0 "$OLD_PID" 2>/dev/null; then
+            echo "::error::postinstall left the old running instance alive"; exit 1
+          fi
+          NEW=0
+          for i in $(seq 1 15); do
+            pgrep -f "^/Applications/mStream.app/Contents/MacOS/mStream" >/dev/null 2>&1 && { NEW=1; break; }
+            sleep 1
+          done
+          [ "$NEW" = "1" ] || { echo "::error::postinstall did not relaunch mStream"; exit 1; }
+          echo "postinstall restarted the running instance into the new app"
+          # Quiet the relaunched app before the deterministic half below
+          # (its server would otherwise boot on the runner's default port).
+          pkill -f "^/Applications/mStream.app/Contents/MacOS/" 2>/dev/null || true
+          sleep 2
+          pkill -9 -f "^/Applications/mStream.app/Contents/MacOS/" 2>/dev/null || true
           test -e /Applications/mStream.app/Contents/MacOS/webapp/index.html || { echo "::error::webapp symlink broken after pkg install"; exit 1; }
           OUT=$(/Applications/mStream.app/Contents/MacOS/mstream-server -V)
           echo "installed server -V -> $OUT"
@@ -1169,6 +1297,8 @@ jobs:
           echo "pkg-installed server served 200 on :3557"
           sudo rm -rf /Applications/mStream.app
           sudo pkgutil --forget io.mstream.server
+          sudo rm -rf "/Library/Application Support/mStream/console"
+          sudo pkgutil --forget io.mstream.console
           echo "PKG INSTALL SMOKE OK"
 
       # darwin-x64 is the one shipped artifact whose binaries never execute
@@ -1545,6 +1675,47 @@ jobs:
           echo "$OUT" | grep -Eq '^mstream-player [0-9]+\.[0-9]+\.[0-9]+' || { echo "::error::staged mstream-player --version produced no/invalid output"; echo "$OUT"; exit 1; }
           echo "OK: staged mstream-player executes ($(basename "$PL"))"
 
+      - name: Smoke test first-run invitation (fresh boot)
+        # The first-boot wizard invitation (server.js onListening): a
+        # pristine install must print the "not set up yet" browser line
+        # and - where the staged player can actually load - the exact
+        # runnable `"<player>" setup --server` command. Runs on a COPY of
+        # the staged bundle: the smoke battery above boots the bundle in
+        # place, so its save/ is no longer pristine. Kept as its own step
+        # on purpose - the main smoke's run block sits near the workflow
+        # expression cap.
+        if: matrix.smoke
+        shell: bash
+        run: |
+          D=$(ls -d dist/stage/mStream-*-${{ matrix.key }})
+          cp -R "$D" "$RUNNER_TEMP/inv"
+          rm -rf "$RUNNER_TEMP/inv/save" "$RUNNER_TEMP/inv/mStream.app/Contents/MacOS/save"   # DB-pristine on BOTH layouts: darwin's dataRoot lives inside the .app
+          case "${{ matrix.key }}" in
+            darwin-*) SRV="$RUNNER_TEMP/inv/mStream.app/Contents/MacOS/mstream-server" ;;
+            win-*)    SRV="$RUNNER_TEMP/inv/mstream-server.exe" ;;
+            *)        SRV="$RUNNER_TEMP/inv/mstream-server" ;;
+          esac
+          printf '{ "port": 3123, "address": "127.0.0.1" }' > "$RUNNER_TEMP/inv-config.json"
+          L="$RUNNER_TEMP/inv-boot.log"
+          "$SRV" -j "$RUNNER_TEMP/inv-config.json" > "$L" 2>&1 &
+          SPID=$!
+          for i in $(seq 1 40); do grep -q "Access mStream locally" "$L" 2>/dev/null && break; sleep 1; done
+          kill $SPID 2>/dev/null || true
+          grep -q "Access mStream locally: http://localhost:3123" "$L" || { echo "::error::fresh boot never listened"; tail -40 "$L"; exit 1; }
+          grep -q "not set up yet" "$L" || { echo "::error::first-run line missing on a pristine boot"; tail -40 "$L"; exit 1; }
+          WANT_WIZARD=yes
+          case "${{ matrix.key }}" in
+            linux-*) ldconfig -p 2>/dev/null | grep -q libasound.so.2 || WANT_WIZARD=no ;;
+          esac
+          if [ "$WANT_WIZARD" = yes ]; then
+            grep -q 'setup --server http://localhost:3123' "$L" || { echo "::error::wizard invitation missing (player staged and loadable)"; tail -40 "$L"; exit 1; }
+            PL=$(sed -n 's/.*Run: "\(.*\)" setup --server.*/\1/p' "$L" | head -1)
+            [ -f "$PL" ] || { echo "::error::printed wizard path does not exist: $PL"; exit 1; }
+            echo "OK: invitation printed a real player at $PL"
+          else
+            grep -q 'setup --server' "$L" && { echo "::error::wizard line printed but this runner has no libasound"; exit 1; }
+            echo "OK: no libasound on this runner - wizard line correctly suppressed"
+          fi
       - name: Smoke test desktop launcher (spawn + supervise + no-orphan)
         # The launcher IS the bundle's double-click face now. Prove the
         # integrated shape on each native leg: launcher finds its
