@@ -12,7 +12,35 @@
 // migration. The trigger DDL lives in SCHEMA_V31 — grep there.
 // ──────────────────────────────────────────────────────────────────────────
 
-export const SCHEMA_VERSION = 36;
+// Bumped to 42 after rebasing onto master's V36 (tracks.source). The
+// torrent feature's six migrations land as V37..V42 — see
+// memory/schema_migration_renumber.md for the established skip-numbering
+// pattern when a feature branch rebases onto a master that grew its own
+// V36+. Mapping (pre-rebase → post-rebase):
+//   V36 (users.allow_torrent)              → V37
+//   V37 (managed_torrents table)           → V38
+//   V38 (managed_torrents.client_type)     → V39
+//   V39 (torrent_client_vpath_access)      → V40
+//   V40 (managed_torrents.download_path)   → V41
+//   V41 (libraries.torrent_path_template)  → V42
+//
+// V48 adds the multi-art data model — art_files + the track_art /
+// album_art / artist_art junction sets, plus default-pointer companions
+// (provenance + pinned on tracks/albums; image_file/source/pinned on
+// artists, which had no image support before). The existing
+// album_art_file stays as the denormalized "default art" pointer, so
+// every existing reader keeps working unchanged. See SCHEMA_V48.
+// V49 is a rescan marker (no schema change): the scanners populate the
+// V48 art sets on re-parse, so upgrades force one resumable rescan to
+// backfill existing libraries' galleries. See SCHEMA_V49.
+// V50 adds art_files.content_hash — image identity as a DB join, for
+// gallery dedupe and the external art downloader. See SCHEMA_V50.
+// V51 adds album_art_lookups — the downloader's per-album attempt cache
+// (cooldowns so rate-limited services aren't re-hammered). See SCHEMA_V51.
+// V52 repairs canonical-hash drift in the user-state tables: mis-keyed
+// rows re-keyed (with merge), '' hashes normalized to NULL, dead all-null
+// rows dropped, user_bookmarks gains its rekey index. See SCHEMA_V52.
+export const SCHEMA_VERSION = 52;
 
 export const SCHEMA_V1 = `
   -- Users
@@ -158,7 +186,6 @@ export const SCHEMA_V1 = `
   CREATE INDEX IF NOT EXISTS idx_tracks_album ON tracks(album_id);
   CREATE INDEX IF NOT EXISTS idx_tracks_hash ON tracks(file_hash);
   CREATE INDEX IF NOT EXISTS idx_tracks_filepath ON tracks(filepath, library_id);
-  CREATE INDEX IF NOT EXISTS idx_tracks_scan ON tracks(scan_id);
   CREATE INDEX IF NOT EXISTS idx_user_metadata_hash ON user_metadata(track_hash);
   CREATE INDEX IF NOT EXISTS idx_user_metadata_user ON user_metadata(user_id);
   CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist ON playlist_tracks(playlist_id);
@@ -422,6 +449,8 @@ export const SCHEMA_V18 = `
   -- user_album_stars references the old fragmented album_ids; the
   -- album-migration helper (src/db/album-migration.js, mirrored in
   -- rust-parser) remaps those during the rescan so stars survive.
+  -- That only works because the TEMP-table dance below carries the
+  -- star rows across the table rebuild in the first place.
 
   -- Step 1: albums column additions (cheap, no rebuild).
   ALTER TABLE albums ADD COLUMN album_artist TEXT;
@@ -429,8 +458,32 @@ export const SCHEMA_V18 = `
 
   -- Step 2: table rebuild for the new UNIQUE. The existing albums row
   -- data is preserved verbatim — the scanner will fix up semantics on
-  -- the next rescan. Foreign keys from tracks/user_album_stars to
-  -- albums survive because we keep the same id values.
+  -- the next rescan.
+  --
+  -- The migration runner has PRAGMA foreign_keys=ON, and DROP TABLE
+  -- under foreign_keys=ON performs an implicit DELETE FROM first,
+  -- which FIRES foreign-key actions on child tables (it skips
+  -- triggers, but not FK actions). At this point in the chain albums
+  -- has two children: tracks.album_id (ON DELETE SET NULL, V1) and
+  -- user_album_stars.album_id (ON DELETE CASCADE, V11). Unprotected,
+  -- the drop nulls every track's album link and permanently empties
+  -- user_album_stars. So: same TEMP-table dance as V24 — snapshot the
+  -- child data, let the drop fire, restore after the rename. Album
+  -- ids are copied verbatim into albums_new, so the restored rows
+  -- pass FK checks against the new table.
+  CREATE TEMP TABLE _v18_album_stars_backup AS SELECT * FROM user_album_stars;
+  CREATE TEMP TABLE _v18_track_album_backup AS
+    SELECT id, album_id FROM tracks WHERE album_id IS NOT NULL;
+  -- Without this index the restore UPDATE's correlated subquery scans
+  -- the whole backup per track — O(n²), measured 7.7 min at 100k tracks
+  -- vs 1.8 s indexed. Dropped automatically with its TEMP table.
+  CREATE INDEX _v18_track_album_backup_idx ON _v18_track_album_backup(id);
+
+  -- Empty the CASCADE child explicitly (same reasoning as V24): the
+  -- TEMP backup holds the data, and the DROP then has no inbound
+  -- CASCADE references left to act on.
+  DELETE FROM user_album_stars;
+
   CREATE TABLE albums_new (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -447,6 +500,15 @@ export const SCHEMA_V18 = `
   DROP TABLE albums;
   ALTER TABLE albums_new RENAME TO albums;
   CREATE INDEX IF NOT EXISTS idx_albums_artist ON albums(artist_id);
+
+  -- Restore the child data the DROP just clobbered.
+  UPDATE tracks SET album_id = (
+    SELECT b.album_id FROM _v18_track_album_backup b WHERE b.id = tracks.id
+  ) WHERE id IN (SELECT id FROM _v18_track_album_backup);
+  INSERT INTO user_album_stars SELECT * FROM _v18_album_stars_backup;
+
+  DROP TABLE _v18_album_stars_backup;
+  DROP TABLE _v18_track_album_backup;
 
   -- Step 3: M2M join tables. position preserves author/tag order so
   -- "Artist A feat. Artist B" stays in that order when emitted.
@@ -659,9 +721,8 @@ export const SCHEMA_V24 = `
   -- valid references — but DROP TABLE in SQLite DOES fire ON DELETE
   -- CASCADE when foreign_keys are enabled, so we have to back the M2M
   -- rows out into TEMP tables, empty the M2M tables, do the rebuild,
-  -- then restore. (V18's albums rebuild didn't need this dance because
-  -- album_artists/track_artists were created NEW in the same migration
-  -- and had no preexisting rows to lose.)
+  -- then restore. (V18's albums rebuild does the same dance for
+  -- user_album_stars and tracks.album_id.)
   --
   -- Not rescanRequired: data is preserved, just re-typed.
 
@@ -1155,13 +1216,15 @@ export const SCHEMA_V35 = `
 // their own labels without a migration.
 //
 // WHY A COLUMN AT ALL (vs. overloading `scan_id` as ytdl historically did):
-//   `scan_id` is the scanner's sweep marker — every scan generates a
-//   fresh UUID and the post-scan `DELETE FROM tracks WHERE scan_id != ?`
-//   evicts unswept rows. Any scan that touches the file (even just to
-//   bump the marker via `UPDATE tracks SET scan_id = ?` on the mtime
-//   fast path) silently overwrites the 'ytdl' label. So `scan_id` was
-//   never effective provenance. `source` is purpose-built and survives
-//   rescans.
+//   `scan_id` was the scanner's sweep marker at the time — every scan
+//   generated a fresh UUID, the post-scan `DELETE FROM tracks WHERE
+//   scan_id != ?` evicted unswept rows, and any scan that touched the
+//   file (even just the mtime fast path's marker bump) silently
+//   overwrote the 'ytdl' label. So `scan_id` was never effective
+//   provenance. `source` is purpose-built and survives rescans. (The
+//   sweep marker itself has since moved into scanner memory — the
+//   seen-set — and `scan_id` now only records the scan epoch that last
+//   REWROTE a row, which the boot-migration resume fast-path keys on.)
 //
 // WHY 'source' (not 'provider' / 'download_source'):
 //   - Short. Matches the verbiage of `play_events.source` (V7) and
@@ -1189,6 +1252,696 @@ export const SCHEMA_V35 = `
 // list — same gotcha as `audio_hash`, `bpm`, etc.
 export const SCHEMA_V36 = `
   ALTER TABLE tracks ADD COLUMN source TEXT;
+`;
+
+// ── Torrent-feature migrations (V37–V42) ─────────────────────────────
+//
+// These six landed on the torrent-feature branch as V36..V41 and were
+// renumbered to V37..V42 during the rebase onto master's V36
+// (tracks.source). The skip-numbering pattern preserves master's
+// user_version trajectory + lets older databases that ran the
+// pre-rebase branch migrations cleanly continue forward — see
+// memory/schema_migration_renumber.md.
+
+// V37: torrent-client integration UX layer. Adds users.allow_torrent
+// (0/1), the per-user whitelist flag consulted only when
+// config.program.torrent.enabledFor === 'whitelist'. Default 0 because
+// flipping enabledFor to 'whitelist' should fail closed — every user
+// starts without access and the admin grants explicitly. In 'all' mode
+// the column is ignored (every authenticated user has access).
+//
+// Forward-only, no rescan: scanner doesn't read this column.
+export const SCHEMA_V37 = `
+  ALTER TABLE users ADD COLUMN allow_torrent INTEGER NOT NULL DEFAULT 0;
+`;
+
+// V38: minimal "managed by mStream" tracking table. Populated by the
+// add-torrent flow; consulted by list endpoints so the admin UI can
+// distinguish torrents added through mStream from those added
+// directly through the daemon's own clients.
+//
+// Intentionally minimal — `info_hash` is the durable join key against
+// the daemon (numeric IDs rotate on daemon restart), `user_id` names
+// the mStream user who added it, `vpath` holds the target library,
+// `added_at` is for sorting / audit. Fuller design-doc fields
+// (metainfo_blob, user_metadata_json, completed_at, client_torrent_id,
+// removed_at) land in their own migrations as features ship.
+export const SCHEMA_V38 = `
+  CREATE TABLE IF NOT EXISTS managed_torrents (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    info_hash TEXT NOT NULL UNIQUE,
+    user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    vpath     TEXT,
+    added_at  INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_managed_torrents_user ON managed_torrents(user_id);
+`;
+
+// V39: multi-client support. Adds `client_type` to managed_torrents
+// and rotates the UNIQUE constraint from `info_hash` alone to
+// `(info_hash, client_type)`. The same physical torrent can now be
+// registered against both a Transmission and a qBittorrent backend
+// in parallel — common when an admin migrates between clients but
+// keeps both running for the transition window.
+//
+// SQLite can't ADD a UNIQUE constraint to an existing column, so we
+// do the canonical table-swap: build the new shape alongside, copy
+// rows (backfilling client_type='transmission' since that was the
+// only client through V38), drop the old, rename. Wrapped in the
+// migration runner's per-version BEGIN/COMMIT — safe to crash mid-
+// way.
+//
+// Indexed for both join patterns the /list endpoint uses:
+//   (info_hash, client_type) — admin UI lookup for "is this hash
+//     mStream-managed against the active client?"
+//   user_id                  — per-user list ("show me my torrents").
+export const SCHEMA_V39 = `
+  CREATE TABLE managed_torrents_new (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    info_hash   TEXT NOT NULL,
+    client_type TEXT NOT NULL,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    vpath       TEXT,
+    added_at    INTEGER NOT NULL,
+    UNIQUE(info_hash, client_type)
+  );
+  INSERT INTO managed_torrents_new (id, info_hash, client_type, user_id, vpath, added_at)
+    SELECT id, info_hash, 'transmission', user_id, vpath, added_at FROM managed_torrents;
+  DROP TABLE managed_torrents;
+  ALTER TABLE managed_torrents_new RENAME TO managed_torrents;
+  CREATE INDEX idx_managed_torrents_user ON managed_torrents(user_id);
+  CREATE INDEX idx_managed_torrents_hash_client ON managed_torrents(info_hash, client_type);
+`;
+
+// V40: per-(client, vpath) access-mapping cache. Driven by the
+// path-probe pipeline — when an admin connects a torrent client we
+// run candidate generators against each library vpath, record which
+// generator (if any) verified the daemon-side path, and cache the
+// resolved daemon_path. The add-torrent gate consults this table:
+// confidence ∈ {verified, inferred} = allowed; 'unconfirmed' or
+// missing row = 4xx with "go confirm the path first."
+//
+// `source` records *how* we got the mapping so operators looking at
+// the admin UI can tell apart "this was an auto-detect hit" from
+// "this is what you typed in manually." Manual entries are sticky —
+// once `source='manual'` the auto-detect sweep skips this row (the
+// user-supplied value wins over our guesses).
+//
+// `vpath_name` is a soft join to libraries.name (no FK so probe
+// history survives a vpath rename/delete; a stale row is cheap and
+// the next sweep cleans it).
+export const SCHEMA_V40 = `
+  CREATE TABLE IF NOT EXISTS torrent_client_vpath_access (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_type       TEXT NOT NULL,
+    vpath_name        TEXT NOT NULL,
+    daemon_path       TEXT,
+    mstream_writable  INTEGER,
+    confidence        TEXT NOT NULL,
+    source            TEXT,
+    method            TEXT,
+    last_probed_at    INTEGER NOT NULL,
+    last_error        TEXT,
+    UNIQUE(client_type, vpath_name)
+  );
+  CREATE INDEX IF NOT EXISTS idx_tcv_access_client
+    ON torrent_client_vpath_access(client_type);
+`;
+
+// V41: managed_torrents.download_path — the daemon-side absolute path
+// each managed torrent was added with. Snapshot at add-time, never
+// refreshed. Lets list/admin endpoints answer "where do this torrent's
+// files live?" without a daemon round-trip, and survives the daemon
+// being offline.
+//
+// Nullable so existing rows (seeded before this column existed) don't
+// force a backfill. Every new row from POST /api/v1/torrent/add
+// populates it.
+export const SCHEMA_V41 = `
+  ALTER TABLE managed_torrents ADD COLUMN download_path TEXT;
+`;
+
+// V42: libraries.torrent_path_template — operator-supplied template
+// string the player UI uses to construct the destination path when a
+// torrent is added. Resolution happens client-side (live preview as
+// the operator edits metadata) and re-validates server-side before
+// any /torrent/add call.
+//
+// Nullable: NULL = "no template, use the legacy freeform input".
+// Existing libraries default to NULL on upgrade. See
+// src/torrent/path-template.js for the syntax + sanitisation.
+export const SCHEMA_V42 = `
+  ALTER TABLE libraries ADD COLUMN torrent_path_template TEXT;
+`;
+
+// V43: index hygiene + one missing sort index. No data change, no rescan.
+//
+//  • idx_tracks_created_at — "recently added" listings (default-UI
+//    /api/v1/db/recent/added, Subsonic getAlbumList?type=newest, DLNA recent)
+//    order by tracks.created_at, which had no index, so SQLite materialised a
+//    full-table temp B-tree to sort before applying LIMIT. With the index it
+//    walks rows in created_at order and stops at LIMIT.
+//
+//  • The four dropped indexes are single-column (user_id) indexes that are
+//    exact left-prefixes of their table's PRIMARY KEY / UNIQUE composite
+//    (user_metadata UNIQUE(user_id, track_hash); user_album_stars /
+//    user_artist_stars / user_bookmarks PK(user_id, …)). The composite
+//    autoindex already serves every lookup they covered, so they only added
+//    write amplification on the hottest per-user write tables (scrobbles,
+//    ratings, stars, bookmarks). Historical migrations are immutable, so we
+//    drop them here rather than editing V1/V11/V12. DROP IF EXISTS is
+//    forward-only and safe (idempotent on installs that never had them).
+export const SCHEMA_V43 = `
+  CREATE INDEX IF NOT EXISTS idx_tracks_created_at ON tracks(created_at);
+
+  DROP INDEX IF EXISTS idx_user_metadata_user;
+  DROP INDEX IF EXISTS idx_user_album_stars_user;
+  DROP INDEX IF EXISTS idx_user_artist_stars_user;
+  DROP INDEX IF EXISTS idx_user_bookmarks_user;
+`;
+
+// V44 drops idx_tracks_filepath. It indexes tracks(filepath, library_id) —
+// the exact same columns, in the same order, as the UNIQUE(filepath,
+// library_id) constraint, whose auto-index (sqlite_autoindex_tracks_1)
+// already serves every lookup the explicit index did (the getTrack
+// equality probe and the UPSERT conflict resolution). The duplicate just
+// doubled the filepath b-tree maintenance on every track INSERT/UPSERT —
+// pure write-amplification on the scanner's hottest path. Index-only, no
+// rescan. The base-schema CREATE is left in place (immutable migration
+// history); this DROP runs after it on both fresh and existing DBs.
+export const SCHEMA_V44 = `
+  DROP INDEX IF EXISTS idx_tracks_filepath;
+`;
+
+// V45: track/disc totals. Surfaced through the track-metadata API.
+// Populated by both scanners from embedded tags — lofty track_total() /
+// disk_total(); music-metadata track.of / disk.of. NULL on rows written
+// before V45; rescanRequired triggers a backfill rescan, same as the V16
+// audio-format columns. (bitrate and file_size, populated by the same
+// scanner change, need no migration — both columns have existed unused
+// since SCHEMA_V1.)
+//
+// NOTE: this migration was authored as "V43" on a pre-V43 base and
+// renumbered to V45 when rebased — master had since shipped a DIFFERENT
+// V43 (index hygiene) and V44. Reusing an already-shipped version number
+// would make every production DB silently skip these ALTERs forever
+// while the scanners bind the new columns.
+//
+// Composer is intentionally NOT a tracks column: it belongs in the
+// track_artists M2M as role='composer' (the documented intent of that
+// table's role enum, and the industry-standard model — Navidrome
+// participants, Lyrion contributors, Kodi roles). That's a follow-up
+// built on top of this PR.
+export const SCHEMA_V45 = `
+  ALTER TABLE tracks ADD COLUMN track_total INTEGER;
+  ALTER TABLE tracks ADD COLUMN disc_total  INTEGER;
+`;
+
+// V46: one-shot repair of REAL values in INTEGER-affinity columns. The JS
+// scanner used to store raw stat.mtimeMs — fractional on NTFS/ext4 — into
+// lyrics_sidecar_mtime (and could in principle into modified), where
+// SQLite keeps it as REAL. The Rust scanner's typed reads rejected REAL
+// with InvalidColumnType, so ONE poisoned row aborted every subsequent
+// Rust scan of that library (exit 1, and the JS fallback only triggers on
+// spawn errors — scans stayed dead until manual intervention). The
+// writers now truncate (lyrics-extraction.js) and the Rust reads are
+// tolerant (load_existing_tracks reads via f64), but already-poisoned
+// rows still cause permanent sidecar re-parse loops (fractional stored
+// value never equals the truncated probe) — CAST them once. typeof()
+// guards make this a no-op table scan on healthy DBs. Index-only-style
+// data fix: no rescan required.
+export const SCHEMA_V46 = `
+  UPDATE tracks SET lyrics_sidecar_mtime = CAST(lyrics_sidecar_mtime AS INTEGER)
+   WHERE typeof(lyrics_sidecar_mtime) = 'real';
+  UPDATE tracks SET modified = CAST(modified AS INTEGER)
+   WHERE typeof(modified) = 'real';
+`;
+
+// V47: drop idx_tracks_scan — pure write-amplification with no readers.
+// The only query that ever filtered tracks by scan_id was the stale
+// sweep's `scan_id != ?`, which SQLite cannot drive with an index (it
+// planned via idx_tracks_library instead) — and the sweep now derives
+// its candidates from the scanner's in-memory seen-set, so even that
+// non-consumer is gone. All scan_id EQUALITY lookups target the separate
+// scan_progress table. Meanwhile every tracks INSERT/UPSERT paid an
+// extra b-tree insert maintaining it, and the historical per-unchanged-
+// file scan_id bump paid a key delete+insert per row. Same dead-index
+// class V44 removed for idx_tracks_filepath. Index-only: no rescan.
+// (Removed from SCHEMA_V1 too; fresh DBs replay the whole migration
+// chain, so they still create it transiently at the V24 tracks rebuild
+// and drop it here — IF EXISTS covers every path.)
+export const SCHEMA_V47 = `
+  DROP INDEX IF EXISTS idx_tracks_scan;
+`;
+
+// V48: the multi-art data model. A track, album, or artist can carry MANY
+// images instead of (at most) one. Schema only — no writer populates the
+// new tables yet; the scanners (full per-song image sets), the manual-art
+// API (galleries, set-default), and the post-scan art backfill build on
+// this in follow-up PRs.
+//
+//   art_files — one row per distinct image, in one of two KINDS:
+//     'cached'    — a copy WE own in albumArtDirectory ("<hash>.<ext>",
+//                   with thumbnail variants). Used for embedded art,
+//                   fetched art, and whatever is the current default (so
+//                   the primary cover is always fast + thumbnailed).
+//                   cache_file is the filename.
+//     'reference' — an image already living in the user's library; we
+//                   never copy or delete it, just point at it
+//                   (library_id + rel_path) and stream it from disk.
+//                   Used for loose folder images (back.jpg, booklet
+//                   scans, artist photos). INVARIANT (enforced by the
+//                   writers, not a CHECK — matching house style):
+//                   'cached' rows have cache_file; 'reference' rows have
+//                   library_id + rel_path.
+//
+//   track_art / album_art / artist_art — the membership SETS. The default
+//     is deliberately NOT flagged on the junction: it's the member whose
+//     cache_file equals the owner's denormalized pointer
+//     (tracks/albums.album_art_file, artists.image_file). source and
+//     picture_type are per-link because the same image can be embedded in
+//     one file, a folder.jpg near another, and an artist photo elsewhere.
+//
+//   tracks/albums.album_art_pinned, artists.image_pinned — when 1, the
+//     user chose this default and a rescan must not re-elect over it. (A
+//     property of the default, so it lives next to the pointer column
+//     rather than on the junction.)
+//
+//   tracks/albums.album_art_source, artists.image_source — provenance:
+//     WHERE the current default came from ('embedded' / 'folder' from the
+//     scanners; 'musicbrainz' / 'itunes' / 'deezer' / 'discogs' from
+//     fetchers; 'upload' / 'url' from the manual endpoints). Open-enum
+//     TEXT, no CHECK — same convention as tracks.source (V36) and
+//     tracks.bpm_source (V32). NULL = unknown: every pre-existing row,
+//     plus anything written before the writers learn to stamp it.
+//
+//   artists.image_file — artists had NO image support at all; they get
+//     the same denormalized-default trio as tracks/albums so the future
+//     artist-image work (folder artist.jpg, external lookups) is pure
+//     data writes with no further migration. Nothing seeds it.
+//
+// Backfill seeds the new model from today's single-art world so existing
+// covers carry over as the default: one 'cached' art_files row per
+// distinct cover in use (a shared album cover dedups to a single row via
+// UNION), then a junction link for every track/album that has one.
+// width/height/byte_size are left NULL — populated opportunistically
+// later, not worth decoding every image during a migration. The
+// junctions' source is NULL (album_art_source is brand-new in this same
+// migration, so there is no provenance to copy yet).
+//
+// NOT rescanRequired: existing art is preserved as the default
+// immediately, and no scanner binds the new columns yet. The FULL
+// per-song image set lands with the scanner PR (force-rescan to
+// backfill).
+//
+// TRIGGER SURVIVAL: V31's FTS5 triggers attach to tracks, artists, and
+// albums but reference none of these columns, and ALTER TABLE ADD COLUMN
+// keeps triggers — safe. Any FUTURE rebuild of those tables (the *_new
+// swap pattern) MUST carry album_art_source / album_art_pinned /
+// image_file / image_source / image_pinned in the new column list — same
+// gotcha as audio_hash / source / bpm.
+//
+// REBUILD CASCADE HAZARD (new with V48): tracks/albums/artists now each
+// have an ON DELETE CASCADE child (track_art / album_art / artist_art),
+// and with foreign_keys=ON a DROP TABLE performs an implicit DELETE that
+// FIRES those cascades — a naive rebuild would silently erase every art
+// link (user-curated data once pinning/manual art ship, NOT
+// rescan-derivable). A future rebuild must also back the junction rows
+// out into TEMP tables first — see SCHEMA_V24 for the pattern.
+export const SCHEMA_V48 = `
+  ALTER TABLE tracks  ADD COLUMN album_art_source TEXT;
+  ALTER TABLE tracks  ADD COLUMN album_art_pinned INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE albums  ADD COLUMN album_art_source TEXT;
+  ALTER TABLE albums  ADD COLUMN album_art_pinned INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE artists ADD COLUMN image_file   TEXT;
+  ALTER TABLE artists ADD COLUMN image_source TEXT;
+  ALTER TABLE artists ADD COLUMN image_pinned INTEGER NOT NULL DEFAULT 0;
+
+  CREATE TABLE IF NOT EXISTS art_files (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,        -- 'cached' | 'reference'
+    cache_file  TEXT,                 -- "<hash>.<ext>" in albumArtDirectory (cached)
+    library_id  INTEGER REFERENCES libraries(id) ON DELETE CASCADE,  -- reference
+    rel_path    TEXT,                 -- library-relative image path (reference)
+    width       INTEGER,
+    height      INTEGER,
+    byte_size   INTEGER,
+    created_at  TEXT DEFAULT (datetime('now'))
+  );
+  -- Dedup within each kind. Partial indexes so cached rows (NULL
+  -- library_id/rel_path) and reference rows (NULL cache_file) don't
+  -- collide with each other.
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_art_files_cache
+    ON art_files(cache_file) WHERE kind = 'cached';
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_art_files_ref
+    ON art_files(library_id, rel_path) WHERE kind = 'reference';
+  -- FK-enforcement index for the libraries → art_files CASCADE. SQLite's
+  -- child-key lookup probes library_id ALONE, which can't use the partial
+  -- idx_art_files_ref (its kind predicate isn't implied), so without this
+  -- a library DELETE full-scans art_files ON THE SERVER CONNECTION
+  -- (~100ms at 200k rows, blocking the event loop). Plain, not partial:
+  -- the same can't-prove-the-predicate problem would apply.
+  CREATE INDEX IF NOT EXISTS idx_art_files_library ON art_files(library_id);
+
+  CREATE TABLE IF NOT EXISTS track_art (
+    track_id     INTEGER NOT NULL REFERENCES tracks(id)    ON DELETE CASCADE,
+    art_id       INTEGER NOT NULL REFERENCES art_files(id) ON DELETE CASCADE,
+    source       TEXT,
+    picture_type TEXT,                -- 'front' | 'back' | 'artist' | 'other' | NULL
+    position     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (track_id, art_id)
+  );
+  -- Reverse lookup for "is this art still referenced?" (orphan cleanup).
+  CREATE INDEX IF NOT EXISTS idx_track_art_art ON track_art(art_id);
+
+  CREATE TABLE IF NOT EXISTS album_art (
+    album_id     INTEGER NOT NULL REFERENCES albums(id)    ON DELETE CASCADE,
+    art_id       INTEGER NOT NULL REFERENCES art_files(id) ON DELETE CASCADE,
+    source       TEXT,
+    picture_type TEXT,
+    position     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (album_id, art_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_album_art_art ON album_art(art_id);
+
+  CREATE TABLE IF NOT EXISTS artist_art (
+    artist_id    INTEGER NOT NULL REFERENCES artists(id)   ON DELETE CASCADE,
+    art_id       INTEGER NOT NULL REFERENCES art_files(id) ON DELETE CASCADE,
+    source       TEXT,
+    picture_type TEXT,
+    position     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (artist_id, art_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_artist_art_art ON artist_art(art_id);
+
+  -- Backfill: one cached art_files row per distinct cover currently in
+  -- use. '' is excluded along with NULL — no writer produces it, but a
+  -- decade of upgraded DBs can carry junk, and an empty-string "cover"
+  -- must not become a real art row.
+  INSERT INTO art_files (kind, cache_file)
+    SELECT 'cached', f FROM (
+      SELECT album_art_file AS f FROM tracks WHERE album_art_file IS NOT NULL AND album_art_file != ''
+      UNION
+      SELECT album_art_file AS f FROM albums WHERE album_art_file IS NOT NULL AND album_art_file != ''
+    );
+  -- ...then link every track/album that has a cover to its art row.
+  -- (Artists have nothing to seed — no artist images existed before V48.)
+  INSERT INTO track_art (track_id, art_id, source, picture_type, position)
+    SELECT t.id, af.id, NULL, NULL, 0
+      FROM tracks t
+      JOIN art_files af ON af.kind = 'cached' AND af.cache_file = t.album_art_file
+     WHERE t.album_art_file IS NOT NULL AND t.album_art_file != '';
+  INSERT INTO album_art (album_id, art_id, source, picture_type, position)
+    SELECT al.id, af.id, NULL, NULL, 0
+      FROM albums al
+      JOIN art_files af ON af.kind = 'cached' AND af.cache_file = al.album_art_file
+     WHERE al.album_art_file IS NOT NULL AND al.album_art_file != '';
+`;
+
+// V49: rescan marker only — no schema change. V48 created the multi-art
+// tables but (deliberately, to keep that PR schema-only) nothing populated
+// them beyond the single-cover seed. The scanners now capture the FULL
+// per-track image set (every embedded picture + every folder image), and
+// they only do that work when a file is (re)parsed — unchanged files ride
+// the mtime fast-path. Without a forced re-parse, upgraded libraries would
+// show single-image galleries forever (or until the user guessed at a
+// manual force-rescan). rescanRequired writes the .rescan-pending marker so
+// the next boot runs the resumable migration rescan and populates the art
+// sets automatically — same mechanism as the V16/V45 column backfills, and
+// safe on huge libraries (the rescan resumes across restarts).
+//
+// SELECT 1 because the runner unconditionally exec()s migration SQL inside
+// its transaction — a trivial statement keeps that path uniform.
+export const SCHEMA_V49 = `
+  SELECT 1;
+`;
+
+// V50: art_files.content_hash — lowercase MD5 hex of the image bytes, for
+// EVERY art row regardless of kind. The two identities the V48 model keeps
+// for one picture ('cached' copy we own vs 'reference' pointed at in the
+// library) were previously comparable only by reading file bytes; the hash
+// makes image identity a DB join. Consumers:
+//   - gallery dedupe (the album-union duplicate: a folder cover elected as
+//     one track's cached default AND referenced by its album-mates is the
+//     same image twice — collapsible by hash, exactly, not by heuristic);
+//   - the upcoming external art downloader: hash the downloaded bytes and
+//     link an existing row instead of minting a duplicate; recognise that
+//     a service returned the image the album already carries; skip writing
+//     a cover.jpg whose content already exists in the folder.
+//
+// INVARIANT: for 'cached' rows the hash IS the cache_file stem (the cache
+// is content-addressed by the same MD5) — which is why the backfill below
+// can populate every cached row exactly, in SQL, with no file reads.
+// 'reference' rows start NULL (their bytes have never been read — the
+// whole point of references) and the scanners fill them: each folder image
+// is read+hashed ONCE when first indexed, with already-hashed rel_paths
+// skipped via the scan-start snapshot, and pre-V50 NULL rows heal as their
+// directories re-parse. byte_size rides along (free once we hold the
+// bytes); width/height stay NULL (they'd need a decode).
+//
+// MD5, not something stronger: this is content addressing for dedup,
+// consistent with file_hash / audio_hash / the cache filenames themselves.
+// Plain non-unique index — the same content legitimately exists as both a
+// cached and a reference row (and as references in multiple libraries);
+// the hot query is the downloader's "do we already have this image?"
+// equality probe.
+//
+// rescanRequired: the forced (resumable) boot rescan populates reference
+// hashes. Free for release users — V49 already forces one, and multiple
+// pending rescanRequired migrations coalesce into a single marker/rescan.
+export const SCHEMA_V50 = `
+  ALTER TABLE art_files ADD COLUMN content_hash TEXT;
+
+  UPDATE art_files
+     SET content_hash = lower(substr(cache_file, 1, instr(cache_file, '.') - 1))
+   WHERE kind = 'cached' AND cache_file IS NOT NULL AND instr(cache_file, '.') > 1;
+
+  CREATE INDEX IF NOT EXISTS idx_art_files_hash ON art_files(content_hash);
+`;
+
+// V51: album-art download negative cache. The post-scan downloader
+// (src/db/album-art-backfill.mjs) queries external services (MusicBrainz /
+// iTunes / Deezer) per album. Those services are rate-limited, and most
+// albums that have no art locally have none online either — without a
+// record of what we already tried, every scheduled scan would re-query the
+// same dead ends forever and hammer the services.
+//
+// One row per attempted album:
+//   outcome 'found'    — art located + written. In 'missing' mode the
+//                        album's album_art_file is now set so it won't be
+//                        re-selected anyway; in 'all' mode the row's
+//                        cooldown is what prevents endless re-fetching.
+//   outcome 'notfound' — no configured service had art; long cooldown (an
+//                        obscure release rarely gains cover art later).
+//   outcome 'error'    — network/transport trouble (timeout, 5xx, rate
+//                        limit); short cooldown, likely transient.
+// attempts is a running counter for diagnostics. fetched_hash records the
+// V50 content hash of what a 'found' attempt downloaded — lets a later
+// run (or the admin UI) distinguish "service still has the same image"
+// from "service art changed".
+//
+// ON DELETE CASCADE: an album orphan-cleaned away takes its lookup row
+// with it; if the album later reappears it is legitimately a fresh lookup.
+//
+// NOT rescanRequired: neither scanner touches this table, and existing
+// albums simply start with no row — "never attempted, eligible now".
+export const SCHEMA_V51 = `
+  CREATE TABLE IF NOT EXISTS album_art_lookups (
+    album_id        INTEGER PRIMARY KEY REFERENCES albums(id) ON DELETE CASCADE,
+    last_attempt_at INTEGER NOT NULL,
+    outcome         TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 1,
+    fetched_hash    TEXT
+  );
+
+  -- One-time normalization of legacy empty-string covers to NULL. The V48
+  -- seed already EXCLUDED '' as junk, but the rows themselves survived —
+  -- and every art writer/reader gates on IS NULL, so a ''-art album was
+  -- structurally unfillable: invisible to the downloader's missing-mode
+  -- selection AND unmatchable by its fill-NULL stamping. No current
+  -- writer produces '' (scanners write NULL or a filename), so this
+  -- converges for good.
+  UPDATE albums SET album_art_file = NULL WHERE album_art_file = '';
+  UPDATE tracks SET album_art_file = NULL WHERE album_art_file = '';
+`;
+
+// V52: canonical-hash repair for the user-state tables.
+//
+// Every reader joins user state on COALESCE(audio_hash, file_hash) — the
+// canonical identity — but two writer-side defects keyed rows off it:
+// scrobble-by-filepath never SELECTed audio_hash (so its upsert keyed on
+// file_hash even when the canonical was audio_hash; those plays were
+// invisible to recently/most-played and frequent lists), and '' hashes
+// gave COALESCE a third semantic (writers' `||` treats '' as falsy, SQL's
+// COALESCE doesn't). The scanner's rekey only migrates the canonical
+// hash, so mis-keyed rows could NEVER heal on their own.
+//
+// Order matters: normalize '' → NULL FIRST (so the rekey map is built
+// from clean identities), then merge-and-rekey, then drop dead rows.
+//
+// The rekey map is a TEMP table (indexed) rather than per-row tracks
+// probes — tracks.file_hash has no index, and a correlated probe would
+// be user-rows × full-table-scans. Two files with identical bytes share
+// one audio_hash but have distinct file_hashes, so old→new is many-to-
+// one: aggregates (SUM/MIN/MAX) merge ALL old rows, not LIMIT-1.
+//
+// Merge semantics when a user holds rows under BOTH identities:
+//   play_count  summed (every play happened),
+//   starred_at  earliest non-NULL (when did they first star it),
+//   last_played latest non-NULL,
+//   rating      canonical row's wins, else the old row's.
+// Bookmarks: the most recently changed row wins outright (a bookmark is
+// a position, not an aggregate). lyrics_cache: the canonical row wins
+// (it was written by the live read path); old-keyed rows drop.
+//
+// Dead-row cleanup: unstar used to INSERT-then-NULL (leaving all-null
+// rows), and ''-keyed rows are unreachable by every reader. Both go.
+//
+// idx_user_bookmarks_hash: the scanner rekey UPDATE filters on
+// track_hash, which the (user_id, track_hash) PK can't serve —
+// user_metadata has had idx_user_metadata_hash for the same reason.
+//
+// NOT rescanRequired: repairs existing rows only; no scanner contract
+// changes.
+export const SCHEMA_V52 = `
+  UPDATE tracks SET audio_hash = NULL WHERE audio_hash = '';
+  UPDATE tracks SET file_hash  = NULL WHERE file_hash  = '';
+  DELETE FROM user_metadata  WHERE track_hash = '';
+  DELETE FROM user_bookmarks WHERE track_hash = '';
+
+  CREATE TEMP TABLE _v52_rekey AS
+    SELECT DISTINCT file_hash AS old_hash, audio_hash AS new_hash
+      FROM tracks
+     WHERE audio_hash IS NOT NULL AND file_hash IS NOT NULL
+       AND audio_hash != file_hash;
+  -- DISTINCT is load-bearing: byte-identical duplicate files repeat the
+  -- (file_hash, audio_hash) pair, and a duplicated map row would multiply
+  -- the SUM merge below by the copy count. old_hash is functionally
+  -- unique after DISTINCT (same file bytes imply the same audio bytes).
+  -- BOTH indexes are load-bearing: old_hash drives the old-row probes;
+  -- new_hash drives every canonical-row correlation — without it the
+  -- merge re-scans each user's whole row set per row, O(rows²) per user
+  -- (measured: a 100k-row fixture didn't finish in 15 minutes).
+  CREATE INDEX _v52_rekey_old ON _v52_rekey(old_hash);
+  CREATE INDEX _v52_rekey_new ON _v52_rekey(new_hash);
+
+  -- Uniform stub → merge → delete flow. There is deliberately NO
+  -- separate "re-key the rest" UPDATE: with two old hashes mapping to
+  -- one canonical and no canonical row (two re-tagged copies, plays on
+  -- both via the old scrobbler path), a bare re-key mints duplicate
+  -- (user_id, hash) keys and the UNIQUE throw aborts EVERY boot.
+  -- Instead a zero-state stub guarantees the canonical row exists, the
+  -- aggregate merge folds ALL old rows into it in one pass, and the old
+  -- rows drop. Stubs that merged nothing real are caught by the dead-row
+  -- DELETE at the end.
+  INSERT OR IGNORE INTO user_metadata (user_id, track_hash, play_count)
+    SELECT DISTINCT o.user_id, m.new_hash, 0
+      FROM user_metadata o
+      JOIN _v52_rekey m ON m.old_hash = o.track_hash;
+  UPDATE user_metadata SET
+    play_count = COALESCE(play_count, 0) + COALESCE((
+        SELECT SUM(COALESCE(o.play_count, 0)) FROM user_metadata o
+          JOIN _v52_rekey m ON m.old_hash = o.track_hash
+         WHERE o.user_id = user_metadata.user_id
+           AND m.new_hash = user_metadata.track_hash), 0),
+    starred_at = NULLIF(MIN(COALESCE(starred_at, '9999-12-31'), COALESCE((
+        SELECT MIN(o.starred_at) FROM user_metadata o
+          JOIN _v52_rekey m ON m.old_hash = o.track_hash
+         WHERE o.user_id = user_metadata.user_id
+           AND m.new_hash = user_metadata.track_hash), '9999-12-31')), '9999-12-31'),
+    last_played = NULLIF(MAX(COALESCE(last_played, ''), COALESCE((
+        SELECT MAX(o.last_played) FROM user_metadata o
+          JOIN _v52_rekey m ON m.old_hash = o.track_hash
+         WHERE o.user_id = user_metadata.user_id
+           AND m.new_hash = user_metadata.track_hash), '')), ''),
+    rating = COALESCE(rating, (
+        SELECT MAX(o.rating) FROM user_metadata o
+          JOIN _v52_rekey m ON m.old_hash = o.track_hash
+         WHERE o.user_id = user_metadata.user_id
+           AND m.new_hash = user_metadata.track_hash))
+  WHERE EXISTS (
+      SELECT 1 FROM user_metadata o
+        JOIN _v52_rekey m ON m.old_hash = o.track_hash
+       WHERE o.user_id = user_metadata.user_id
+         AND m.new_hash = user_metadata.track_hash);
+  DELETE FROM user_metadata WHERE EXISTS (
+      SELECT 1 FROM _v52_rekey m WHERE m.old_hash = user_metadata.track_hash);
+
+  -- user_bookmarks: same stub flow; the most recently changed row wins
+  -- outright (a bookmark is a position, not an aggregate). The stub is
+  -- inserted with NULL stamps explicitly — a created_at DEFAULT would
+  -- make the stub "newest" and beat the real data. '>=' (not '>') so a
+  -- stub tied with an all-NULL-stamp old row still takes its data.
+  INSERT OR IGNORE INTO user_bookmarks (user_id, track_hash, position_ms, created_at, changed_at)
+    SELECT DISTINCT o.user_id, m.new_hash, 0, NULL, NULL
+      FROM user_bookmarks o
+      JOIN _v52_rekey m ON m.old_hash = o.track_hash;
+  UPDATE user_bookmarks SET
+    position_ms = (SELECT o.position_ms FROM user_bookmarks o
+        JOIN _v52_rekey m ON m.old_hash = o.track_hash
+       WHERE o.user_id = user_bookmarks.user_id
+         AND m.new_hash = user_bookmarks.track_hash
+       ORDER BY COALESCE(o.changed_at, o.created_at, '') DESC, o.track_hash DESC LIMIT 1),
+    comment = (SELECT o.comment FROM user_bookmarks o
+        JOIN _v52_rekey m ON m.old_hash = o.track_hash
+       WHERE o.user_id = user_bookmarks.user_id
+         AND m.new_hash = user_bookmarks.track_hash
+       ORDER BY COALESCE(o.changed_at, o.created_at, '') DESC, o.track_hash DESC LIMIT 1),
+    changed_at = (SELECT o.changed_at FROM user_bookmarks o
+        JOIN _v52_rekey m ON m.old_hash = o.track_hash
+       WHERE o.user_id = user_bookmarks.user_id
+         AND m.new_hash = user_bookmarks.track_hash
+       ORDER BY COALESCE(o.changed_at, o.created_at, '') DESC, o.track_hash DESC LIMIT 1)
+  WHERE EXISTS (
+      SELECT 1 FROM user_bookmarks o
+        JOIN _v52_rekey m ON m.old_hash = o.track_hash
+       WHERE o.user_id = user_bookmarks.user_id
+         AND m.new_hash = user_bookmarks.track_hash
+         AND COALESCE(o.changed_at, o.created_at, '') >=
+             COALESCE(user_bookmarks.changed_at, user_bookmarks.created_at, ''));
+  DELETE FROM user_bookmarks WHERE EXISTS (
+      SELECT 1 FROM _v52_rekey m WHERE m.old_hash = user_bookmarks.track_hash);
+  -- Stubs whose merge produced nothing (shouldn't exist — every stub had
+  -- at least one old row — but cheap belt for the position_ms=0 shape).
+  DELETE FROM user_bookmarks
+   WHERE position_ms = 0 AND comment IS NULL AND created_at IS NULL AND changed_at IS NULL;
+
+  -- lyrics_cache: one survivor per canonical key. An existing canonical
+  -- row wins; otherwise the best old row ('found' beats everything,
+  -- then newest fetched_at, then key as a deterministic tiebreak). The
+  -- old-old case matters here too: two old-keyed rows for one canonical
+  -- would collide on the PK in a bare re-key.
+  DELETE FROM lyrics_cache WHERE audio_hash = '';
+  DELETE FROM lyrics_cache WHERE EXISTS (
+      SELECT 1 FROM _v52_rekey m
+       WHERE m.old_hash = lyrics_cache.audio_hash
+         AND EXISTS (SELECT 1 FROM lyrics_cache n WHERE n.audio_hash = m.new_hash));
+  DELETE FROM lyrics_cache WHERE EXISTS (
+      SELECT 1 FROM _v52_rekey m WHERE m.old_hash = lyrics_cache.audio_hash)
+    AND EXISTS (
+      SELECT 1 FROM lyrics_cache o2
+        JOIN _v52_rekey m2 ON m2.old_hash = o2.audio_hash
+        JOIN _v52_rekey m  ON m.old_hash  = lyrics_cache.audio_hash
+       WHERE m2.new_hash = m.new_hash
+         AND o2.audio_hash != lyrics_cache.audio_hash
+         AND ( (o2.status = 'found') > (lyrics_cache.status = 'found')
+            OR ((o2.status = 'found') = (lyrics_cache.status = 'found')
+                AND o2.fetched_at > lyrics_cache.fetched_at)
+            OR ((o2.status = 'found') = (lyrics_cache.status = 'found')
+                AND o2.fetched_at = lyrics_cache.fetched_at
+                AND o2.audio_hash > lyrics_cache.audio_hash)));
+  UPDATE lyrics_cache SET audio_hash = (
+      SELECT m.new_hash FROM _v52_rekey m WHERE m.old_hash = lyrics_cache.audio_hash)
+   WHERE EXISTS (SELECT 1 FROM _v52_rekey m WHERE m.old_hash = lyrics_cache.audio_hash);
+
+  DROP TABLE _v52_rekey;
+
+  -- Dead all-null user_metadata rows (unstar's INSERT-then-NULL legacy).
+  DELETE FROM user_metadata
+   WHERE COALESCE(play_count, 0) = 0 AND last_played IS NULL
+     AND rating IS NULL AND starred_at IS NULL;
+
+  CREATE INDEX IF NOT EXISTS idx_user_bookmarks_hash ON user_bookmarks(track_hash);
 `;
 
 // rescanRequired: true — marks migrations that change the tracks table schema
@@ -1298,4 +2051,78 @@ export const MIGRATIONS = [
   // across copies/moves. No rescan required; NULL default keeps the
   // migration invisible to pre-existing rows. See SCHEMA_V36.
   { version: 36, sql: SCHEMA_V36 },
+  // V37 adds users.allow_torrent, the per-user whitelist flag for the
+  // optional torrent-client feature. Default 0 = fail-closed; ignored
+  // entirely when config.torrent.enabledFor === 'all'. See SCHEMA_V37.
+  { version: 37, sql: SCHEMA_V37 },
+  // V38 adds the managed_torrents table — minimal info_hash → user_id
+  // mapping used by list endpoints to flag which torrent-client
+  // entries were added through mStream vs added directly through the
+  // daemon's own UI. See SCHEMA_V38 for the deliberately-narrow
+  // column set.
+  { version: 38, sql: SCHEMA_V38 },
+  // V39 rotates managed_torrents to support multiple clients in
+  // parallel (Transmission + qBittorrent + Deluge). Adds client_type
+  // column, swaps UNIQUE(info_hash) → UNIQUE(info_hash, client_type).
+  // See SCHEMA_V39 for the table-rebuild dance and the index choices.
+  { version: 39, sql: SCHEMA_V39 },
+  // V40 caches per-(client, vpath) access mappings so the admin UI
+  // can render the access state without round-tripping the daemon on
+  // every page load, and the add-torrent gate can decide
+  // verified/unconfirmed in O(1). See SCHEMA_V40.
+  { version: 40, sql: SCHEMA_V40 },
+  // V41 adds managed_torrents.download_path so we can answer "where
+  // does this torrent's data live?" without a daemon round-trip. See
+  // SCHEMA_V41.
+  { version: 41, sql: SCHEMA_V41 },
+  // V42 adds libraries.torrent_path_template — the per-vpath template
+  // string that the player's Add Torrent panel uses to construct the
+  // destination path from auto-detected metadata. See SCHEMA_V42.
+  { version: 42, sql: SCHEMA_V42 },
+  // V43 adds idx_tracks_created_at (recently-added sort) and drops four
+  // redundant single-column user_id indexes that duplicate each table's
+  // PK/UNIQUE composite. Index-only, no rescan. See SCHEMA_V43.
+  { version: 43, sql: SCHEMA_V43 },
+  // V44 drops the redundant idx_tracks_filepath (duplicate of the
+  // UNIQUE(filepath, library_id) auto-index) to cut b-tree write
+  // amplification on the scanner's hottest INSERT/UPSERT path. Index-only,
+  // no rescan. See SCHEMA_V44.
+  { version: 44, sql: SCHEMA_V44 },
+  // V45 adds tracks.track_total / disc_total, populated by both scanners
+  // from embedded tags (bitrate/file_size ride the same scanner change but
+  // are V1 columns). rescanRequired backfills existing libraries, same as
+  // the V16 audio-format columns. Renumbered from the PR's original V43 —
+  // see SCHEMA_V45.
+  { version: 45, sql: SCHEMA_V45, rescanRequired: true },
+  // V46 CASTs stray REAL values out of lyrics_sidecar_mtime / modified —
+  // the rows older JS scanners poisoned (they killed Rust scans outright
+  // and caused permanent sidecar re-parse loops). Data-only, no rescan.
+  // See SCHEMA_V46.
+  { version: 46, sql: SCHEMA_V46 },
+  // See SCHEMA_V47. Index drop only — no rescan.
+  { version: 47, sql: SCHEMA_V47 },
+  // V48 adds the multi-art model (art_files + track_art / album_art /
+  // artist_art) and the default-pointer companion columns, backfilled
+  // from existing single art. The denormalized album_art_file stays as
+  // the default pointer; no writer populates the sets yet (the scanner
+  // PR does, behind a force-rescan). No rescan here. See SCHEMA_V48.
+  { version: 48, sql: SCHEMA_V48 },
+  // V49 is a rescan marker only: the scanners now populate the V48 art
+  // sets, but only for (re)parsed files — the forced (resumable) rescan
+  // backfills existing libraries' galleries automatically on upgrade.
+  // See SCHEMA_V49.
+  { version: 49, sql: SCHEMA_V49, rescanRequired: true },
+  // V50 adds art_files.content_hash (image identity as a DB join — gallery
+  // dedupe + the external downloader's dedup probe). Cached rows backfill
+  // from their content-addressed filename in SQL; reference rows are
+  // hashed by the scanners on the forced rescan. See SCHEMA_V50.
+  { version: 50, sql: SCHEMA_V50, rescanRequired: true },
+  // V51 adds album_art_lookups — the per-album attempt cache that keeps
+  // the post-scan art downloader from re-hammering rate-limited services
+  // over the same dead ends. Starts empty; no rescan. See SCHEMA_V51.
+  { version: 51, sql: SCHEMA_V51 },
+  // V52 repairs canonical-hash drift in user state (mis-keyed scrobbles
+  // re-keyed with merge, '' hashes normalized, dead rows dropped) and
+  // adds the bookmarks rekey index. No rescan: rows only. See SCHEMA_V52.
+  { version: 52, sql: SCHEMA_V52 },
 ];

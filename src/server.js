@@ -4,10 +4,10 @@ import fs from 'fs';
 import path from 'path';
 import Joi from 'joi';
 import cookieParser from 'cookie-parser';
+import { compression } from './util/compression.js';
 import jwt from 'jsonwebtoken';
 import http from 'http';
 import https from 'https';
-import { createRequire } from 'module';
 
 import * as dbApi from './api/db.js';
 import * as searchApi from './api/search.js';
@@ -17,6 +17,7 @@ import * as authApi from './api/auth.js';
 import * as fileExplorerApi from './api/file-explorer.js';
 import * as downloadApi from './api/download.js';
 import * as adminApi from './api/admin.js';
+import * as irohApi from './api/iroh.js';
 import * as remoteApi from './api/remote.js';
 import * as sharedApi from './api/shared.js';
 import * as scrobblerApi from './api/scrobbler.js';
@@ -24,6 +25,7 @@ import * as config from './state/config.js';
 import * as logger from './logger.js';
 import * as transcode from './api/transcode.js';
 import * as dbManager from './db/manager.js';
+import { reapOrphanedScanner } from './db/scan-pidfile.js';
 // Federation + syncthing are disabled while the feature is rebuilt
 // around the new local-backup story. The source files in
 // src/state/syncthing.js and src/api/federation.js stay on disk for
@@ -35,6 +37,7 @@ import * as dbManager from './db/manager.js';
 // import * as federationApi from './api/federation.js';
 // scanner.js removed — parser now writes directly to SQLite
 import * as ytdlApi from './api/ytdl.js';
+import * as torrentApi from './api/torrent.js';
 import * as dlnaApi from './api/dlna.js';
 import * as dlnaSsdp from './dlna/ssdp.js';
 import * as dlnaServer from './dlna/dlna-server.js';
@@ -52,9 +55,9 @@ import * as backupApi from './api/backup.js';
 import * as backupManager from './backup/manager.js';
 // Velvet UI modules — dynamically imported only when ui='velvet' is active
 import WebError from './util/web-error.js';
+import { isAdminAllowed } from './util/admin-network.js';
 
-const require = createRequire(import.meta.url);
-const packageJson = require('../package.json');
+import packageJson from '../package.json' with { type: 'json' };
 
 let mstream;
 let server;
@@ -70,6 +73,10 @@ export async function serveIt(configFile) {
   }
 
   // Logging
+  // Size the in-memory live-log ring buffer (admin panel viewer) from config.
+  // Independent of writeLogs — the buffer is always active so live logs work
+  // even when on-disk logging is off.
+  logger.setBufferCapacity(config.program.logBufferSize);
   if (config.program.writeLogs) {
     logger.addFileLogger(config.program.storage.logsDirectory);
   }
@@ -93,6 +100,13 @@ export async function serveIt(configFile) {
   }
 
   // Magic Middleware Things
+  // Response compression for text-ish payloads (API JSON + the static webapp
+  // bundle). Operator-configured via config.compression.mode (none | gzip |
+  // brotli), default none for now; the middleware reads the mode live so the
+  // admin panel can switch it without a reboot. Registered first so it wraps
+  // every response. Content-type gated, so audio/* and range/seek streams pass
+  // through untouched even when enabled.
+  mstream.use(compression);
   mstream.use(cookieParser());
   mstream.use(express.json({ limit: config.program.maxRequestSize }));
   mstream.use(express.urlencoded({ extended: true }));
@@ -109,6 +123,13 @@ export async function serveIt(configFile) {
   if (config.program.trustProxy) {
     mstream.set("trust proxy", true);
   }
+
+  // Reap any scanner orphaned by a previous run (Task Manager kill,
+  // taskkill /F, SIGKILL — shutdown paths where neither the kill queue's
+  // 'exit' hook nor its signal handlers can run). Must happen BEFORE
+  // initDB(): an orphan still writing would lock-fight this boot's
+  // migrations, and a migration failure aborts the boot.
+  reapOrphanedScanner(config.program.storage.dbDirectory);
 
   // Setup DB
   dbManager.initDB();
@@ -135,6 +156,12 @@ export async function serveIt(configFile) {
     if (config.program.lockAdmin === true) {
       return res.send('<p>Admin Page Disabled</p>');
     }
+    // Application-level IP gate (adminAccess localhost/whitelist modes).
+    // trust proxy is configured above (~line 123) so req.ip is correct here;
+    // req.user isn't set yet, which is fine — isAdminAllowed only needs req.ip.
+    if (!isAdminAllowed(req)) {
+      return res.send('<p>Admin Panel is restricted to the local network</p>');
+    }
     if (dbManager.getAllUsers().length === 0) {
       return next();
     }
@@ -147,9 +174,18 @@ export async function serveIt(configFile) {
     }
   });
 
-  mstream.get('/admin/index.html', (req, res, next) => {
+  // Gate the entire admin asset tree (index.html, index.js, index.css, …),
+  // not just the HTML entry point. Without this, express.static below would
+  // hand the admin bundle to IPs blocked by localhost/whitelist mode — the UI
+  // would be "restricted" in name only. No JWT here: these are static assets
+  // and the network/lockAdmin gate is the real control; the bare /admin
+  // handler above keeps the login redirect for the page itself.
+  mstream.get('/admin/{*path}', (req, res, next) => {
     if (config.program.lockAdmin === true) {
       return res.send('<p>Admin Page Disabled</p>');
+    }
+    if (!isAdminAllowed(req)) {
+      return res.send('<p>Admin Panel is restricted to the local network</p>');
     }
     next();
   });
@@ -253,6 +289,7 @@ export async function serveIt(configFile) {
   authApi.setup(mstream);
 
   adminApi.setup(mstream);
+  irohApi.setup(mstream);
   dbApi.setup(mstream);
   searchApi.setup(mstream);
   randomApi.setup(mstream);
@@ -268,6 +305,7 @@ export async function serveIt(configFile) {
   // syncthing.setup();
   // federationApi.setup(mstream);
   ytdlApi.setup(mstream);
+  torrentApi.setup(mstream);
   albumArtApi.setup(mstream);
   waveformApi.setup(mstream);
   scanApi.setup(mstream);
@@ -327,26 +365,52 @@ export async function serveIt(configFile) {
   // album art folder
   mstream.get('/album-art/:file', albumArtApi.serveAlbumArtFile);
 
-  // TODO: determine if user has access to the exact file
-  // mstream.all('/media/*', (req, res, next) => {
-  //   next();
-  // });
-
-  // Mount media directories from database libraries
+  // Mount media directories from database libraries.
+  //
+  // Dispatch on a `:vpath` route param instead of interpolating each library
+  // name into its own route path (`/media/<name>/`). Under Express 5,
+  // path-to-regexp throws at registration for names containing characters like
+  // ( ) : * +, which would crash the entire boot. That notably bites users
+  // upgrading from a pre-v6 (LokiJS) install: their library names were migrated
+  // verbatim, without the character restrictions newer libraries get. Routing
+  // on a param keeps arbitrary names away from the path parser entirely.
+  //
+  // Building each handler is guarded too: a library with a missing/invalid
+  // root_path is logged and skipped rather than taking down all of /media.
+  const mediaHandlers = new Map();
   for (const lib of dbManager.getAllLibraries()) {
-    mstream.use(
-      '/media/' + lib.name + '/',
-      express.static(lib.root_path)
-    );
+    try {
+      mediaHandlers.set(lib.name, express.static(lib.root_path));
+    } catch (err) {
+      winston.error(`Failed to mount media library '${lib.name}' (root: ${lib.root_path}) — it will not be served`, { stack: err });
+    }
   }
+  // `:vpath` matches a single URL-decoded path segment, so it matches the raw
+  // library name stored in the map. express.static confines serving to its own
+  // root, so path traversal stays blocked.
+  mstream.use('/media/:vpath', (req, res, next) => {
+    const handler = mediaHandlers.get(req.params.vpath);
+    if (!handler) { return next(); }
+    // Authorize against the user's library list — the same vpath check
+    // getVPathInfo() applies to file-explorer/download. A user who can't see
+    // this library is treated like one requesting an unknown library (fall
+    // through to 404) so we don't reveal that it exists. In public mode (no
+    // users) req.user.vpaths spans every library, so nothing is restricted.
+    if (!req.user || !Array.isArray(req.user.vpaths) || !req.user.vpaths.includes(req.params.vpath)) {
+      return next();
+    }
+    return handler(req, res, next);
+  });
 
   // error handling
   mstream.use((error, req, res, _next) => {
     winston.error(`Server error on route ${req.originalUrl}`, { stack: error });
 
-    // Check for validation error
+    // Schema validation failures are malformed-request errors: the client
+    // sent a body/params we can't accept. That's 400 Bad Request, not 403
+    // Forbidden (which means "authenticated but not permitted").
     if (error instanceof Joi.ValidationError) {
-      return res.status(403).json({ error: error.message });
+      return res.status(400).json({ error: error.message });
     }
 
     if (error instanceof WebError) {
@@ -365,6 +429,14 @@ export async function serveIt(configFile) {
     const taskQueue = await import('./db/task-queue.js');
     taskQueue.runAfterBoot();
 
+    // Torrent completion-watcher (V42-adjacent). Polls the active
+    // client periodically; when a managed torrent transitions from
+    // downloading → seeding, kicks off a subtree scan so the new
+    // files land in the library index without waiting for the next
+    // full scan. Cheap no-op when no torrent client is active.
+    const completionWatcher = await import('./torrent/completion-watcher.js');
+    completionWatcher.start();
+
     if (config.program.dlna.mode !== 'disabled') {
       dlnaSsdp.start();
     }
@@ -373,6 +445,24 @@ export async function serveIt(configFile) {
     }
     if (config.program.subsonic.mode === 'separate-port') {
       subsonicServer.start();
+    }
+
+    // Iroh P2P remote-access tunnel (opt-in; default off). Lazy-loaded so a
+    // platform without a prebuilt @number0/iroh binary still boots — a load or
+    // start failure just logs and leaves the feature off. The tunnel proxies to
+    // the local HTTP port; it assumes mStream is reachable as plain HTTP there
+    // (the QUIC transport already encrypts end-to-end).
+    if (config.program.iroh.enabled) {
+      try {
+        const iroh = await import('./state/iroh.js');
+        await iroh.start({
+          targetPort: config.program.port,
+          secretKey: config.program.iroh.secretKey,
+          connectSecret: config.program.iroh.connectSecret,
+        });
+      } catch (err) {
+        winston.error('[iroh] tunnel unavailable on this platform — feature disabled', { stack: err });
+      }
     }
 
     // Boot server audio (Rust preferred, CLI fallback) — runs CLI detection
@@ -399,6 +489,12 @@ export function reboot() {
     // never fires its callback, leaving the user with "server stopped
     // but never rebooted".
     remoteApi.stop();
+
+    // Tear down the Iroh tunnel. It binds its own UDP socket independent of the
+    // HTTP server, so it doesn't block server.close(); we stop it to free the
+    // socket + relay connection. Lazy-imported to match the boot path and to
+    // stay a no-op when the native module was never loaded.
+    import('./state/iroh.js').then((m) => m.stop()).catch(() => {});
 
     // Close the server. server.close() waits for every in-flight HTTP
     // request AND every idle keep-alive socket to drain. The admin

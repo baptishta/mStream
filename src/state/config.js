@@ -3,17 +3,16 @@ import path from 'path';
 import crypto from 'crypto';
 import Joi from 'joi';
 import winston from 'winston';
-import { getDirname } from '../util/esm-helpers.js';
+import { appRoot } from '../util/esm-helpers.js';
 import { getTransCodecs, getTransBitrates } from '../api/transcode.js';
-
-const __dirname = getDirname(import.meta.url);
+import { CLIENT_TYPE, ENABLED_FOR } from '../torrent/constants.js';
 
 const storageJoi = Joi.object({
-  albumArtDirectory: Joi.string().default(path.join(__dirname, '../../image-cache')),
-  dbDirectory: Joi.string().default(path.join(__dirname, '../../save/db')),
-  logsDirectory: Joi.string().default(path.join(__dirname, '../../save/logs')),
-  syncConfigDirectory:  Joi.string().default(path.join(__dirname, '../../save/sync')),
-  waveformCacheDirectory: Joi.string().default(path.join(__dirname, '../../waveform-cache')),
+  albumArtDirectory: Joi.string().default(path.join(appRoot, 'image-cache')),
+  dbDirectory: Joi.string().default(path.join(appRoot, 'save/db')),
+  logsDirectory: Joi.string().default(path.join(appRoot, 'save/logs')),
+  syncConfigDirectory:  Joi.string().default(path.join(appRoot, 'save/sync')),
+  waveformCacheDirectory: Joi.string().default(path.join(appRoot, 'waveform-cache')),
 });
 
 const scanOptions = Joi.object({
@@ -50,59 +49,150 @@ const scanOptions = Joi.object({
   // because it's the slow-path for hosts without a Rust binary
   // anyway.
   scanThreads: Joi.number().integer().min(0).default(0),
-  // Generate waveform .bin files inline during scan. ~90% of scan
-  // wall-time goes into the symphonia decode for these — disabling
-  // it gives roughly a 10× scan speedup. Default true preserves the
-  // current behaviour (scan-time waveforms = instant playback bar).
-  // When false, task-queue.js sends an empty waveformCacheDir and
-  // the Rust scanner skips the decode entirely; the on-demand GET
-  // /api/v1/db/waveform endpoint still serves waveforms by
-  // generating them via ffmpeg on first playback (this is how
-  // .opus files have always worked, since symphonia 0.5 has no
-  // Opus decoder). Trade-off: a few hundred ms of latency on the
-  // first time each track's waveform is requested.
+  // Run the waveform enrichment pass after each scan. Waveform decode
+  // no longer happens inside the scan itself — the scan finishes at
+  // tag-parse speed and task-queue.js chains a separate read-only
+  // `--waveform-scan` pass that generates the .bin for every track
+  // missing one (see runWaveformTask). Default true keeps the end
+  // state of the old behaviour (every track gets a cached waveform)
+  // with a much faster time-to-browsable library. When false, the
+  // pass never runs and the on-demand GET /api/v1/db/waveform
+  // endpoint generates waveforms lazily via ffmpeg on first playback
+  // (this is how .opus files have always worked, since symphonia 0.5
+  // has no Opus decoder) — a few hundred ms of latency the first
+  // time each track's waveform is requested.
   generateWaveforms: Joi.boolean().default(true),
-  // Run BPM + musical-key detection on each scanned track via the
-  // pure-Rust stratum-dsp analyzer, piggybacking on the existing
-  // symphonia decode pass. Default true because:
-  //   • Tag-sourced BPM/key (TBPM / TKEY etc.) is preferred when
-  //     present — those tracks skip analysis with zero overhead.
-  //   • Tracks with audiobook/spoken-word genres or duration outside
-  //     [30s, 30min] also skip — see is_audiobook_genre + the
-  //     duration gate in rust-parser's extract_track.
-  //   • Cost is bounded: per-file ~200-300ms analysis on top of an
-  //     already-running decode, and rayon parallelises it across
-  //     workers. Memory peak is ~52MB per active worker (capped at
-  //     5min of mono samples per track).
-  // Rust-only — the JS fallback scanner accepts this field but
-  // ignores it. Existing libraries on the JS path stay on
-  // tag-sourced BPM/key, same as today.
-  //
-  // To backfill BPM/key on a library that was already scanned before
-  // this feature shipped, trigger a force-rescan from the admin
-  // panel — the fast-path mtime check would otherwise skip the
-  // entire extract pass for unchanged files.
-  analyzeBpm: Joi.boolean().default(true),
+  // DEPRECATED — accepted but currently a no-op. Scan-time BPM/key
+  // ANALYSIS (stratum-dsp) was removed along with scan-time decode;
+  // analysis returns as the separate essentia enrichment scanner.
+  // Tag-sourced BPM/key (TBPM / TKEY etc.) is always read during the
+  // scan regardless of this flag, and existing analysis-derived rows
+  // keep their values. The flag is still sent to scanners so a stale
+  // prebuilt rust binary (pre-split) honours it until CI rebuilds.
+  analyzeBpm: Joi.boolean().default(false),
   autoAlbumArt: Joi.boolean().default(true),
+  // What the post-scan album-art downloader targets. 'missing' (default):
+  // only albums with no cover at all — the fill-in-the-blanks pass.
+  // 'all': every album; ones that already have a cover get the fetched
+  // image ADDED to their gallery (album_art junction) without touching
+  // the existing default — nothing is ever overwritten, and the V50
+  // hash dedupe skips images the album already carries.
+  autoAlbumArtMode: Joi.string().valid('missing', 'all').default('missing'),
+  // When the downloader fetches a cover, also write it as cover.jpg into
+  // each folder holding the album's tracks (existing covers and identical
+  // content are never overwritten — hash-checked). Default false: this
+  // writes into the user's library tree as a bulk automatic side effect,
+  // distinct from the manual albumArtWriteToFolder below which only
+  // fires on a user's deliberate set-art action.
+  autoAlbumArtWriteToFolder: Joi.boolean().default(false),
+  // Albums attempted per downloader run. Each run holds the serial task
+  // slot for ~perRun seconds (one throttled service lookup per album), so
+  // the cap bounds how long a queued scan/backup can wait; the task
+  // re-enqueues itself while a backlog remains, yielding between batches.
+  autoAlbumArtPerRun: Joi.number().integer().min(1).max(10000).default(100),
   albumArtWriteToFolder: Joi.boolean().default(false),
   albumArtWriteToFile: Joi.boolean().default(false),
   albumArtServices: Joi.array().items(
     Joi.string().valid('musicbrainz', 'itunes', 'deezer')
   ).default(['musicbrainz', 'itunes', 'deezer']),
+  // Which source wins when a track has BOTH an embedded picture and a
+  // folder image (cover.jpg etc.). 'metadata' (default) keeps the embedded
+  // art — the long-standing behaviour; 'folder' lets the folder image win.
+  // The other source is the fallback when the preferred one is absent.
+  // Consumed by both scanners (rust-parser + src/db/scanner.mjs); flipping
+  // it takes effect on the next scan of a file whose tags are re-read
+  // (a force-rescan backfills existing TRACK rows; album-level covers are
+  // fill-NULL-only — the scanner never overwrites an album's existing
+  // cover, so album defaults keep their original election). config.json-
+  // only for now — the admin UI toggle ships with the manual-art PR.
+  albumArtPriority: Joi.string().valid('metadata', 'folder').default('metadata'),
 });
 
 const dbOptions = Joi.object({
-  clearSharedInterval: Joi.number().integer().min(0).default(24)
+  clearSharedInterval: Joi.number().integer().min(0).default(24),
+  // SQLite synchronous mode for the main server connection. FULL (default)
+  // fsyncs the WAL on every commit, so no user write (scrobble, rating,
+  // playlist save) can be lost on a power cut. NORMAL skips the per-commit
+  // fsync for faster writes and is still crash-safe under WAL (the DB never
+  // corrupts), but a hard power loss can lose transactions committed since the
+  // most recent WAL checkpoint. Runtime-changeable via the admin API/UI.
+  synchronous: Joi.string().valid('FULL', 'NORMAL').default('FULL'),
+  // SQLite page-cache size for the main server connection, in MEBIBYTES.
+  // Applied as `PRAGMA cache_size = -(cacheSizeMb*1024)` — a negative cache_size
+  // means "this many KiB of memory" rather than a page count. A larger cache
+  // keeps more of the DB + its indexes resident, cutting disk reads under heavy
+  // browse/search/stats load on big libraries, at the cost of that much process
+  // RAM. 64 (MB) preserves the previously hard-coded value. Runtime-changeable
+  // via the admin API/UI (per-connection PRAGMA, effective immediately). Capped
+  // at 2048 MB as a fat-finger guard — a multi-GB page cache on a NAS box would
+  // OOM long before it helped.
+  cacheSizeMb: Joi.number().integer().min(1).max(2048).default(64)
+});
+
+// HTTP response compression for text-ish payloads (API JSON, HTML, JS, CSS,
+// SVG/XML). `mode` selects the codec the server will use:
+//   'none'   — compression disabled (default for now; opt in once validated).
+//   'gzip'   — gzip only, even for clients that also advertise brotli (widest
+//              compatibility, lowest CPU).
+//   'brotli' — brotli for clients that advertise `br`, falling back to gzip for
+//              clients that only do gzip (best ratio with broad reach).
+// Audio/*, image/* (except SVG), video/* and range/seek (HTTP 206) responses
+// are NEVER compressed regardless of mode, so playback + seeking are unaffected.
+// The middleware reads this fresh on every request, so the admin API/UI can
+// switch it live with no reboot.
+const compressionOptions = Joi.object({
+  mode: Joi.string().valid('none', 'gzip', 'brotli').default('none')
+});
+
+// Admin-surface access control. `mode` selects how the admin API + /admin
+// page are reachable; the gate itself is an application-level req.ip check
+// in src/util/admin-network.js, read live on every request (no reboot).
+//   'all'       — reachable from anywhere (the historical lockAdmin=false).
+//   'none'      — admin disabled entirely (the historical lockAdmin=true):
+//                 405 on the admin API, /admin page disabled, public-mode
+//                 write perms demoted. config.program.lockAdmin is DERIVED
+//                 from this value in setup() so every existing reader of
+//                 lockAdmin (auth.js, server.js, admin.js, federation.js)
+//                 keeps working unchanged.
+//   'localhost' — reachable only from loopback IPs (127.0.0.0/8 + ::1).
+//   'whitelist' — reachable only from IPs/CIDRs in `whitelist`.
+// `whitelist` accepts single IPs ('127.0.0.1') or CIDRs ('192.168.0.0/16');
+// the default covers loopback + the RFC1918 private ranges (the common
+// "LAN-only" intent). Only consulted when mode='whitelist'.
+// Single adminAccess whitelist entry: a valid IP or CIDR, but a /0 range is
+// rejected. '0.0.0.0/0' and '::/0' pass Joi's ip() check yet match every
+// address, silently turning 'whitelist' mode into allow-all — an operator who
+// genuinely wants that should set mode='all' explicitly. Exported so the admin
+// API endpoint (src/api/admin.js) validates POSTed whitelists identically.
+export const adminWhitelistEntry = Joi.string().ip({ cidr: 'optional' }).custom((value, helpers) => {
+  const slash = value.indexOf('/');
+  if (slash !== -1 && Number(value.slice(slash + 1)) === 0) {
+    return helpers.message(`adminAccess whitelist entry '${value}' is a /0 (allow-all) range — use mode='all' instead`);
+  }
+  return value;
+});
+
+const adminAccessOptions = Joi.object({
+  mode: Joi.string().valid('all', 'none', 'localhost', 'whitelist').default('all'),
+  whitelist: Joi.array().items(adminWhitelistEntry).default([
+    '127.0.0.0/8', '::1/128', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'
+  ]),
 });
 
 const transcodeOptions = Joi.object({
-  ffmpegDirectory: Joi.string().default(path.join(__dirname, '../../bin/ffmpeg')),
+  ffmpegDirectory: Joi.string().default(path.join(appRoot, 'bin/ffmpeg')),
   defaultCodec: Joi.string().valid(...getTransCodecs()).default('opus'),
-  defaultBitrate: Joi.string().valid(...getTransBitrates()).default('96k')
+  defaultBitrate: Joi.string().valid(...getTransBitrates()).default('96k'),
+  // Auto-update the managed ffmpeg build (BtbN on Linux/Windows, martin-riedl
+  // on macOS) on a weekly check. Default on so codec/security fixes land
+  // without operator action. Set false to pin the current binary — useful when
+  // a rolling upstream build regresses, or for air-gapped / reproducible
+  // installs. No effect when running off system ffmpeg (managed by the OS).
+  autoUpdate: Joi.boolean().default(true)
 });
 
 const rpnOptions = Joi.object({
-  iniFile: Joi.string().default(path.join(__dirname, `../../bin/rpn/frps.ini`)),
+  iniFile: Joi.string().default(path.join(appRoot, 'bin/rpn/frps.ini')),
   apiUrl: Joi.string().default('https://api.mstream.io'),
   email: Joi.string().allow('').optional(),
   password: Joi.string().allow('').optional(),
@@ -128,6 +218,35 @@ const federationOptions = Joi.object({
   federateUsersMode: Joi.boolean().default(false),
 });
 
+// Iroh P2P remote-access tunnel. When enabled, mStream binds an Iroh endpoint
+// that proxies incoming QUIC connections to the local HTTP server, so a paired
+// device can reach the server from anywhere by dialing its EndpointId — no
+// port-forwarding/DDNS/reverse-proxy. Opt-in (default off).
+//   secretKey     — base64 of 32 random bytes; the endpoint's identity. The
+//                   EndpointId (and therefore every issued QR) is derived from
+//                   it, so it's auto-generated once and persisted (like
+//                   `secret`/`subsonicSecret`). Losing it changes the EndpointId
+//                   and breaks every previously-issued QR/ticket.
+//   connectSecret — base64 shared secret carried inside the QR. The tunnel only
+//                   completes a connection after the client proves knowledge of
+//                   it (constant-time handshake over the encrypted QUIC stream),
+//                   so merely knowing the EndpointId is not enough to open the
+//                   pipe. Rotatable from the admin panel (invalidates old QRs).
+// Both are sensitive; they live in the config file in plaintext like the other
+// secrets, and the admin surface that exposes the QR is admin-only.
+const irohOptions = Joi.object({
+  enabled: Joi.boolean().default(false),
+  secretKey: Joi.string().optional(),
+  connectSecret: Joi.string().optional(),
+  // Expose the pairing code on the NON-admin API (GET /api/v1/iroh/code) so the
+  // web player can show it to ordinary users. The code carries the connect
+  // secret, so this is OFF by default (the code stays admin-only); it's meant
+  // for public/demo servers that WANT anyone to be able to test an Iroh
+  // connection. Still sits behind the auth wall, so a private server with users
+  // only exposes it to logged-in users.
+  shareCodePublic: Joi.boolean().default(false),
+});
+
 const dlnaOptions = Joi.object({
   mode: Joi.string().valid('disabled', 'same-port', 'separate-port').default('disabled'),
   name: Joi.string().default('mStream Music'),
@@ -139,6 +258,73 @@ const dlnaOptions = Joi.object({
 const subsonicOptions = Joi.object({
   mode: Joi.string().valid('disabled', 'same-port', 'separate-port').default('disabled'),
   port: Joi.number().integer().min(1).max(65535).default(3012),
+});
+
+// Torrent client integration. v1 supports exactly two states for
+// `client`:
+//   'disabled'     — feature off; no UI surface, no routes, no DB writes.
+//   'transmission' — talk to a Transmission daemon via RPC.
+// Future clients (qBittorrent, Deluge, rTorrent) will extend the valid()
+// list. `enabledFor` gates which users see the feature:
+//   'all'       — every authenticated user can add torrents.
+//   'whitelist' — only users with `users.allow_torrent = 1` can.
+//
+// `transmission` holds the saved RPC credentials for the Transmission
+// backend. Empty `host` means "no credentials saved" (the admin UI
+// shows the login form rather than the status card). Plaintext on
+// purpose — matches the existing pattern for `lastFM`, `discogs`, and
+// `rpn.password`; encrypting these would be inconsistent and would
+// require a key-rotation story we don't have. Anyone who can read the
+// config file can also read the .torrent files; threat-modelling the
+// disk-at-rest case is the operator's job.
+const transmissionCredsOptions = Joi.object({
+  host:     Joi.string().allow('').default(''),
+  port:     Joi.number().integer().min(1).max(65535).default(9091),
+  username: Joi.string().allow('').default(''),
+  password: Joi.string().allow('').default(''),
+  rpcPath:  Joi.string().default('/transmission/rpc'),
+  useHttps: Joi.boolean().default(false),
+});
+
+// qBittorrent WebAPI v2. The protocol mounts everywhere under
+// /api/v2/<group>/<action>; the mount point itself isn't user-
+// configurable in the same way Transmission's `rpcPath` is, so there
+// is no `rpcPath` field here. Default port 8080 matches qBittorrent's
+// out-of-box WebUI port.
+//
+// Both clients keep their credentials independently. Switching the
+// `client` field between 'transmission' and 'qbittorrent' doesn't
+// erase the other's saved creds — operators can toggle back and forth
+// (e.g. during a migration) without re-entering passwords.
+const qbittorrentCredsOptions = Joi.object({
+  host:     Joi.string().allow('').default(''),
+  port:     Joi.number().integer().min(1).max(65535).default(8080),
+  username: Joi.string().allow('').default(''),
+  password: Joi.string().allow('').default(''),
+  useHttps: Joi.boolean().default(false),
+});
+
+// Deluge WebUI JSON-RPC. Unlike Transmission's Basic auth or
+// qBittorrent's username+password, Deluge's WebUI auth is
+// password-only (the daemon is single-user). Default port 8112 is
+// Deluge's stock WebUI port.
+const delugeCredsOptions = Joi.object({
+  host:     Joi.string().allow('').default(''),
+  port:     Joi.number().integer().min(1).max(65535).default(8112),
+  password: Joi.string().allow('').default(''),
+  useHttps: Joi.boolean().default(false),
+});
+
+const torrentOptions = Joi.object({
+  // Pulled from CLIENT_TYPE / ENABLED_FOR — adding a new backend or
+  // policy extends the validator automatically. Defaults stay
+  // explicit (rather than CLIENT_TYPE.DISABLED) so the wire-format
+  // expectations remain visible at the Joi-schema level.
+  client:       Joi.string().valid(...Object.values(CLIENT_TYPE)).default(CLIENT_TYPE.DISABLED),
+  enabledFor:   Joi.string().valid(...Object.values(ENABLED_FOR)).default(ENABLED_FOR.ALL),
+  transmission: transmissionCredsOptions.default(transmissionCredsOptions.validate({}).value),
+  qbittorrent:  qbittorrentCredsOptions.default(qbittorrentCredsOptions.validate({}).value),
+  deluge:       delugeCredsOptions.default(delugeCredsOptions.validate({}).value),
 });
 
 // External lyrics lookup via LRCLib (https://lrclib.net). Opt-in
@@ -203,7 +389,21 @@ const schema = Joi.object({
   noMkdir: Joi.boolean().default(false),
   noFileModify: Joi.boolean().default(false),
   writeLogs: Joi.boolean().default(false),
+  // Number of recent log lines kept in an in-memory ring buffer that
+  // backs the admin panel's live-log viewer (GET /api/v1/admin/logs/recent).
+  // Independent of `writeLogs`: the buffer is always populated so the live
+  // view works even when on-disk logging is off. 0 disables it entirely.
+  // Memory is bounded — each entry's text is capped at ~4 KB, so the
+  // absolute worst case is roughly `logBufferSize × 4 KB` (≈2 MB at the
+  // 500 default), though typical entries are ~200 B → ~100 KB. Capped at
+  // 10000 so a fat-fingered config can't eat hundreds of MB.
+  logBufferSize: Joi.number().integer().min(0).max(10000).default(500),
+  // Legacy boolean kept in the schema so old config files still parse.
+  // It is OVERWRITTEN by a value derived from adminAccess.mode in setup()
+  // (lockAdmin = adminAccess.mode === 'none'); existing readers of
+  // config.program.lockAdmin keep behaving correctly with no change.
   lockAdmin: Joi.boolean().default(false),
+  adminAccess: adminAccessOptions.default(adminAccessOptions.validate({}).value),
   storage: storageJoi.default(storageJoi.validate({}).value),
   // 'default'  — mStream's classic UI (webapp/alpha/)
   // 'velvet'   — mStream's alternative UI (webapp/velvet/)
@@ -212,7 +412,7 @@ const schema = Joi.object({
   //              Users log in with their mStream username + password;
   //              every HTTP call from the UI speaks Subsonic.
   ui: Joi.string().valid('default', 'velvet', 'subsonic').default('default'),
-  webAppDirectory: Joi.string().default(path.join(__dirname, '../../webapp')),
+  webAppDirectory: Joi.string().default(path.join(appRoot, 'webapp')),
   rpn: rpnOptions.default(rpnOptions.validate({}).value),
   transcode: transcodeOptions.default(transcodeOptions.validate({}).value),
   lyrics: lyricsOptions.default(lyricsOptions.validate({}).value),
@@ -227,7 +427,20 @@ const schema = Joi.object({
   // config file.
   subsonicSecret: Joi.string().optional(),
   maxRequestSize: Joi.string().pattern(/[0-9]+(KB|MB)/i).default('1MB'),
+  // Cap on the total uncompressed size of a bulk zip download
+  // (/api/v1/download/*). The source files are summed before any bytes are
+  // streamed, so an over-limit request gets a clean 413 instead of a
+  // truncated archive. '0' (default) means unlimited — kept as the default
+  // for now so an upgrade doesn't silently start blocking large downloads;
+  // switching the default to a finite cap (e.g. 1GB) is planned for the next
+  // major. Otherwise a size string: a whole or decimal number + KB|MB|GB
+  // (1024-based, case-insensitive), e.g. '500MB', '1.5GB'. Read live per
+  // request, so the admin API/UI can change it with no reboot. Does NOT apply
+  // to single-file playback/streaming (/media, transcode) — only the zip
+  // bundlers.
+  downloadSizeLimit: Joi.string().pattern(/^(0|[0-9]+(\.[0-9]+)?(KB|MB|GB))$/i).default('0'),
   db: dbOptions.default(dbOptions.validate({}).value),
+  compression: compressionOptions.default(compressionOptions.validate({}).value),
   folders: Joi.object().pattern(
     Joi.string(),
     Joi.object({
@@ -253,8 +466,10 @@ const schema = Joi.object({
     cert: Joi.string().allow('').optional()
   }).optional(),
   federation: federationOptions.default(federationOptions.validate({}).value),
+  iroh: irohOptions.default(irohOptions.validate({}).value),
   dlna: dlnaOptions.default(dlnaOptions.validate({}).value),
   subsonic: subsonicOptions.default(subsonicOptions.validate({}).value),
+  torrent: torrentOptions.default(torrentOptions.validate({}).value),
   autoBootServerAudio: Joi.boolean().default(false),
   rustPlayerPort: Joi.number().integer().min(1).max(65535).default(3333),
   // true  - trust X-Forwarded-For header for client IP address
@@ -280,6 +495,11 @@ export async function setup(configFileArg) {
     await fs.access(configFileArg);
   } catch (_err) {
     winston.info('Config File does not exist. Attempting to create file');
+    // The default config lives at appRoot/save/conf/default.json, and a freshly
+    // extracted standalone bundle has no save/conf/ yet — writeFile won't create
+    // parent dirs, so create them before the first write (else a bare/default
+    // boot dies with ENOENT, misreported as "Failed to validate config file").
+    await fs.mkdir(path.dirname(configFileArg), { recursive: true });
     await fs.writeFile(configFileArg, JSON.stringify({}), 'utf8');
     winston.info(`Config file created: ${configFile}`);
   }
@@ -311,7 +531,53 @@ export async function setup(configFileArg) {
     await fs.writeFile(configFileArg, JSON.stringify(programData, null, 2), 'utf8');
   }
 
+  // Iroh tunnel identity (secretKey -> stable EndpointId) and the pipe secret
+  // (connectSecret). Generated once and persisted up-front — same generate-and-
+  // persist precedent as secret/subsonicSecret/dlna.uuid — so the EndpointId and
+  // any issued QR stay stable across reboots, and so enabling the feature later
+  // from the admin panel doesn't need a key-generation round-trip. secretKey is
+  // base64 of exactly 32 bytes (the size Iroh's SecretKey expects).
+  if (!programData.iroh) { programData.iroh = {}; }
+  if (!programData.iroh.secretKey || !programData.iroh.connectSecret) {
+    winston.info('Config file missing iroh secrets. Generating and saving');
+    if (!programData.iroh.secretKey) { programData.iroh.secretKey = await asyncRandom(32); }
+    if (!programData.iroh.connectSecret) { programData.iroh.connectSecret = await asyncRandom(32); }
+    await fs.writeFile(configFileArg, JSON.stringify(programData, null, 2), 'utf8');
+  }
+
+  // Back-compat migration for the lockAdmin -> adminAccess rename. A config
+  // file that predates adminAccess and had lockAdmin=true meant "admin
+  // disabled", which is now adminAccess.mode='none'. Coerce + persist before
+  // validation so the upgrade is sticky (matches the secret/subsonicSecret/
+  // dlna.uuid generate-and-persist precedents in this function). A pre-existing
+  // adminAccess always wins; a missing/false lockAdmin needs no migration
+  // (adminAccess defaults to mode='all', which is the lockAdmin=false meaning).
+  if (programData.adminAccess === undefined && programData.lockAdmin === true) {
+    winston.info("Migrating legacy lockAdmin=true to adminAccess.mode='none' and saving");
+    programData.adminAccess = { mode: 'none' };
+    await fs.writeFile(configFileArg, JSON.stringify(programData, null, 2), 'utf8');
+  }
+
   program = await schema.validateAsync(programData, { allowUnknown: true });
+
+  // Derive the legacy lockAdmin flag from adminAccess.mode. Every existing
+  // reader of config.program.lockAdmin (auth.js, server.js page guards,
+  // admin.js guard, federation.js) keeps behaving correctly off this value;
+  // only mode='none' fully disables the admin surface, the other three modes
+  // are application-level IP gates layered on top via util/admin-network.js.
+  program.lockAdmin = (program.adminAccess.mode === 'none');
+
+  // The IP-based modes gate on req.ip. With trustProxy=true, req.ip is taken
+  // from X-Forwarded-For, which a client can forge unless a TRUSTED reverse
+  // proxy overwrites it. Warn the operator so a localhost/whitelist gate
+  // isn't mistaken for airtight when it's actually trusting a spoofable header.
+  if ((program.adminAccess.mode === 'localhost' || program.adminAccess.mode === 'whitelist') && program.trustProxy === true) {
+    winston.warn(
+      `[config] adminAccess.mode='${program.adminAccess.mode}' with trustProxy=true: the admin IP gate ` +
+      `trusts X-Forwarded-For, which clients can spoof unless a trusted reverse proxy overwrites it. ` +
+      `Ensure your proxy strips/sets X-Forwarded-For, or the gate can be bypassed.`
+    );
+  }
 
   // Enforce the `ui=subsonic` <-> Subsonic same-port constraint: the
   // bundled Airsonic Refix SPA is configured to talk to the SAME origin
@@ -338,6 +604,23 @@ export async function setup(configFileArg) {
     if (!rawConfig.dlna) { rawConfig.dlna = {}; }
     rawConfig.dlna.uuid = program.dlna.uuid;
     await fs.writeFile(configFileArg, JSON.stringify(rawConfig, null, 2), 'utf8');
+  }
+
+  // Ensure the writable storage directories exist before anything opens them.
+  // Nothing else creates them, so a fresh run with
+  // default (or freshly-pointed) paths would fail when SQLite tries to open
+  // <dbDirectory>/mstream.db in a directory that doesn't exist (SQLITE_CANTOPEN),
+  // or when the logger/caches first write. mkdir recursive is idempotent, so
+  // this is a no-op when Electron (or a prior run) already created them.
+  for (const dir of [
+    program.storage.dbDirectory,
+    program.storage.albumArtDirectory,
+    program.storage.logsDirectory,
+    program.storage.syncConfigDirectory,
+    program.storage.waveformCacheDirectory,
+    program.transcode.ffmpegDirectory,
+  ]) {
+    if (dir) { await fs.mkdir(dir, { recursive: true }); }
   }
 }
 

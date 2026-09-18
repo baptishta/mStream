@@ -10,8 +10,8 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { assertFfmpegAvailable, encodeTone } from './ffmpeg.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
@@ -32,27 +32,10 @@ const FIXTURES = [
   { artist: 'Vosto',  album: 'Untitled EP',       year: null, genre: null,         disc: 1, track: 1, title: 'Sketch 1' },
 ];
 
-const BUNDLED_FFMPEG =
-  process.platform === 'win32' ? path.join(REPO_ROOT, 'bin', 'ffmpeg', 'ffmpeg.exe')
-                               : path.join(REPO_ROOT, 'bin', 'ffmpeg', 'ffmpeg');
-
 function relPathFor(f) {
   const trackNum = String(f.track).padStart(2, '0');
   const safe = s => s.replace(/[/\\:*?"<>|]/g, '_');
   return path.join(safe(f.artist), safe(f.album), `${trackNum} - ${safe(f.title)}.mp3`);
-}
-
-function runFfmpeg(args) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(BUNDLED_FFMPEG, args, { stdio: ['ignore', 'ignore', 'pipe'] });
-    let stderr = '';
-    p.stderr.on('data', d => { stderr += d.toString(); });
-    p.on('error', reject);
-    p.on('exit', code => {
-      if (code === 0) { resolve(); }
-      else { reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-500)}`)); }
-    });
-  });
 }
 
 async function encode(outPath, f, fixtureIndex) {
@@ -82,15 +65,7 @@ async function encode(outPath, f, fixtureIndex) {
   // content correctly share one audio_hash, but we want distinct content
   // here so per-track state stays per-track.
   const freq = 220 + fixtureIndex * 40;  // 220, 260, 300, … Hz
-  await runFfmpeg([
-    '-nostdin', '-y', '-loglevel', 'error',
-    '-f', 'lavfi', '-i', `sine=frequency=${freq}:sample_rate=44100:duration=1`,
-    '-ac', '2',
-    '-c:a', 'libmp3lame', '-b:a', '64k',
-    ...metaArgs,
-    '-id3v2_version', '3',
-    outPath,
-  ]);
+  await encodeTone({ outPath, freq, metaArgs });
 }
 
 // Summary of what the test suite will see. Derived from FIXTURES so assertions
@@ -117,6 +92,7 @@ export async function ensureFixtures() {
     const f = FIXTURES[i];
     const full = path.join(MUSIC_DIR, relPathFor(f));
     try { await fs.access(full); continue; } catch { /* need to generate */ }
+    assertFfmpegAvailable();
     await fs.mkdir(path.dirname(full), { recursive: true });
     await encode(full, f, i);
   }

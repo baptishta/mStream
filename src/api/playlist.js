@@ -3,6 +3,7 @@ import * as config from '../state/config.js';
 import * as db from '../db/manager.js';
 import * as transcode from './transcode.js';
 import { joiValidate, resolveId } from '../util/validation.js';
+import WebError from '../util/web-error.js';
 
 export function setup(mstream) {
   const d = () => db.getDB();
@@ -106,7 +107,7 @@ export function setup(mstream) {
     `).get(trackId);
 
     if (!track || track.user_id !== req.user.id) {
-      throw new Error('Access denied or track not found');
+      throw new WebError('Access denied or track not found', 404);
     }
 
     d().prepare('DELETE FROM playlist_tracks WHERE id = ?').run(trackId);
@@ -149,25 +150,31 @@ export function setup(mstream) {
       'SELECT id FROM playlists WHERE name = ? AND user_id = ?'
     ).get(req.body.title, req.user.id);
 
-    if (playlist) {
-      // Delete existing tracks
-      d().prepare('DELETE FROM playlist_tracks WHERE playlist_id = ?').run(playlist.id);
-    } else {
-      const result = d().prepare(
-        'INSERT INTO playlists (name, user_id) VALUES (?, ?)'
-      ).run(req.body.title, req.user.id);
-      playlist = { id: Number(result.lastInsertRowid) };
-    }
-
-    // Insert new tracks with positions
-    const insert = d().prepare(
-      'INSERT INTO playlist_tracks (playlist_id, filepath, position) VALUES (?, ?, ?)'
-    );
-    if (req.body.songs) {
-      for (let i = 0; i < req.body.songs.length; i++) {
-        insert.run(playlist.id, req.body.songs[i], i);
+    // Overwrite atomically: create-or-clear + re-insert run in one transaction,
+    // so a concurrent reader never sees the playlist mid-rewrite (empty between
+    // the DELETE and the inserts) and a large save costs one fsync, not one per
+    // track.
+    db.transaction(() => {
+      if (playlist) {
+        // Delete existing tracks
+        d().prepare('DELETE FROM playlist_tracks WHERE playlist_id = ?').run(playlist.id);
+      } else {
+        const result = d().prepare(
+          'INSERT INTO playlists (name, user_id) VALUES (?, ?)'
+        ).run(req.body.title, req.user.id);
+        playlist = { id: Number(result.lastInsertRowid) };
       }
-    }
+
+      // Insert new tracks with positions
+      const insert = d().prepare(
+        'INSERT INTO playlist_tracks (playlist_id, filepath, position) VALUES (?, ?, ?)'
+      );
+      if (req.body.songs) {
+        for (let i = 0; i < req.body.songs.length; i++) {
+          insert.run(playlist.id, req.body.songs[i], i);
+        }
+      }
+    });
 
     res.json({});
   });

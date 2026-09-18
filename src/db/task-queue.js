@@ -6,16 +6,20 @@ import { nanoid } from 'nanoid';
 import * as config from '../state/config.js';
 import * as db from './manager.js';
 import { addToKillQueue, removeFromKillQueue } from '../state/kill-list.js';
-import { getDirname } from '../util/esm-helpers.js';
+import { writeScannerPidfile, clearScannerPidfile } from './scan-pidfile.js';
+import { SCHEMA_VERSION } from './schema.js';
+import { getDirname, appRoot } from '../util/esm-helpers.js';
+import { launchWorker, workerReaperMarker } from '../util/worker-process.js';
 import * as dlnaApi from '../api/dlna.js';
 
 const __dirname = getDirname(import.meta.url);
 
 // ── Unified task queue ──────────────────────────────────────────────────────
 //
-// One queue, two task shapes:
-//   { task: 'scan',   vpath, id, forceRescan }
-//   { task: 'backup', destinationId, triggerReason, id }
+// One queue, three task shapes:
+//   { task: 'scan',     vpath, id, forceRescan }
+//   { task: 'backup',   destinationId, triggerReason, id }
+//   { task: 'waveform', id }   — post-scan enrichment pass (whole-DB)
 //
 // STRICTLY SERIAL: at most one task — scan or backup, doesn't matter which —
 // runs at any time. We tried allowing concurrent scans of different vpaths
@@ -72,15 +76,35 @@ let scanIntervalTimer = null;
 // in a batch — skipped on fully-unchanged rescans so control points aren't
 // poked for nothing.
 let anyScansChanged = false;
+// Set in onScanClose after a clean scan; consumed in
+// checkQueueDrainedSideEffects to enqueue the album-art download pass once
+// the whole scan batch has drained. Module-level because the enqueue point
+// (queue drain) is decoupled from where we learn a scan finished (per-scan
+// close), and N library scans should collapse to one pass.
+let albumArtEnqueuePending = false;
 // True between runAfterBoot noticing a `.rescan-pending` migration marker
-// and the resulting rescanAll() draining the queue. The marker is only
+// and the resulting rescan draining the queue. The marker is only
 // unlinked once this flag is set AND the queue empties — if the process
-// crashes partway through the rescan, the marker survives and the next
-// boot re-runs the rescan. Without this, an interrupted boot rescan left
+// is restarted partway through the rescan, the marker survives and the
+// next boot RESUMES it. Without this, an interrupted boot rescan left
 // the DB stuck on pre-rescan row shapes (e.g. V18 compilations still
 // fragmented) with no surfacing signal.
 let bootRescanInFlight = false;
 let bootRescanMarkerPath = null;
+// Stable scan id for the in-flight migration-rescan epoch, read from (or
+// assigned into) the .rescan-pending marker. Reusing one id across
+// restarts is what makes the rescan RESUMABLE: the scanner skips any row
+// already stamped with this id (re-parsed in an earlier pass of the same
+// epoch) instead of re-parsing the whole library from file zero every
+// boot. See resolveRescanEpochId() and runAfterBoot().
+let bootRescanScanId = null;
+// Set true when any scan in the current boot-rescan epoch finishes
+// unsuccessfully (non-zero exit / never emitted scanComplete). The marker
+// is cleared only when the epoch drains WITHOUT a failure — otherwise it
+// survives so the next boot resumes (cheaply, skipping already-stamped
+// rows) rather than the migration being silently abandoned. Reset
+// alongside bootRescanInFlight on drain.
+let bootRescanFailed = false;
 
 // ── Rust parser binary detection ────────────────────────────────────────────
 
@@ -88,8 +112,8 @@ const ext = process.platform === 'win32' ? '.exe' : '';
 // Detect musl libc (Alpine, Void, distroless musl, etc.) — glibcVersionRuntime is undefined on musl
 const isMusl = process.platform === 'linux' && !process.report?.getReport()?.header?.glibcVersionRuntime;
 const libcSuffix = isMusl ? '-musl' : '';
-const rustParserDir = path.join(__dirname, '../../rust-parser');
-const prebuiltBin = path.join(__dirname, `../../bin/rust-parser/rust-parser-${process.platform}-${process.arch}${libcSuffix}${ext}`);
+const rustParserDir = path.join(appRoot, 'rust-parser');
+const prebuiltBin = path.join(appRoot, `bin/rust-parser/rust-parser-${process.platform}-${process.arch}${libcSuffix}${ext}`);
 const localBuildBin = path.join(rustParserDir, `target/release/rust-parser${ext}`);
 let rustParserBin = null;
 let rustBinaryReady = false;
@@ -144,6 +168,38 @@ function findRustParser() {
   return false;
 }
 
+// One-shot per process: when the SHIPPED glibc rust-parser can't run on this
+// host (most often it's simply too new — it needs GLIBC_2.34 — but any exec
+// failure counts), retry the committed static-musl build instead of dropping
+// straight to the ~16x-slower JS scanner. The -musl binary is fully static and
+// runs on ANY linux libc/version, so this salvages native-speed scanning AND
+// the post-scan waveform pass on older-glibc distros (RHEL/Rocky 8, Ubuntu
+// 20.04, Amazon Linux 2, Debian 11, ...). It swaps rustParserBin to the musl
+// build (so every later Rust use — incl. waveforms — picks it up too) and
+// re-enters runScan. Returns true if a retry was launched (the caller must then
+// return), false to proceed with the JS fallback.
+let muslRetryTried = false;
+function tryMuslRetry(scanObj, reason) {
+  if (muslRetryTried) { return false; }
+  // Only on a linux glibc host: musl hosts already select the -musl binary up
+  // front (libcSuffix), and non-linux platforms have no musl variant.
+  if (process.platform !== 'linux' || libcSuffix === '-musl') { return false; }
+  // Only second-guess the shipped prebuilt glibc binary — a failed local dev
+  // build (cargo) is a different problem the musl sibling won't fix.
+  if (rustParserBin !== prebuiltBin) { return false; }
+  const muslBin = path.join(appRoot, `bin/rust-parser/rust-parser-${process.platform}-${process.arch}-musl${ext}`);
+  if (!fs.existsSync(muslBin)) { return false; }
+
+  muslRetryTried = true;
+  try { fs.chmodSync(muslBin, 0o755); } catch (_) { /* best-effort; spawn will surface a real failure */ }
+  rustParserBin = muslBin;
+  rustBinaryReady = true;
+  rustParserDisabled = false;
+  winston.warn(`Rust parser (glibc) ${reason}; retrying with the portable static-musl build before the JS fallback`);
+  runScan(scanObj);
+  return true;
+}
+
 // ── Stream helpers ──────────────────────────────────────────────────────────
 
 // Wire `stream` (a child process's stdout or stderr) up to call `onLine`
@@ -195,17 +251,32 @@ function bufferLines(stream, onLine) {
 function nextTask() {
   while (activeTask === null && taskQueue.length > 0) {
     const candidate = taskQueue.shift();
-    if (candidate.task === 'scan')        { runScan(candidate); }
-    else if (candidate.task === 'backup') { runBackupTask(candidate); }
+    if (candidate.task === 'scan')          { runScan(candidate); }
+    else if (candidate.task === 'backup')   { runBackupTask(candidate); }
+    else if (candidate.task === 'waveform') { runWaveformTask(candidate); }
+    else if (candidate.task === 'albumart') { runAlbumArtTask(candidate); }
   }
 }
+
+// The two enrichment-pass task kinds. They share semantics everywhere the
+// queue makes a decision: they don't count against "drained" (the side
+// effects below are about the SCAN batch), they don't surface as `locked`
+// (isScanning), and they run strictly serial like everything else.
+const ENRICHMENT_KINDS = ['waveform', 'albumart'];
 
 // Drained-queue side effects shared by onScanClose + onBackupClose.
 // Centralised here because the DLNA bump and the migration-rescan marker
 // cleanup both depend on "all queued and active work finished," which can
 // be triggered by either kind of close after the unified-queue change.
 function checkQueueDrainedSideEffects() {
-  const drained = activeTask === null && taskQueue.length === 0;
+  // Enrichment passes (waveform decode, art download) don't count against
+  // "drained": the side effects below are about the SCAN batch — the
+  // passes change no library content the DLNA caches care about, and they
+  // are not part of any migration epoch (the marker must not wait minutes
+  // for background decode / throttled downloads before clearing).
+  const drained =
+    (activeTask === null || ENRICHMENT_KINDS.includes(activeTask.kind)) &&
+    !taskQueue.some((t) => !ENRICHMENT_KINDS.includes(t.task));
   if (!drained) { return; }
 
   // Bump DLNA's SystemUpdateID so control points refresh their caches —
@@ -218,12 +289,21 @@ function checkQueueDrainedSideEffects() {
   }
 
   // Clear the migration rescan marker only after every queued task —
-  // including any backup that piled in behind the scans — has finished.
-  // If the process dies before this point, the marker survives on disk
-  // and the next boot re-triggers rescanAll().
+  // including any backup that piled in behind the scans — has finished,
+  // AND only if the rescan actually completed. If any boot-rescan scan
+  // failed (non-zero exit / no scanComplete), keep the marker so the next
+  // boot RESUMES it — cheap, because already-stamped rows are skipped.
+  // (Previously the marker cleared on drain regardless of success, so a
+  // fatal scanner error silently abandoned the migration with no retry.)
+  // A process crash before this point likewise leaves the marker in place.
   if (bootRescanInFlight) {
+    const failed = bootRescanFailed;
     bootRescanInFlight = false;
-    if (bootRescanMarkerPath) {
+    bootRescanFailed = false;
+    if (failed) {
+      winston.warn('Migration rescan did not fully complete (a library scan failed or was '
+        + 'interrupted) — keeping .rescan-pending; the next boot will resume it.');
+    } else if (bootRescanMarkerPath) {
       try {
         fs.unlinkSync(bootRescanMarkerPath);
         winston.info('Migration rescan complete — cleared .rescan-pending marker');
@@ -235,11 +315,28 @@ function checkQueueDrainedSideEffects() {
       bootRescanMarkerPath = null;
     }
   }
+
+  // Hand the now-idle stretch to the album-art download pass if a scan in
+  // this drained batch asked for it. Done HERE — after the DLNA bump and
+  // the rescan-marker cleanup — so it runs once per batch and only after
+  // any .rescan-pending marker is gone (a restart during the potentially
+  // long download must not re-trigger a full migration rescan).
+  // maybeEnqueueAlbumArt re-checks config + that anything is eligible
+  // before forking.
+  if (albumArtEnqueuePending) {
+    albumArtEnqueuePending = false;
+    maybeEnqueueAlbumArt();
+  }
 }
 
 // ── Scan task management ────────────────────────────────────────────────────
 
-function addScanTask(vpath, forceRescan = false) {
+// scanId: optional fixed scan id. The boot migration rescan passes the
+// stable epoch id from the .rescan-pending marker so a restart REUSES it
+// and the scanner can skip rows it already re-parsed this epoch (resume).
+// Omitted everywhere else → a fresh per-scan nanoid (every other scan is
+// independent and gets its own id).
+function addScanTask(vpath, forceRescan = false, scanId = null) {
   // Dedup: drop if a scan for this vpath is already running, and merge
   // forceRescan upgrade into a queued one. Without this, a scan that
   // outlasts scanInterval (24h default) lets the periodic timer pile up
@@ -262,7 +359,43 @@ function addScanTask(vpath, forceRescan = false) {
     }
     return;
   }
-  taskQueue.push({ task: 'scan', vpath, id: nanoid(8), forceRescan });
+  taskQueue.push({ task: 'scan', vpath, id: scanId || nanoid(8), forceRescan });
+  nextTask();
+}
+
+// Targeted subtree scan. Used by the torrent completion-watcher to
+// refresh only the directory where a torrent just finished, avoiding a
+// full vpath walk per add. Distinct from addScanTask because it dedups
+// on (vpath, subtree) instead of vpath — two completions in different
+// subtrees of the same library should NOT be merged into one wider scan.
+//
+// If a whole-vpath scan is already queued or running for this vpath,
+// the subtree request is dropped (the broader scan will cover the
+// subtree's files anyway).
+function addSubtreeScanTask(vpath, subtree) {
+  if (typeof subtree !== 'string' || subtree.trim() === '') {
+    winston.warn(`addSubtreeScanTask: empty subtree for vpath '${vpath}', falling back to full vpath scan`);
+    return addScanTask(vpath);
+  }
+  const sub = subtree.replace(/^[/\\]+|[/\\]+$/g, '');
+  // If a whole-vpath scan is in flight or queued for this vpath, the
+  // subtree's files will be covered by it. Drop the targeted request.
+  if (activeTask?.kind === 'scan' && activeTask.taskObj.vpath === vpath && !activeTask.taskObj.subtree) {
+    winston.info(`Subtree scan for '${vpath}/${sub}' dropped — full scan already running`);
+    return;
+  }
+  const queuedFull = taskQueue.find((t) => t.task === 'scan' && t.vpath === vpath && !t.subtree);
+  if (queuedFull) {
+    winston.info(`Subtree scan for '${vpath}/${sub}' dropped — full scan already queued`);
+    return;
+  }
+  const dupSubtree = taskQueue.find((t) => t.task === 'scan' && t.vpath === vpath && t.subtree === sub);
+  if (dupSubtree) {
+    winston.info(`Subtree scan for '${vpath}/${sub}' dropped — same subtree already queued`);
+    return;
+  }
+  taskQueue.push({ task: 'scan', vpath, subtree: sub, id: nanoid(8), forceRescan: false });
+  winston.info(`Queued subtree scan: ${vpath}/${sub}`);
   nextTask();
 }
 
@@ -273,21 +406,41 @@ function scanAll() {
   }
 }
 
-function rescanAll() {
+// scanId: when set (boot migration rescan), every library shares this
+// stable id so an interrupted rescan resumes on the next boot instead of
+// restarting from file zero. When omitted (manual admin force-rescan),
+// each library gets a fresh id — a one-shot full re-parse, as before.
+function rescanAll(scanId = null) {
   const libraries = db.getAllLibraries();
   for (const lib of libraries) {
-    addScanTask(lib.name, true);
+    addScanTask(lib.name, true, scanId);
   }
 }
 
 function handleScannerLine(scanObj, line) {
   if (!line) { return; }
+  // Any stdout at all proves the binary launched and ran real code —
+  // read by the rust close handler to tell "scanned and failed" from
+  // "died on arrival" (dynamic-linker abort, stale arg format, instant
+  // panic), which is the case that warrants the JS fallback.
+  scanObj.sawOutput = true;
   // Structured events from the scanner are emitted as single-line JSON;
   // see scanner.mjs and rust-parser/src/main.rs for the event shapes.
   if (line[0] === '{') {
     try {
       const evt = JSON.parse(line);
+      if (evt?.event === 'scanStart') {
+        // Liveness banner — the rust binary's first stdout line, emitted
+        // before any environment-dependent work. Its only job is setting
+        // sawOutput (above) so died-on-arrival detection can't misfire on
+        // pre-walk environment failures. Nothing to log.
+        return;
+      }
       if (evt?.event === 'scanComplete') {
+        // A clean end-of-scan event means the scanner finished its walk
+        // (vs. dying mid-way). onScanClose reads this to tell a completed
+        // boot-rescan from a failed one before clearing the marker.
+        scanObj.completed = true;
         // filesUnchanged / filesScanned were added to the contract later — emit
         // them only when the scanner actually reported them, so a stale
         // prebuilt rust-parser binary still produces a clean log line instead
@@ -299,6 +452,15 @@ function handleScannerLine(scanObj, line) {
         parts.push(`${evt.staleEntriesRemoved} stale entries removed`);
         const tail = evt.filesScanned != null ? ` (${evt.filesScanned} scanned)` : '';
         winston.info(`Scan complete: ${parts.join(', ')}${tail}`);
+        if (evt.walkErrors > 0) {
+          // Cleanup was partially shielded — deleted files under the
+          // affected subtrees stay in the index until a clean scan.
+          // Surface it at warn level so a permanently unreadable
+          // directory doesn't hide behind healthy-looking summaries.
+          winston.warn(
+            `Scan saw ${evt.walkErrors} directory enumeration error(s) — ` +
+            'rows under the affected subtrees were shielded from cleanup');
+        }
         if (evt.filesProcessed > 0 || evt.staleEntriesRemoved > 0) {
           anyScansChanged = true;
           // Per-scan flag, read in onScanClose to decide whether to run
@@ -345,7 +507,19 @@ function attachScanHandlers(forkedScan, scanObj) {
 }
 
 function onScanClose(forkedScan, scanObj, code) {
-  winston.info(`File scan completed with code ${code}`);
+  if (code === 0) {
+    winston.info(`File scan completed with code ${code}`);
+  } else {
+    // A non-zero exit is a FAILED scan (schema-version guard, vanished
+    // mount, crash) — surface it at error level instead of burying it in
+    // INFO logs where a permanently broken scanner looks healthy.
+    winston.error(
+      `File scan FAILED with exit code ${code} for vpath '${scanObj.vpath}' — ` +
+      'see preceding scanner output; the library index may be stale');
+  }
+  // The child is gone either way — its pidfile record is no longer an
+  // orphan candidate for the next boot's reaper.
+  clearScannerPidfile(config.program.storage.dbDirectory);
   if (activeTask?.child === forkedScan) {
     removeFromKillQueue(activeTask.killFn);
     activeTask = null;
@@ -394,15 +568,370 @@ function onScanClose(forkedScan, scanObj, code) {
     catch (err) { winston.error(`onScanCompleteCallback failed for vpath ${scanObj.vpath}`, { stack: err }); }
   }
 
+  // A boot-rescan scan is the one sharing the stable epoch id. If it
+  // exited non-zero or never emitted scanComplete, the migration rescan
+  // didn't finish — flag it so checkQueueDrainedSideEffects keeps the
+  // marker for the next boot to resume instead of clearing it.
+  if (bootRescanInFlight && scanObj.id === bootRescanScanId && (code !== 0 || !scanObj.completed)) {
+    bootRescanFailed = true;
+  }
+
+  // Chain the waveform enrichment pass behind successful scans. Queued
+  // rather than run inline so it obeys the single-task rule, and dedup'd
+  // so a multi-library scanAll yields ONE pass after the last scan, not
+  // one per library (the pass sweeps the whole DB when it runs). Enqueued
+  // even for no-change scans: on the first boot after waveform generation
+  // moved out of the scanner, the library is fully scanned but has no
+  // .bins yet — the pass is near-free when there's nothing to do.
+  if (code === 0 && scanObj.completed) {
+    addWaveformTask();
+    // Flag the album-art download pass to enqueue once the whole batch
+    // drains (consumed in checkQueueDrainedSideEffects — N library scans
+    // collapse to one pass, and it starts only after any .rescan-pending
+    // marker is cleared so a restart mid-download never re-triggers a
+    // migration rescan). Only after a CLEAN scan: a crashed or
+    // shutdown-killed scan shouldn't spawn follow-up network work.
+    albumArtEnqueuePending = true;
+  }
+
   nextTask();
   checkQueueDrainedSideEffects();
 }
 
+// ── Waveform enrichment task ────────────────────────────────────────────────
+//
+// Runs the rust binary's `--waveform-scan` pass: a READ-ONLY sweep that
+// generates the 800-bar .bin for every track that lacks one (writing a
+// `<hash>.failed` marker for undecodable files so they aren't retried
+// every pass), then exits. Waveform decode left the scan itself in this
+// release — the scan finishes at tag-parse speed and this pass fills in
+// the visuals behind it, never touching (or even queueing for) the DB
+// writer lock.
+//
+// There is deliberately NO JS fallback here: without a usable rust
+// binary the on-demand GET /api/v1/db/waveform endpoint still generates
+// waveforms lazily via ffmpeg on first play, which is exactly the
+// pre-rust behaviour.
+
+// Latched when the binary provably pre-dates the --waveform-scan
+// subcommand (exits non-zero having printed NOTHING — the current
+// binary's first statement is the waveformScanStart banner). A stale
+// binary doesn't heal between scans; without the latch every scan batch
+// would log the same failure forever. Inline scan-time waveforms keep
+// working on such a binary, so nothing is actually lost.
+let waveformPassUnsupported = false;
+
+export function addWaveformTask() {
+  if (config.program.scanOptions.generateWaveforms === false) { return; }
+  if (waveformPassUnsupported) { return; }
+  // One queued pass is enough — it sweeps the whole DB when it runs.
+  if (taskQueue.some((t) => t.task === 'waveform')) { return; }
+  taskQueue.push({ task: 'waveform', id: nanoid(8) });
+  nextTask();
+}
+
+function runWaveformTask(taskObj) {
+  // Re-check at run time: the admin toggle may have flipped while this
+  // sat queued, and findRustParser() stays false for the process
+  // lifetime once the binary was found dead.
+  if (config.program.scanOptions.generateWaveforms === false) { return; }
+  if (!findRustParser()) {
+    winston.info(
+      'Waveform pass skipped — no usable rust-parser binary (the on-demand ' +
+      'endpoint will generate waveforms lazily on first play)');
+    return;
+  }
+
+  const payload = {
+    dbPath: path.join(config.program.storage.dbDirectory, 'mstream.db'),
+    cacheDir: config.program.storage.waveformCacheDirectory,
+    expectedSchemaVersion: SCHEMA_VERSION,
+    scanThreads: config.program.scanOptions.scanThreads || 0,
+  };
+
+  const wfChild = child.spawn(rustParserBin, ['--waveform-scan', JSON.stringify(payload)],
+    { stdio: ['ignore', 'pipe', 'pipe'] });
+  winston.info('Waveform pass started');
+  // Same boot-reaper contract as scans: record the child so an orphan
+  // from a hard server kill gets cleaned up on the next boot.
+  if (Number.isInteger(wfChild.pid)) {
+    writeScannerPidfile(config.program.storage.dbDirectory, wfChild.pid, rustParserBin, 'waveform');
+  }
+
+  const killFn = () => { try { wfChild.kill(); } catch (_) { /* already gone */ } };
+  addToKillQueue(killFn);
+  activeTask = { kind: 'waveform', taskObj, child: wfChild, killFn };
+
+  // Any stdout proves the binary knows the subcommand — the banner is
+  // its first statement, printed before config parsing. Read by
+  // closeOnce to tell "ran and failed" from "pre-dates --waveform-scan".
+  let sawOutput = false;
+  bufferLines(wfChild.stdout, (line) => {
+    if (!line) { return; }
+    sawOutput = true;
+    if (line[0] === '{') {
+      try {
+        const evt = JSON.parse(line);
+        if (evt?.event === 'waveformScanStart') { return; }     // liveness banner
+        if (evt?.event === 'waveformScanProgress') { return; }  // too chatty for info
+        if (evt?.event === 'waveformScanPlan') {
+          if (evt.total > 0) {
+            winston.info(`Waveform pass: ${evt.total} track(s) need waveforms`);
+          }
+          return;
+        }
+        if (evt?.event === 'waveformScanComplete') {
+          winston.info(
+            `Waveform pass complete: ${evt.generated} generated, ` +
+            `${evt.failed} failed (${evt.total} planned)`);
+          return;
+        }
+      } catch (_) { /* not a structured event — log as plain text */ }
+    }
+    winston.info(line);
+  });
+  bufferLines(wfChild.stderr, (line) => {
+    if (!line) { return; }
+    if (line.startsWith('Warning:')) { winston.warn(`Waveform pass: ${line}`); }
+    else { winston.error(`Waveform pass error: ${line}`); }
+  });
+
+  let closed = false;
+  const closeOnce = (code, signal) => {
+    if (closed) { return; }
+    closed = true;
+    if (signal) {
+      // Deliberate kill (server shutdown via the kill queue, operator) —
+      // expected lifecycle, not a failure.
+      winston.info(`Waveform pass terminated by ${signal}`);
+    } else if (code !== 0 && !sawOutput) {
+      // Zero stdout means the binary never even printed its banner: it
+      // pre-dates the --waveform-scan subcommand (a stale prebuilt in
+      // the window before CI rebuilds). Such a binary still generates
+      // waveforms INLINE during its scans, so nothing is lost — say so
+      // once and stop re-trying every scan batch.
+      waveformPassUnsupported = true;
+      winston.warn(
+        'rust-parser pre-dates the --waveform-scan subcommand — skipping the ' +
+        'post-scan waveform pass until the binary updates (scan-time waveform ' +
+        'generation remains active on this binary)');
+    } else if (code !== 0) {
+      // Non-fatal for the server: waveforms stay lazy (on-demand
+      // endpoint). Error level so a chronically failing pass is visible.
+      winston.error(`Waveform pass FAILED with exit code ${code}`);
+    }
+    clearScannerPidfile(config.program.storage.dbDirectory);
+    if (activeTask?.child === wfChild) {
+      removeFromKillQueue(activeTask.killFn);
+      activeTask = null;
+    }
+    nextTask();
+    checkQueueDrainedSideEffects();
+  };
+  wfChild.on('error', (err) => {
+    winston.error(`Waveform pass failed to start: ${err.message}`);
+    closeOnce(-1, null);
+  });
+  wfChild.on('close', (code, signal) => closeOnce(code, signal));
+}
+
+// ── Album-art download task ─────────────────────────────────────────────────
+//
+// The third enrichment pass: a forked child (src/db/album-art-backfill.mjs)
+// that fills cover-art gaps from external services (MusicBrainz / iTunes /
+// Deezer), throttled to ~1 album/sec for rate-limit etiquette and capped
+// per run so a queued scan/backup never waits long behind it. Enqueued
+// once per scan BATCH from checkQueueDrainedSideEffects (N library scans
+// collapse to one pass), re-enqueued by its own close handler while it
+// keeps hitting the per-run cap. See album-art-backfill.mjs for the
+// cooldown/dedupe design.
+
+const ALBUM_ART_SCRIPT_PATH = path.join(__dirname, './album-art-backfill.mjs');
+const SCANNER_SCRIPT_PATH = path.join(__dirname, './scanner.mjs');
+
+// Enqueue unless the feature is off or nothing is eligible. The coarse
+// art-presence pre-check on the main connection avoids forking a no-op
+// child after every quiet scan (and keeps the stub libraries in tests
+// from spawning network work). The worker re-checks with the full
+// per-album cooldown logic — an album still in cooldown can pass this
+// gate; that just costs one fast no-op run.
+// Exported: the admin auto-album-art toggle routes through here so EVERY
+// entry point honours the same gates (autoAlbumArt, skipImg, a non-empty
+// service list, something eligible).
+export function maybeEnqueueAlbumArt() {
+  const opts = config.program.scanOptions;
+  if (opts.autoAlbumArt === false) { return; }
+  if (opts.skipImg === true) { return; }
+  // An emptied service list is "feature off", not a worker crash: the
+  // worker's own Joi requires >= 1 service, so forking with [] would just
+  // log a failed pass after every scan forever.
+  if (Array.isArray(opts.albumArtServices) && opts.albumArtServices.length === 0) { return; }
+
+  try {
+    const database = db.getDB();
+    if (!database) { return; }
+    const artFilter = opts.autoAlbumArtMode === 'all' ? '' : 'AND album_art_file IS NULL';
+    // EXISTS-tracks mirrors the worker's eligibility query: trackless
+    // ghost albums must keep neither the enqueue nor the worker alive.
+    const row = database.prepare(
+      `SELECT 1 FROM albums WHERE name IS NOT NULL AND TRIM(name) != ''
+        AND EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = albums.id) ${artFilter} LIMIT 1`
+    ).get();
+    if (!row) { return; }
+  } catch (err) {
+    // Fail safe: a pre-check hiccup must never wedge the task queue.
+    winston.warn('Album-art download pre-check failed; skipping enqueue', { stack: err });
+    return;
+  }
+
+  addAlbumArtTask();
+}
+
+function addAlbumArtTask() {
+  // One pass at a time — it's a global sweep over eligible albums, so a
+  // second concurrent or queued run would only duplicate work.
+  if (activeTask?.kind === 'albumart') { return; }
+  if (taskQueue.some((t) => t.task === 'albumart')) { return; }
+  taskQueue.push({ task: 'albumart', id: nanoid(8) });
+  nextTask();
+}
+
+function runAlbumArtTask(taskObj) {
+  const opts = config.program.scanOptions;
+  // Re-check ALL the gates at run time: config may have flipped while
+  // this sat queued, and run-time gating is what keeps every enqueue
+  // path (scan-drain, admin toggle, hitCap re-enqueue) consistent.
+  if (opts.autoAlbumArt === false || opts.skipImg === true) { return; }
+  if (Array.isArray(opts.albumArtServices) && opts.albumArtServices.length === 0) { return; }
+
+  const jsonLoad = {
+    dbPath: path.join(config.program.storage.dbDirectory, 'mstream.db'),
+    albumArtDirectory: config.program.storage.albumArtDirectory,
+    compressImage: opts.compressImage,
+    services: opts.albumArtServices || ['musicbrainz', 'itunes', 'deezer'],
+    mode: opts.autoAlbumArtMode || 'missing',
+    writeToFolder: opts.autoAlbumArtWriteToFolder === true,
+    maxPerRun: opts.autoAlbumArtPerRun || 100,
+    expectedSchemaVersion: SCHEMA_VERSION,
+    // Cooldowns + inter-request throttle use the worker's own defaults.
+  };
+
+  const forked = launchWorker('albumart', ALBUM_ART_SCRIPT_PATH, JSON.stringify(jsonLoad));
+  winston.info('Album-art download pass started');
+  // Boot-reaper contract, same as the scanners: this child WRITES the DB
+  // (per-album lookup rows + found-commits), so an orphan surviving a
+  // hard server kill must be reapable on the next boot — the script path
+  // is the command-line marker the reaper matches.
+  if (Number.isInteger(forked.pid)) {
+    writeScannerPidfile(config.program.storage.dbDirectory, forked.pid,
+      process.execPath, 'js', workerReaperMarker('albumart', ALBUM_ART_SCRIPT_PATH));
+  }
+
+  const killFn = () => { try { forked.kill(); } catch (_) { /* already gone */ } };
+  addToKillQueue(killFn);
+  // `observers.hitCap` is set by the stdout 'albumArtComplete' event so
+  // the close handler can decide whether to queue another batch.
+  const observers = { hitCap: false };
+  activeTask = { kind: 'albumart', taskObj, child: forked, killFn, observers };
+
+  bufferLines(forked.stdout, (line) => {
+    if (!line) { return; }
+    if (line[0] === '{') {
+      try {
+        const evt = JSON.parse(line);
+        if (evt.event === 'albumArtComplete') {
+          observers.hitCap = !!evt.hitCap;
+          if (evt.attempted > 0) {
+            winston.info(`Album-art download pass complete: ${evt.updated} fetched, `
+              + `${evt.deduped} already-had, ${evt.notFound} not found, `
+              + `${evt.errors} error(s) (${evt.attempted} attempted)`);
+          }
+          return;
+        }
+        if (evt.event === 'albumArtProgress') {
+          winston.info(`Album-art download: ${evt.attempted}/${evt.total} albums attempted`);
+          return;
+        }
+        if (evt.event === 'error') {
+          winston.error(`Album-art download: ${evt.message}`);
+          return;
+        }
+      } catch (_) { /* not a structured event — log as plain text */ }
+    }
+    winston.info(line);
+  });
+  bufferLines(forked.stderr, (line) => {
+    if (!line) { return; }
+    if (line.startsWith('Warning:')) { winston.warn(`Album-art download: ${line}`); }
+    else { winston.error(`Album-art download error: ${line}`); }
+  });
+
+  // Same close/error double-fire latch as the backup + waveform workers.
+  let closed = false;
+  const closeOnce = (code, signal) => {
+    if (closed) { return; }
+    closed = true;
+    if (signal) {
+      winston.info(`Album-art download pass terminated by ${signal}`);
+    } else if (code === 3) {
+      winston.warn('Album-art download pass aborted: DB schema changed under it (another instance migrating?)');
+    } else if (code !== 0 && code !== null) {
+      winston.warn(`Album-art download pass exited with code ${code}`);
+    }
+    clearScannerPidfile(config.program.storage.dbDirectory);
+    if (activeTask?.child === forked) {
+      removeFromKillQueue(activeTask.killFn);
+      activeTask = null;
+    }
+    // hitCap: the worker stopped at maxPerRun with (probably) more to do —
+    // queue another batch so a large first-run backlog drains in this idle
+    // stretch, while still yielding the slot to any scan/backup queued
+    // meanwhile. Terminates: every attempted album gets a cooldown row, so
+    // a later run that finds only cooled-down albums clears hitCap.
+    if (code === 0 && !signal && observers.hitCap) {
+      maybeEnqueueAlbumArt();
+    }
+    nextTask();
+    checkQueueDrainedSideEffects();
+  };
+  forked.on('error', (err) => {
+    winston.error(`Album-art download pass failed to start: ${err.message}`);
+    closeOnce(-1, null);
+  });
+  forked.on('close', (code, signal) => closeOnce(code, signal));
+}
+
 function launchJsScanner(scanObj, jsonLoad, library, { isFallback = false } = {}) {
-  const forkedScan = child.fork(path.join(__dirname, './scanner.mjs'), [JSON.stringify(jsonLoad)], { silent: true });
+  const forkedScan = launchWorker('scanner', SCANNER_SCRIPT_PATH, JSON.stringify(jsonLoad));
   winston.info(`File scan started${isFallback ? ' (JS fallback)' : ''} on ${library.root_path}`);
+  // Record the child for the boot-time orphan reaper (covers shutdown
+  // paths where no JS can run — Task Manager kill, SIGKILL). The forked
+  // scanner's image is this node executable — far too generic to kill
+  // on alone, so the scanner.mjs path rides along as the marker the
+  // reaper must find in the live process's command line.
+  if (Number.isInteger(forkedScan.pid)) {
+    writeScannerPidfile(config.program.storage.dbDirectory, forkedScan.pid,
+      process.execPath, 'js', workerReaperMarker('scanner', SCANNER_SCRIPT_PATH));
+  }
   attachScanHandlers(forkedScan, scanObj);
-  forkedScan.on('close', (code) => onScanClose(forkedScan, scanObj, code));
+  // Latched close-or-error: a fork that fails to start (ENOMEM, exec
+  // policy) emits 'error', and with no listener that is an unhandled
+  // EventEmitter error that tears down the whole server — while the
+  // activeTask claim and kill-queue entry leak, wedging the serial task
+  // queue forever. Route it through onScanClose exactly once (code -1 →
+  // error-level FAILED log + normal queue accounting), mirroring the
+  // backup worker's guard.
+  let scanClosed = false;
+  const closeOnce = (code) => {
+    if (scanClosed) { return; }
+    scanClosed = true;
+    onScanClose(forkedScan, scanObj, code);
+  };
+  forkedScan.on('error', (err) => {
+    winston.error(`JS scanner failed to start: ${err.message}`);
+    closeOnce(-1);
+  });
+  forkedScan.on('close', (code) => closeOnce(code));
   return forkedScan;
 }
 
@@ -423,7 +952,17 @@ function runScan(scanObj) {
     skipImg: config.program.scanOptions.skipImg,
     albumArtDirectory: config.program.storage.albumArtDirectory,
     scanId: scanObj.id,
+    // The server's current schema version. Both scanners refuse to run
+    // against a DB whose PRAGMA user_version differs (half-migrated DB,
+    // a second server instance on the same DB file, or a migration racing
+    // an orphaned scanner), and re-check before the stale-track sweep —
+    // their one destructive phase. Old scanner builds simply ignore the
+    // field (neither Joi nor serde rejects unknown/extra config here).
+    expectedSchemaVersion: SCHEMA_VERSION,
     compressImage: config.program.scanOptions.compressImage,
+    // Which art source wins when a track has both an embedded picture and a
+    // folder image. Both scanners honour it — see scanOptions.albumArtPriority.
+    albumArtPriority: config.program.scanOptions.albumArtPriority,
     supportedFiles: config.program.supportedAudioFiles,
     scanCommitInterval: config.program.scanOptions.scanCommitInterval || 25,
     // Pass through unconditionally — Rust binary treats 0 as "auto"
@@ -437,28 +976,24 @@ function runScan(scanObj) {
     // effect on the next scan of this vpath without the scanner
     // needing to know anything about the admin UI.
     followSymlinks: library.follow_symlinks === 1,
-    // The Rust scanner generates waveform .bin files inline via symphonia
-    // and writes them here (keyed by audio_hash, falling back to file_hash).
-    // The JS fallback scanner doesn't generate waveforms — for those users,
-    // the on-demand GET /api/v1/db/waveform endpoint produces them lazily
-    // via ffmpeg on first playback.
-    //
-    // generateWaveforms=false → send an empty cache dir; the Rust scanner
-    // treats that as "skip waveform decode entirely". The on-demand
-    // endpoint still works — it'll regenerate via ffmpeg on first
-    // playback — but you save the ~90% of scan wall-time symphonia
-    // would otherwise burn here.
+    // TRANSITION-ONLY fields: current scanners ignore both — waveform
+    // generation moved to the post-scan waveform task (runWaveformTask)
+    // and BPM analysis left the scanner entirely (it returns as the
+    // essentia enrichment scanner). They're still sent so a STALE
+    // prebuilt rust binary (pre-split) keeps its old inline behaviour
+    // until CI rebuilds — drop both once the fleet has moved.
     waveformCacheDir: config.program.scanOptions.generateWaveforms === false
       ? ''
       : config.program.storage.waveformCacheDirectory,
-    // BPM + musical-key detection via stratum-dsp. Pulled through the
-    // same scanOptions path as the other Rust-scanner toggles so an
-    // operator can flip it via `config.json` without rebuilding.
-    // The JS fallback scanner accepts this field in its Joi schema
-    // but doesn't act on it (stratum-dsp is a Rust crate). See
-    // scanOptions.analyzeBpm in src/state/config.js for the trade-off
-    // discussion + rust-parser's extract_track for the skip gates.
     analyzeBpm: config.program.scanOptions.analyzeBpm !== false,
+    // Subtree mode (V42-adjacent). When non-empty, the scanner walks
+    // {root_path}/{subtree} instead of {root_path} and SKIPS the
+    // stale-track + orphan cleanup passes (they'd wipe tracks living
+    // outside the subtree). Default empty = legacy whole-vpath scan.
+    // Used by the torrent completion-watcher to refresh only the
+    // directory a torrent landed in instead of waiting for the next
+    // full library scan.
+    subtree: scanObj.subtree || '',
   };
 
   if (!findRustParser()) {
@@ -468,30 +1003,81 @@ function runScan(scanObj) {
 
   const rustScan = child.spawn(rustParserBin, [JSON.stringify(jsonLoad)], { stdio: ['ignore', 'pipe', 'pipe'] });
   winston.info(`File scan started (Rust) on ${library.root_path}`);
+  // Record the child for the boot-time orphan reaper (see scan-pidfile.js).
+  // If this spawn errors and we fall back to JS, launchJsScanner simply
+  // overwrites the record with the fork's pid.
+  if (Number.isInteger(rustScan.pid)) {
+    writeScannerPidfile(config.program.storage.dbDirectory, rustScan.pid, rustParserBin, 'rust');
+  }
 
   let fellBack = false;
   rustScan.on('error', (err) => {
     if (fellBack) { return; }
     fellBack = true;
-    winston.warn(`Rust parser failed to start (${err.code || 'ERR'}), falling back to JS scanner: ${err.message}`);
-    // Permission / ABI / exec errors don't resolve themselves — disable Rust
-    // for the rest of this process lifetime so we don't retry every scan.
-    rustParserDisabled = true;
     // Undo the activeTask claim attachScanHandlers made for the rust
-    // child so the JS fallback's attachScanHandlers can claim it cleanly.
-    // Without this, the second attachScanHandlers would overwrite the
-    // claim — which works in steady state, but the rust handle's killFn
+    // child so the retry/JS-fallback's attachScanHandlers can claim it
+    // cleanly. Without this, the second attachScanHandlers would overwrite
+    // the claim — which works in steady state, but the rust handle's killFn
     // would still be in the kill queue, leaking entries across scans.
     if (activeTask?.child === rustScan) {
       removeFromKillQueue(activeTask.killFn);
       activeTask = null;
     }
+    // An unexecutable/incompatible shipped glibc binary can fail here too —
+    // try the portable static-musl sibling before giving up on Rust.
+    if (tryMuslRetry(scanObj, `failed to start (${err.code || 'ERR'}): ${err.message}`)) { return; }
+    winston.warn(`Rust parser failed to start (${err.code || 'ERR'}), falling back to JS scanner: ${err.message}`);
+    // Permission / ABI / exec errors don't resolve themselves — disable Rust
+    // for the rest of this process lifetime so we don't retry every scan.
+    rustParserDisabled = true;
     launchJsScanner(scanObj, jsonLoad, library, { isFallback: true });
   });
 
   attachScanHandlers(rustScan, scanObj);
-  rustScan.on('close', (code) => {
+  rustScan.on('close', (code, signal) => {
     if (fellBack) { return; }
+    // Died-on-arrival fallback: the spawn 'error' event only fires when
+    // the OS can't exec the binary at all (ENOENT/EACCES). The far more
+    // common real-world breakage — the dynamic linker aborting ("GLIBC
+    // not found", exit 127), a stale binary rejecting the arg format, an
+    // instant panic — execs fine, prints NOTHING to stdout, and exits
+    // non-zero. That used to log "completed with code N" and re-spawn
+    // the same dead binary every scheduled scan, leaving the library
+    // unindexed forever. Treat "really exited non-zero + zero stdout +
+    // never completed" as a launch failure: disable Rust for this
+    // process lifetime (a dead binary doesn't heal between scans) and
+    // run the JS fallback for this scan.
+    //
+    // The signature is precise, not inferential:
+    //  - the binary prints a {"event":"scanStart"} banner as its FIRST
+    //    statement, before any environment-dependent work — so a downed
+    //    mount, a busy DB, or a poisoned row (all transient, all stderr-
+    //    only) sets sawOutput and can never be mistaken for a dead
+    //    binary;
+    //  - signal === null excludes kills (shutdown via the kill queue,
+    //    OOM, operator) — close reports (null, 'SIGTERM')-style pairs
+    //    for those, and spawning a fallback after a deliberate kill
+    //    would orphan a scanner the kill queue no longer tracks;
+    //  - exit 3 (schema-version guard) is excluded as belt-and-braces:
+    //    a deliberate refusal the JS scanner would simply repeat.
+    if (signal === null && code !== null && code !== 0 && code !== 3
+        && !scanObj.completed && !scanObj.sawOutput) {
+      if (activeTask?.child === rustScan) {
+        removeFromKillQueue(activeTask.killFn);
+        activeTask = null;
+      }
+      clearScannerPidfile(config.program.storage.dbDirectory);
+      // Most often the shipped glibc binary is simply too new for an older
+      // host glibc (needs GLIBC_2.34); the static-musl build runs on any
+      // libc, so try it before dropping to the ~16x-slower JS scanner.
+      if (tryMuslRetry(scanObj, `died on arrival (exit ${code}, no output)`)) { return; }
+      winston.error(
+        `Rust parser died on arrival (exit ${code}, no output) — disabling it ` +
+        'for this run and falling back to the JS scanner');
+      rustParserDisabled = true;
+      launchJsScanner(scanObj, jsonLoad, library, { isFallback: true });
+      return;
+    }
     onScanClose(rustScan, scanObj, code);
   });
 }
@@ -586,7 +1172,7 @@ function runBackupTask(taskObj) {
     interFileDelayMs: dest.inter_file_delay_ms || 0,
   };
 
-  const forked = child.fork(BACKUP_WORKER_PATH, [JSON.stringify(jsonLoad)], { silent: true });
+  const forked = launchWorker('backup', BACKUP_WORKER_PATH, JSON.stringify(jsonLoad));
   winston.info(`Backup: started run #${historyId} for ${dest.dest_path} (trigger=${taskObj.triggerReason})`);
 
   const observers = attachBackupHandlers(forked, taskObj, historyId);
@@ -740,6 +1326,14 @@ export function scanVPath(vPath) {
   addScanTask(vPath);
 }
 
+// Targeted subtree scan. Walks {vpath}/{subtree} only and skips the
+// stale-cleanup pass. Used by the torrent completion-watcher so each
+// completed torrent triggers a narrow scan over its own download dir
+// instead of a full library walk.
+export function scanSubtree(vPath, subtree) {
+  addSubtreeScanTask(vPath, subtree);
+}
+
 export { scanAll, rescanAll };
 
 // "Is the system currently doing heavy disk work?" Used by API endpoints
@@ -750,7 +1344,13 @@ export { scanAll, rescanAll };
 // and the function name is preserved for back-compat with existing
 // JSON response shapes that key off it.
 export function isScanning() {
-  return activeTask !== null;
+  // Enrichment passes don't count: the waveform pass never writes the DB
+  // at all, and the art download pass writes one tiny transaction per
+  // throttled lookup (~1/sec) — the library is fully browsable while
+  // either runs, and a pass can legitimately take minutes. Reporting
+  // them as "scanning" would keep the UI's scanning state (and anything
+  // polling /db/status locked) busy for work that doesn't affect it.
+  return activeTask !== null && !ENRICHMENT_KINDS.includes(activeTask.kind);
 }
 
 // Snapshot of the queue + currently-scanning vpath. Returns DEFENSIVE
@@ -765,7 +1365,27 @@ export function getAdminStats() {
   return {
     taskQueue: taskQueue.map((t) => ({ ...t })),
     vpaths: activeScanVpath ? [activeScanVpath] : [],
+    // The running task's kind — isScanning() deliberately ignores the
+    // enrichment passes (waveform, albumart), so this is the only place
+    // a dashboard can see one in flight.
+    activeTaskKind: activeTask?.kind || null,
   };
+}
+
+// Read the stable scan id for the in-flight migration-rescan epoch from
+// the `.rescan-pending` marker, assigning + persisting one the first time
+// (older markers were written empty — that's expected). Reusing this id
+// across restarts is what lets the boot rescan RESUME: the scanner skips
+// any track already stamped with it instead of re-parsing from file zero.
+// Exported for the unit test in test/task-queue.test.mjs.
+export function resolveRescanEpochId(markerPath) {
+  let epochId = '';
+  try { epochId = fs.readFileSync(markerPath, 'utf8').trim(); } catch (_) { /* unreadable/missing — assign below */ }
+  if (!epochId) {
+    epochId = `rescan-${nanoid(8)}`;
+    try { fs.writeFileSync(markerPath, epochId + '\n'); } catch (_) { /* best-effort persist */ }
+  }
+  return epochId;
 }
 
 export function runAfterBoot() {
@@ -773,9 +1393,17 @@ export function runAfterBoot() {
   try { db.getDB()?.prepare('DELETE FROM scan_progress').run(); } catch (_) {}
 
   // Check if a migration flagged a force rescan. We DO NOT unlink the
-  // marker here — it stays on disk until onScanClose sees the queue
-  // drain. If the process crashes during the rescan, the marker
-  // survives and the next boot re-triggers the rescan automatically.
+  // marker here — it stays on disk until the queue drains after a
+  // COMPLETE rescan (checkQueueDrainedSideEffects). If the process is
+  // restarted mid-rescan, the marker survives and the next boot RESUMES.
+  //
+  // Resume hinges on a stable scan id persisted in the marker: the boot
+  // rescan reuses it across restarts, and the scanner skips any row whose
+  // scan_id already equals it (re-parsed in an earlier pass of the same
+  // epoch). The previous code force-rescanned with a fresh id every boot,
+  // so it restarted from file zero each time — on a library too large to
+  // finish in one uptime the marker never cleared and it re-scanned from
+  // scratch forever (the bug this fixes).
   const markerPath = path.join(config.program.storage.dbDirectory, '.rescan-pending');
   let pendingRescan = false;
   try {
@@ -783,14 +1411,22 @@ export function runAfterBoot() {
       pendingRescan = true;
       bootRescanInFlight = true;
       bootRescanMarkerPath = markerPath;
-      winston.info('Force rescan pending from migration — will rescan all libraries');
+      bootRescanScanId = resolveRescanEpochId(markerPath);
+      winston.info(`Force rescan pending from migration — resumable epoch '${bootRescanScanId}'`);
     }
   } catch (_) {}
 
   setTimeout(() => {
     if (pendingRescan) {
-      // Migration requires full rescan — force re-parse all files
-      rescanAll();
+      // Resumable migration rescan: every library shares the stable epoch
+      // id so a restart continues from where it left off instead of
+      // re-parsing the whole library from file zero.
+      rescanAll(bootRescanScanId);
+      // If rescanAll enqueued nothing (e.g. zero libraries configured), no
+      // scan will ever close to trigger the drain check — so clear the
+      // marker now rather than letting it linger across boots. When
+      // libraries exist a scan is already active here, so this is a no-op.
+      checkQueueDrainedSideEffects();
     } else if (config.program.scanOptions.scanInterval > 0 && scanIntervalTimer === null) {
       scanAll();
     }

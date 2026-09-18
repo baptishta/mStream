@@ -46,6 +46,45 @@ const ADMINDATA = (() => {
   // subsonic
   module.subsonicParams = {};
   module.subsonicParamsUpdated = { ts: 0 };
+
+  module.irohParams = {};
+  module.irohParamsUpdated = { ts: 0 };
+  // torrent (UX-layer settings — client + whitelist gating)
+  module.torrentParams = {
+    client:       'disabled',
+    enabledFor:   'all',
+    transmission: { host: '', port: 9091, username: '', rpcPath: '/transmission/rpc', useHttps: false, configured: false },
+    qbittorrent:  { host: '', port: 8080, username: '',                                useHttps: false, configured: false },
+    deluge:       { host: '', port: 8112,                                              useHttps: false, configured: false },
+  };
+  module.torrentParamsUpdated = { ts: 0 };
+  // Connection status for the active client. Refetched on page load
+  // and after Connect/Disconnect actions. Polling is intentionally not
+  // wired in v1 — the status card has a "Test" button for on-demand
+  // checks.
+  module.torrentStatus = { connected: false, configured: false, reason: null, version: null };
+  module.torrentStatusUpdated = { ts: 0 };
+  // Torrent list. Refetched on demand. Empty array is the legitimate
+  // "no torrents" state; `error` is non-null when the daemon couldn't
+  // be reached.
+  module.torrentList = { torrents: [], error: null };
+  module.torrentListUpdated = { ts: 0 };
+  // Per-vpath access mapping for the active client. Empty object until
+  // a sweep runs. Each entry: {daemonPath, mstreamWritable, confidence,
+  // source, method, lastProbedAt, lastError}. Confidence drives the
+  // colour; source drives whether the manual-edit input is editable.
+  module.torrentVpathAccess = { clientType: null, vpaths: {} };
+  module.torrentVpathAccessUpdated = { ts: 0 };
+  // Per-vpath path templates (V41). Each entry: {template: string|null}.
+  // supportedVars + suggestedTemplate + sampleMetadata come from the
+  // server so we don't duplicate the allowlist client-side.
+  module.torrentPathTemplates = {
+    vpaths:            {},
+    supportedVars:     [],
+    suggestedTemplate: '',
+    sampleMetadata:    {},
+  };
+  module.torrentPathTemplatesUpdated = { ts: 0 };
   // subsonic — API keys for the currently-authenticated user. Keys are
   // returned in full only at creation; subsequent listings are metadata-only.
   module.apiKeys = [];
@@ -231,6 +270,89 @@ const ADMINDATA = (() => {
       Object.keys(res.data).forEach(key => { module.subsonicParams[key] = res.data[key]; });
     } catch (err) {}
     module.subsonicParamsUpdated.ts = Date.now();
+  }
+
+  module.getIroh = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/admin/iroh`
+      });
+      Object.keys(res.data).forEach(key => { module.irohParams[key] = res.data[key]; });
+    } catch (err) {}
+    module.irohParamsUpdated.ts = Date.now();
+  }
+
+  module.getTorrentParams = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/admin/torrent`
+      });
+      Object.keys(res.data).forEach(key => { module.torrentParams[key] = res.data[key]; });
+    } catch (err) {}
+    module.torrentParamsUpdated.ts = Date.now();
+  }
+
+  module.getTorrentVpathAccess = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/admin/torrent/vpath-access`,
+      });
+      module.torrentVpathAccess.clientType = res.data.clientType;
+      module.torrentVpathAccess.vpaths     = res.data.vpaths || {};
+    } catch (err) {
+      module.torrentVpathAccess.vpaths = {};
+    }
+    module.torrentVpathAccessUpdated.ts = Date.now();
+  }
+
+  module.getTorrentPathTemplates = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/admin/torrent/path-templates`,
+      });
+      module.torrentPathTemplates.vpaths            = res.data.vpaths || {};
+      module.torrentPathTemplates.supportedVars     = res.data.supportedVars || [];
+      module.torrentPathTemplates.suggestedTemplate = res.data.suggestedTemplate || '';
+      module.torrentPathTemplates.sampleMetadata    = res.data.sampleMetadata || {};
+    } catch (err) {
+      module.torrentPathTemplates.vpaths = {};
+    }
+    module.torrentPathTemplatesUpdated.ts = Date.now();
+  }
+
+  module.getTorrentList = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/admin/torrent/list`,
+      });
+      module.torrentList.torrents = Array.isArray(res.data.torrents) ? res.data.torrents : [];
+      module.torrentList.error    = res.data.error || null;
+    } catch (err) {
+      module.torrentList.torrents = [];
+      module.torrentList.error    = err.message || 'request failed';
+    }
+    module.torrentListUpdated.ts = Date.now();
+  }
+
+  module.getTorrentStatus = async () => {
+    try {
+      const res = await API.axios({
+        method: 'GET',
+        url: `${API.url()}/api/v1/admin/torrent/status`
+      });
+      Object.keys(module.torrentStatus).forEach(k => { module.torrentStatus[k] = res.data[k] ?? null; });
+      // Pick up any new fields the API decides to add later (e.g. rpcVersion).
+      Object.keys(res.data).forEach(k => { module.torrentStatus[k] = res.data[k]; });
+    } catch (err) {
+      module.torrentStatus.connected = false;
+      module.torrentStatus.reason    = err.message || 'request failed';
+    }
+    module.torrentStatusUpdated.ts = Date.now();
   }
 
   // ── Subsonic API key management ───────────────────────────────────────
@@ -431,6 +553,12 @@ ADMINDATA.getServerAudioInfo();
 ADMINDATA.getFederationParams();
 ADMINDATA.getDlnaParams();
 ADMINDATA.getSubsonicParams();
+ADMINDATA.getIroh();
+ADMINDATA.getTorrentParams();
+ADMINDATA.getTorrentStatus();
+ADMINDATA.getTorrentList();
+ADMINDATA.getTorrentVpathAccess();
+ADMINDATA.getTorrentPathTemplates();
 ADMINDATA.getApiKeys();
 ADMINDATA.getSubsonicStats();
 ADMINDATA.getJukeboxStatus();
@@ -451,6 +579,7 @@ M.Modal.init(document.querySelectorAll('.modal'), {
 
 // Intialize Clipboard
 new ClipboardJS('.fed-copy-button');
+new ClipboardJS('.iroh-copy-button');
 
 // ----- i18n glue for Vue templates -----
 // A reactive counter that increments each time the active language changes.
@@ -1091,7 +1220,8 @@ const advancedView = Vue.component('advanced-view', {
       params: ADMINDATA.serverParams,
       paramsTS: ADMINDATA.serverParamsUpdated,
       audioInfo: ADMINDATA.serverAudioInfo,
-      audioInfoTS: ADMINDATA.serverAudioInfoUpdated
+      audioInfoTS: ADMINDATA.serverAudioInfoUpdated,
+      dbCacheSizeDraft: null
     };
   },
   computed: {
@@ -1167,9 +1297,21 @@ const advancedView = Vue.component('advanced-view', {
                       </td>
                     </tr>
                     <tr>
+                      <td><b>{{ t('admin.settings.downloadSizeLimit') }}</b> {{ params.downloadSizeLimit === '0' ? t('admin.settings.unlimited') : params.downloadSizeLimit }}</td>
+                      <td>
+                        [<a v-on:click="openModal('edit-download-size-limit-modal')">{{ t('admin.settings.edit') }}</a>]
+                      </td>
+                    </tr>
+                    <tr>
                       <td><b>{{ t('admin.settings.address') }}</b> {{params.address}}</td>
                       <td>
                         [<a v-on:click="openModal('edit-address-modal')">{{ t('admin.settings.edit') }}</a>]
+                      </td>
+                    </tr>
+                    <tr>
+                      <td><b>{{ t('admin.settings.trustProxy') }}</b> {{ params.trustProxy === true ? t('admin.settings.enabled') : t('admin.settings.disabled') }}</td>
+                      <td>
+                        [<a v-on:click="toggleTrustProxy()">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
@@ -1210,6 +1352,39 @@ const advancedView = Vue.component('advanced-view', {
                     <tr>
                       <td><b>Detected CLI players:</b> {{ detectedCliPlayersLabel }}</td>
                       <td></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+          <div class="col s12">
+            <div class="card">
+              <div class="card-content">
+                <span class="card-title">Database</span>
+                <table>
+                  <tbody>
+                    <tr>
+                      <td><b title="SQLite write durability for the main connection. FULL fsyncs every commit, so no scrobble, rating, or playlist edit is lost on a power cut. NORMAL skips the per-commit fsync for faster writes — still crash-safe under WAL (never corrupts), but a hard power loss can lose the last few committed actions. Applied live, no restart.">Write Durability (synchronous):</b> {{params.dbSynchronous || 'FULL'}}</td>
+                      <td>
+                        [<a v-on:click="toggleDbSynchronous()">switch to {{ (params.dbSynchronous === 'NORMAL') ? 'FULL' : 'NORMAL' }}</a>]
+                      </td>
+                    </tr>
+                    <tr>
+                      <td><b title="SQLite page-cache size for the main connection, in MB (applied as a negative cache_size). A larger cache keeps more of the DB + indexes hot in RAM, cutting disk reads on big libraries under heavy browse/search load, at the cost of that much process memory. Applied live, no restart.">Page cache (MB):</b> {{params.dbCacheSizeMb || 64}}</td>
+                      <td>
+                        <input type="number" min="1" max="2048" v-model.number="dbCacheSizeDraft" :placeholder="params.dbCacheSizeMb || 64" style="width:90px" />
+                        [<a v-on:click="saveDbCacheSize()">save</a>]
+                      </td>
+                    </tr>
+                    <tr>
+                      <td><b title="HTTP response compression for text payloads (API JSON, HTML, JS, CSS). brotli = best ratio; gzip = widest compatibility; none = off. Audio and range/seek streams are never compressed. Applied live, no restart.">Compression:</b> {{params.compression || 'none'}}</td>
+                      <td>
+                        <span v-for="m in ['none','gzip','brotli']" :key="m" style="margin-right:6px">
+                          <b v-if="(params.compression || 'none') === m">[{{m}}]</b>
+                          <span v-else>[<a v-on:click="setCompression(m)">{{m}}</a>]</span>
+                        </span>
+                      </td>
                     </tr>
                   </tbody>
                 </table>
@@ -1519,6 +1694,122 @@ const advancedView = Vue.component('advanced-view', {
     refreshServerAudioInfo: function() {
       ADMINDATA.redetectCliPlayers();
     },
+    toggleDbSynchronous: async function() {
+      const next = (this.params.dbSynchronous === 'NORMAL') ? 'FULL' : 'NORMAL';
+      try {
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/config/db-synchronous`,
+          data: { synchronous: next }
+        });
+        Vue.set(ADMINDATA.serverParams, 'dbSynchronous', next);
+        iziToast.success({
+          title: `DB write durability set to ${next}`,
+          position: 'topCenter',
+          timeout: 2500
+        });
+      } catch (err) {
+        iziToast.error({
+          title: 'Failed to change DB synchronous setting',
+          position: 'topCenter',
+          timeout: 3500
+        });
+      }
+    },
+    saveDbCacheSize: async function() {
+      const mb = Number(this.dbCacheSizeDraft);
+      if (!Number.isInteger(mb) || mb < 1 || mb > 2048) {
+        iziToast.error({
+          title: 'Cache size must be a whole number between 1 and 2048 MB',
+          position: 'topCenter',
+          timeout: 3500
+        });
+        return;
+      }
+      try {
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/config/db-cache-size`,
+          data: { cacheSizeMb: mb }
+        });
+        Vue.set(ADMINDATA.serverParams, 'dbCacheSizeMb', mb);
+        this.dbCacheSizeDraft = null;
+        iziToast.success({
+          title: `DB page cache set to ${mb} MB`,
+          position: 'topCenter',
+          timeout: 2500
+        });
+      } catch (err) {
+        iziToast.error({
+          title: 'Failed to change DB cache size',
+          position: 'topCenter',
+          timeout: 3500
+        });
+      }
+    },
+    setCompression: async function(mode) {
+      try {
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/config/compression`,
+          data: { mode }
+        });
+        Vue.set(ADMINDATA.serverParams, 'compression', mode);
+        iziToast.success({
+          title: `Compression set to ${mode}`,
+          position: 'topCenter',
+          timeout: 2500
+        });
+      } catch (err) {
+        iziToast.error({
+          title: 'Failed to change compression setting',
+          position: 'topCenter',
+          timeout: 3500
+        });
+      }
+    },
+    toggleTrustProxy: function() {
+      iziToast.question({
+        timeout: 20000,
+        close: false,
+        overlayClose: true,
+        overlay: true,
+        displayMode: 'once',
+        id: 'question',
+        zindex: 99999,
+        layout: 2,
+        maxWidth: 600,
+        title: `<b>${this.params.trustProxy ? t('admin.settings.disableTrustProxy') : t('admin.settings.enableTrustProxy')}</b>`,
+        message: t('admin.settings.trustProxyHint'),
+        position: 'center',
+        buttons: [
+          [`<button><b>${this.params.trustProxy ? t('admin.settings.disableButton') : t('admin.settings.enableButton')}</b></button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+            API.axios({
+              method: 'POST',
+              url: `${API.url()}/api/v1/admin/config/trust-proxy`,
+              data: { trustProxy: !this.params.trustProxy }
+            }).then(() => {
+              Vue.set(ADMINDATA.serverParams, 'trustProxy', !this.params.trustProxy);
+              iziToast.success({
+                title: t('admin.settings.updated'),
+                position: 'topCenter',
+                timeout: 3500
+              });
+            }).catch(() => {
+              iziToast.error({
+                title: t('admin.settings.failed'),
+                position: 'topCenter',
+                timeout: 3500
+              });
+            });
+          }, true],
+          [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
+            instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
+          }],
+        ]
+      });
+    },
     toggleAutoBootServerAudio: function() {
       iziToast.question({
         timeout: 20000,
@@ -1613,13 +1904,13 @@ const dbView = Vue.component('db-view', {
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Generate waveforms during scan:</b> {{dbParams.generateWaveforms}}</td>
+                      <td><b>Generate waveforms after scans:</b> {{dbParams.generateWaveforms}}</td>
                       <td>
                         [<a v-on:click="toggleGenerateWaveforms()">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
-                      <td><b>Analyse BPM + key during scan:</b> {{dbParams.analyzeBpm}}</td>
+                      <td><b>Analyse BPM + key (deprecated — no effect until the essentia scanner ships):</b> {{dbParams.analyzeBpm}}</td>
                       <td>
                         [<a v-on:click="toggleAnalyzeBpm()">{{ t('admin.settings.edit') }}</a>]
                       </td>
@@ -1639,6 +1930,24 @@ const dbView = Vue.component('db-view', {
                       <td><b>{{ t('admin.db.autoLookup') }}</b> {{ dbParams.autoAlbumArt ? t('admin.settings.enabled') : t('admin.settings.disabled') }}</td>
                       <td>
                         [<a v-on:click="toggleAutoAlbumArt()">{{ t('admin.settings.edit') }}</a>]
+                      </td>
+                    </tr>
+                    <tr>
+                      <td><b>{{ t('admin.db.autoArtMode') }}</b> {{ dbParams.autoAlbumArtMode === 'all' ? t('admin.db.autoArtModeAll') : t('admin.db.autoArtModeMissing') }}</td>
+                      <td>
+                        [<a v-on:click="toggleAutoAlbumArtMode()">{{ t('admin.settings.edit') }}</a>]
+                      </td>
+                    </tr>
+                    <tr>
+                      <td><b>{{ t('admin.db.autoArtPerRun') }}</b> {{ dbParams.autoAlbumArtPerRun }}</td>
+                      <td>
+                        [<a v-on:click="openModal('edit-auto-album-art-per-run-modal')">{{ t('admin.settings.edit') }}</a>]
+                      </td>
+                    </tr>
+                    <tr>
+                      <td><b>{{ t('admin.db.autoWriteToFolder') }}</b> {{ dbParams.autoAlbumArtWriteToFolder ? t('admin.settings.enabled') : t('admin.settings.disabled') }}</td>
+                      <td>
+                        [<a v-on:click="toggleAutoAlbumArtWriteToFolder()">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
                     <tr>
@@ -1711,7 +2020,7 @@ const dbView = Vue.component('db-view', {
                       <tr v-for="(v, k) in sharedPlaylists">
                         <th><a target="_blank" v-bind:href="'/shared/'+ v.playlistId">{{v.playlistId}}</a></th>
                         <th>{{v.user}}</th>
-                        <th>{{new Date(v.expires * 1000).toLocaleString()}}</th>
+                        <th>{{ v.expires ? new Date(v.expires * 1000).toLocaleString() : t('admin.db.never') }}</th>
                         <th>[<a v-on:click="deletePlaylist(v)">{{ t('admin.db.deleteLower') }}</a>]</th>
                       </tr>
                     </tbody>
@@ -2000,12 +2309,12 @@ const dbView = Vue.component('db-view', {
       });
     },
     toggleGenerateWaveforms: function() {
-      // Disabling waveform generation roughly 10× the scan throughput
-      // because symphonia decode dominates per-file work. Waveforms
-      // still appear in the UI — the on-demand /api/v1/db/waveform
-      // endpoint regenerates via ffmpeg on first playback. Trade-off
-      // is a few hundred ms latency on the first waveform request
-      // per track.
+      // Waveforms are generated by a background pass AFTER each scan
+      // (the scan itself no longer decodes audio). Disabling skips the
+      // pass; waveforms still appear in the UI via the on-demand
+      // /api/v1/db/waveform endpoint, which regenerates via ffmpeg on
+      // first playback — a few hundred ms latency on the first request
+      // per track. Enabling immediately queues a backfill pass.
       iziToast.question({
         timeout: 20000,
         close: false,
@@ -2016,7 +2325,7 @@ const dbView = Vue.component('db-view', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: `<b>${this.dbParams.generateWaveforms === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')} scan-time waveform generation?</b>`,
+        title: `<b>${this.dbParams.generateWaveforms === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')} background waveform generation?</b>`,
         position: 'center',
         buttons: [
           [`<button><b>${this.dbParams.generateWaveforms === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')}</b></button>`, (instance, toast) => {
@@ -2047,15 +2356,12 @@ const dbView = Vue.component('db-view', {
       });
     },
     toggleAnalyzeBpm: function() {
-      // Stratum-dsp adds ~200-1000ms decode+analysis per file (varies
-      // by track length and signal). Skip gates in extract_track
-      // already filter audiobook genres and durations outside
-      // [30s, 30min] — disabling here is the global kill-switch for
-      // hosts that don't want any algorithmic analysis (e.g.
-      // memory-constrained NAS boxes, or libraries where tag-sourced
-      // BPM/key is the only source the operator trusts).
-      // Disabling doesn't strip existing stratum-sourced rows — they
-      // stay in the DB until the next force-rescan re-extracts.
+      // DEPRECATED — currently a no-op: scan-time BPM/key analysis was
+      // removed with scan-time decode and returns as the separate
+      // essentia enrichment scanner. The toggle persists the config
+      // value (it will seed the essentia scanner's default), tag-sourced
+      // BPM/key is always ingested, and existing analysis-derived rows
+      // keep their values.
       iziToast.question({
         timeout: 20000,
         close: false,
@@ -2066,7 +2372,7 @@ const dbView = Vue.component('db-view', {
         zindex: 99999,
         layout: 2,
         maxWidth: 600,
-        title: `<b>${this.dbParams.analyzeBpm === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')} BPM + key detection during scan?</b>`,
+        title: `<b>${this.dbParams.analyzeBpm === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')} BPM + key detection? (deprecated — no effect until the essentia scanner ships)</b>`,
         position: 'center',
         buttons: [
           [`<button><b>${this.dbParams.analyzeBpm === true ? t('admin.settings.disableButton') : t('admin.settings.enableButton')}</b></button>`, (instance, toast) => {
@@ -2138,6 +2444,26 @@ const dbView = Vue.component('db-view', {
           }],
         ]
       });
+    },
+    // Binary setting — the "edit" link just flips to the other value.
+    toggleAutoAlbumArtMode: function() {
+      const self = this;
+      const next = self.dbParams.autoAlbumArtMode === 'all' ? 'missing' : 'all';
+      API.axios({ method: 'POST', url: `${API.url()}/api/v1/admin/db/params/auto-album-art-mode`,
+        data: { autoAlbumArtMode: next }
+      }).then(() => {
+        Vue.set(ADMINDATA.dbParams, 'autoAlbumArtMode', next);
+        iziToast.success({ title: t('admin.settings.updated'), position: 'topCenter', timeout: 3500 });
+      }).catch(() => { iziToast.error({ title: t('admin.settings.failed'), position: 'topCenter', timeout: 3500 }); });
+    },
+    toggleAutoAlbumArtWriteToFolder: function() {
+      const self = this;
+      API.axios({ method: 'POST', url: `${API.url()}/api/v1/admin/db/params/auto-album-art-write-to-folder`,
+        data: { autoAlbumArtWriteToFolder: !self.dbParams.autoAlbumArtWriteToFolder }
+      }).then(() => {
+        Vue.set(ADMINDATA.dbParams, 'autoAlbumArtWriteToFolder', !self.dbParams.autoAlbumArtWriteToFolder);
+        iziToast.success({ title: t('admin.settings.updated'), position: 'topCenter', timeout: 3500 });
+      }).catch(() => { iziToast.error({ title: t('admin.settings.failed'), position: 'topCenter', timeout: 3500 }); });
     },
     toggleAutoAlbumArt: function() {
       const self = this;
@@ -2425,6 +2751,12 @@ const transcodeView = Vue.component('transcode-view', {
                       [<a v-on:click="changeBitrate()">{{ t('admin.settings.edit') }}</a>]
                     </td>
                   </tr>
+                  <tr>
+                    <td><b title="Automatically update the managed ffmpeg build on a weekly check. Disable to pin the current binary — useful if a rolling upstream build regresses, or for reproducible/air-gapped installs. No effect when running off system ffmpeg.">Auto-Update FFmpeg:</b> {{params.autoUpdate ? 'on' : 'off'}}</td>
+                    <td>
+                      [<a v-on:click="toggleAutoUpdate()">{{ params.autoUpdate ? 'disable' : 'enable' }}</a>]
+                    </td>
+                  </tr>
                 </tbody>
               </table>
             </div>
@@ -2440,6 +2772,28 @@ const transcodeView = Vue.component('transcode-view', {
     changeBitrate: function() {
       modVM.currentViewModal = 'edit-transcode-bitrate-modal';
       M.Modal.getInstance(document.getElementById('admin-modal')).open();
+    },
+    toggleAutoUpdate: async function() {
+      const next = !this.params.autoUpdate;
+      try {
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/transcode/auto-update`,
+          data: { autoUpdate: next }
+        });
+        Vue.set(ADMINDATA.transcodeParams, 'autoUpdate', next);
+        iziToast.success({
+          title: next ? 'FFmpeg auto-update enabled' : 'FFmpeg auto-update disabled',
+          position: 'topCenter',
+          timeout: 2500
+        });
+      } catch (err) {
+        iziToast.error({
+          title: 'Failed to change auto-update setting',
+          position: 'topCenter',
+          timeout: 3500
+        });
+      }
     },
     downloadFFMpeg: async function() {
       if (this.downloadPending.val === true) {
@@ -2820,8 +3174,23 @@ const logsView = Vue.component('logs-view', {
   data() {
     return {
       params: ADMINDATA.serverParams,
-      paramsTS: ADMINDATA.serverParamsUpdated
+      paramsTS: ADMINDATA.serverParamsUpdated,
+      // Live-log viewer state. logLines holds the rendered tail; lastSeq is
+      // the cursor we poll from; paused freezes the feed; autoscroll keeps
+      // us pinned to the bottom unless the user scrolls up to read history.
+      logLines: [],
+      lastSeq: 0,
+      paused: false,
+      autoscroll: true,
+      pollTimer: null
     };
+  },
+  mounted() {
+    this.fetchRecent();
+    this.pollTimer = setInterval(() => { this.fetchRecent(); }, 2000);
+  },
+  beforeDestroy() {
+    if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
   },
   template: `
     <div v-if="paramsTS.ts === 0" class="row">
@@ -2848,6 +3217,12 @@ const logsView = Vue.component('logs-view', {
                         [<a v-on:click="changeLogsDir()">{{ t('admin.settings.edit') }}</a>]
                       </td>
                     </tr>
+                    <tr>
+                      <td><b>{{ t('admin.logs.bufferSize') }}</b> {{ params.logBufferSize === 0 ? t('admin.logs.bufferDisabled') : params.logBufferSize }}</td>
+                      <td>
+                        [<a v-on:click="openModal('edit-log-buffer-size-modal')">{{ t('admin.settings.edit') }}</a>]
+                      </td>
+                    </tr>
                   </tbody>
                 </table>
               </div>
@@ -2856,10 +3231,95 @@ const logsView = Vue.component('logs-view', {
               </div>
             </div>
           </div>
+          <div class="col s12">
+            <div class="card">
+              <div class="card-content">
+                <span class="card-title">
+                  {{ t('admin.logs.liveTitle') }}
+                  <span style="font-size:0.55em; vertical-align:middle; margin-left:8px;" :style="{ color: paused ? '#ff9800' : '#4caf50' }">
+                    ● {{ paused ? t('admin.logs.paused') : t('admin.logs.live') }}
+                  </span>
+                </span>
+                <div v-if="params.logBufferSize === 0">
+                  <blockquote>{{ t('admin.logs.bufferOff') }}</blockquote>
+                </div>
+                <div v-else>
+                  <div style="margin-bottom:10px;">
+                    <a v-on:click="togglePause" class="waves-effect waves-light btn-small">{{ paused ? t('admin.logs.resume') : t('admin.logs.pause') }}</a>
+                    <a v-on:click="clearLog" class="waves-effect waves-light btn-small grey lighten-1" style="margin-left:6px;">{{ t('admin.logs.clear') }}</a>
+                  </div>
+                  <div ref="logbox" v-on:scroll="onScroll" style="background:#1e1e1e; color:#d4d4d4; font-family:monospace; font-size:12px; line-height:1.45; height:360px; overflow-y:auto; padding:10px; border-radius:4px; white-space:pre-wrap; word-break:break-word;">
+                    <div v-if="logLines.length === 0" style="color:#888;">{{ t('admin.logs.bufferEmpty') }}</div>
+                    <div v-for="line in logLines" :key="line.seq" :style="{ color: lineColor(line.level) }">{{ fmtTime(line.t) }} {{ line.level }}: {{ line.message }}</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>`,
   methods: {
+    openModal: function(modalView) {
+      modVM.currentViewModal = modalView;
+      M.Modal.getInstance(document.getElementById('admin-modal')).open();
+    },
+    togglePause: function() {
+      this.paused = !this.paused;
+      // Resuming jumps back to the live tail.
+      if (!this.paused) { this.autoscroll = true; this.fetchRecent(); }
+    },
+    clearLog: function() {
+      this.logLines = [];
+    },
+    fmtTime: function(iso) {
+      // ISO 'YYYY-MM-DDTHH:MM:SS.sssZ' -> 'HH:MM:SS'
+      return (typeof iso === 'string' && iso.length >= 19) ? iso.slice(11, 19) : '';
+    },
+    lineColor: function(level) {
+      switch (level) {
+        case 'error': return '#ff5252';
+        case 'warn': return '#ffb74d';
+        case 'info': return '#9ccc65';
+        case 'debug': return '#90a4ae';
+        default: return '#d4d4d4';
+      }
+    },
+    onScroll: function() {
+      const el = this.$refs.logbox;
+      if (!el) { return; }
+      // Stick to the bottom only while the user is already near it, so
+      // scrolling up to read history isn't yanked back down by new lines.
+      this.autoscroll = (el.scrollHeight - el.scrollTop - el.clientHeight) < 30;
+    },
+    fetchRecent: async function() {
+      if (this.paused) { return; }
+      try {
+        const res = await API.axios({
+          method: 'GET',
+          url: `${API.url()}/api/v1/admin/logs/recent?since=${this.lastSeq}`
+        });
+        // A server restart resets the seq counter; if the server cursor
+        // fell below ours the buffer is fresh — drop what we have and reseed.
+        if (typeof res.data.lastSeq === 'number' && res.data.lastSeq < this.lastSeq) {
+          this.logLines = [];
+        }
+        const entries = Array.isArray(res.data.entries) ? res.data.entries : [];
+        if (entries.length) {
+          for (const e of entries) { this.logLines.push(e); }
+          // Cap the rendered list so the DOM stays bounded on a busy server.
+          const MAXVIEW = 2000;
+          if (this.logLines.length > MAXVIEW) {
+            this.logLines.splice(0, this.logLines.length - MAXVIEW);
+          }
+          this.$nextTick(() => {
+            const el = this.$refs.logbox;
+            if (el && this.autoscroll) { el.scrollTop = el.scrollHeight; }
+          });
+        }
+        if (typeof res.data.lastSeq === 'number') { this.lastSeq = res.data.lastSeq; }
+      } catch (_err) { /* transient — next poll retries */ }
+    },
     changeLogsDir: function() {
       iziToast.warning({
         title: t('admin.transcode.comingSoon'),
@@ -2936,63 +3396,184 @@ const logsView = Vue.component('logs-view', {
   }
 });
 
-const lockView = Vue.component('lock-view', {
+const securityView = Vue.component('security-view', {
   data() {
-    return {};
+    return {
+      params: ADMINDATA.serverParams,
+      paramsTS: ADMINDATA.serverParamsUpdated,
+      // Local form state, hydrated from serverParams.adminAccess once loaded.
+      selectedMode: 'all',
+      // Local editable copy of the whitelist so edits aren't committed to the
+      // saved config until Apply succeeds.
+      whitelistDraft: [],
+      newEntry: '',
+      applyPending: false,
+    };
+  },
+  watch: {
+    'paramsTS.ts': {
+      immediate: true,
+      handler: function() {
+        const aa = this.params.adminAccess || {};
+        this.selectedMode = aa.mode || 'all';
+        this.whitelistDraft = Array.isArray(aa.whitelist) ? aa.whitelist.slice() : [];
+      }
+    }
   },
   template: `
-    <div class="container">
-      <div class="row">
-        <h2>{{ t('admin.lock.title') }}</h2>
-        <p>
-          {{ t('admin.lock.description') }} {{ t('admin.lock.undoInstructions') }}
-          <br><br>
-          -- {{ t('admin.lock.undoStep1') }}<br>
-          -- {{ t('admin.lock.undoStep2') }}<br>
-          -- {{ t('admin.lock.undoStep3') }}
-        </p>
-        <br>
-        <a class="waves-effect waves-light btn-large" v-on:click="disableAdmin()">{{ t('admin.lock.disableButton') }}</a>
+    <div v-if="paramsTS.ts === 0" class="row">
+      <svg class="spinner" width="65px" height="65px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
+    </div>
+    <div v-else class="container">
+      <div class="row" style="margin-top:24px">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">{{ t('admin.security.title') }}</span>
+              <p>{{ t('admin.security.description') }}</p>
+              <div style="margin-top:16px">
+                <p><b>{{ t('admin.security.currentMode') }}</b> {{ (params.adminAccess && params.adminAccess.mode) || 'all' }}</p>
+              </div>
+              <div style="margin-top:20px">
+                <p><b>{{ t('admin.security.changeMode') }}</b></p>
+                <p>
+                  <label style="margin-right:20px">
+                    <input type="radio" v-model="selectedMode" value="all" />
+                    <span>{{ t('admin.security.modeAll') }}</span>
+                  </label>
+                  <label style="margin-right:20px">
+                    <input type="radio" v-model="selectedMode" value="localhost" />
+                    <span>{{ t('admin.security.modeLocalhost') }}</span>
+                  </label>
+                  <label style="margin-right:20px">
+                    <input type="radio" v-model="selectedMode" value="whitelist" />
+                    <span>{{ t('admin.security.modeWhitelist') }}</span>
+                  </label>
+                  <label>
+                    <input type="radio" v-model="selectedMode" value="none" />
+                    <span>{{ t('admin.security.modeNone') }}</span>
+                  </label>
+                </p>
+                <p class="grey-text" style="margin-top:4px">
+                  <span v-if="selectedMode === 'all'">{{ t('admin.security.modeAllHint') }}</span>
+                  <span v-else-if="selectedMode === 'localhost'">{{ t('admin.security.modeLocalhostHint') }}</span>
+                  <span v-else-if="selectedMode === 'whitelist'">{{ t('admin.security.modeWhitelistHint') }}</span>
+                  <span v-else-if="selectedMode === 'none'">{{ t('admin.security.modeNoneHint') }}</span>
+                </p>
+              </div>
+              <div v-if="selectedMode === 'whitelist'" style="margin-top:16px">
+                <p><b>{{ t('admin.security.whitelistTitle') }}</b></p>
+                <p class="grey-text">{{ t('admin.security.whitelistHint') }}</p>
+                <table class="striped" style="max-width:480px">
+                  <tbody>
+                    <tr v-for="(entry, idx) in whitelistDraft" :key="idx">
+                      <td>{{ entry }}</td>
+                      <td style="text-align:right">[<a v-on:click="removeEntry(idx)">{{ t('admin.security.remove') }}</a>]</td>
+                    </tr>
+                    <tr v-if="whitelistDraft.length === 0">
+                      <td colspan="2" class="grey-text">{{ t('admin.security.whitelistEmpty') }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div class="input-field" style="max-width:480px; margin-top:8px">
+                  <input id="security-new-entry" type="text" v-model.trim="newEntry"
+                         @keyup.enter="addEntry()" :placeholder="t('admin.security.entryPlaceholder')" />
+                  <a v-on:click="addEntry()" class="waves-effect waves-light btn-small">{{ t('admin.security.add') }}</a>
+                </div>
+              </div>
+              <div v-if="selectedMode === 'localhost' || selectedMode === 'whitelist'" class="card-panel orange lighten-4" style="margin-top:16px">
+                <p><b>{{ t('admin.security.proxyNoticeTitle') }}</b> {{ t('admin.security.proxyNotice') }}</p>
+              </div>
+            </div>
+            <div class="card-action flow-root">
+              <a v-on:click="applyMode()" :disabled="applyPending"
+                 class="waves-effect waves-light btn right">
+                {{ t('admin.security.apply') }}
+              </a>
+            </div>
+          </div>
+        </div>
       </div>
     </div>`,
-    methods: {
-      disableAdmin: function() {
+  methods: {
+    addEntry: function() {
+      const v = (this.newEntry || '').trim();
+      if (!v) { return; }
+      if (!this.whitelistDraft.includes(v)) {
+        this.whitelistDraft.push(v);
+      }
+      this.newEntry = '';
+    },
+    removeEntry: function(idx) {
+      this.whitelistDraft.splice(idx, 1);
+    },
+    doApply: async function() {
+      const mode = this.selectedMode;
+      try {
+        this.applyPending = true;
+        const data = { mode };
+        if (mode === 'whitelist') { data.whitelist = this.whitelistDraft.slice(); }
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/config/admin-access`,
+          data
+        });
+        // Reflect the saved state back into the shared config. In whitelist
+        // mode we just sent the list; otherwise keep whatever was saved.
+        const next = {
+          mode,
+          whitelist: mode === 'whitelist'
+            ? this.whitelistDraft.slice()
+            : ((this.params.adminAccess && this.params.adminAccess.whitelist) || [])
+        };
+        Vue.set(ADMINDATA.serverParams, 'adminAccess', next);
+        iziToast.success({
+          title: t('admin.security.applied'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } catch (err) {
+        iziToast.error({
+          title: err.response?.data?.error || err.message || t('admin.security.applyFailed'),
+          position: 'topCenter',
+          timeout: 4500
+        });
+      } finally {
+        this.applyPending = false;
+      }
+    },
+    applyMode: function() {
+      // 'none' disables the entire admin panel — confirm first, mirroring the
+      // old Lock Admin flow.
+      if (this.selectedMode === 'none') {
         iziToast.question({
           timeout: 20000,
           close: false,
           overlayClose: true,
           overlay: true,
           displayMode: 'once',
-          id: 'question',
+          id: 'security-question',
           zindex: 99999,
           layout: 2,
           maxWidth: 600,
-          title: `<b>${t('admin.lock.disableTitle')}</b>`,
+          title: `<b>${t('admin.security.confirmNoneTitle')}</b>`,
+          message: t('admin.security.confirmNoneMessage'),
           position: 'center',
           buttons: [
-            [`<button><b>${t('admin.lock.disable')}</b></button>`, (instance, toast) => {
+            [`<button><b>${t('admin.security.confirmNoneButton')}</b></button>`, (instance, toast) => {
               instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
-              API.axios({
-                method: 'POST',
-                url: `${API.url()}/api/v1/admin/lock-api`,
-                data: { lock: true }
-              }).then(() => {
-                window.location.reload();
-              }).catch(() => {
-                iziToast.error({
-                  title: t('admin.lock.disableFailed'),
-                  position: 'topCenter',
-                  timeout: 3500
-                });
-              });
+              this.doApply();
             }, true],
             [`<button>${t('admin.folders.goBack')}</button>`, (instance, toast) => {
               instance.hide({ transitionOut: 'fadeOut' }, toast, 'button');
             }],
           ]
         });
+        return;
       }
+      this.doApply();
     }
+  }
 });
 
 const dlnaView = Vue.component('dlna-view', {
@@ -3003,8 +3584,11 @@ const dlnaView = Vue.component('dlna-view', {
       selectedMode: 'disabled',
       selectedPort: 3011,
       selectedBrowse: 'dirs',
+      selectedName: '',
+      selectedUuid: '',
       applyPending: false,
       browsePending: false,
+      identityPending: false,
     };
   },
   watch: {
@@ -3014,6 +3598,8 @@ const dlnaView = Vue.component('dlna-view', {
         this.selectedMode   = this.params.mode   || 'disabled';
         this.selectedPort   = this.params.port   || 3011;
         this.selectedBrowse = this.params.browse || 'dirs';
+        this.selectedName   = this.params.name   || '';
+        this.selectedUuid   = this.params.uuid   || '';
       }
     }
   },
@@ -3076,6 +3662,31 @@ const dlnaView = Vue.component('dlna-view', {
         <div class="col s12">
           <div class="card">
             <div class="card-content">
+              <span class="card-title">Identity</span>
+              <p>The name renderers display for this server, and its DLNA UUID (the unique id devices use to recognize it). Changing these while DLNA is active re-announces the server on the network so clients pick up the new values; no restart needed.</p>
+              <div class="input-field" style="max-width:420px;margin-top:16px">
+                <input id="dlna-name" type="text" maxlength="256" v-model.trim="selectedName" />
+                <label for="dlna-name" class="active">Server Name</label>
+              </div>
+              <div class="input-field" style="max-width:420px">
+                <input id="dlna-uuid" type="text" v-model.trim="selectedUuid" />
+                <label for="dlna-uuid" class="active">UUID</label>
+                <span class="helper-text">[<a v-on:click="generateUuid()">generate a new UUID</a>] Changing the UUID makes existing clients re-discover the server as a new device.</span>
+              </div>
+            </div>
+            <div class="card-action flow-root">
+              <a v-on:click="applyIdentity()" :disabled="identityPending"
+                 class="waves-effect waves-light btn right">
+                Apply
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="row">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
               <span class="card-title">Default View</span>
               <p>DLNA clients always see all five views (Folders, Artists, Albums, Genres, All Tracks) as sibling containers. This setting controls which one is listed first &mdash; useful for clients that auto-drill into the first container.</p>
               <div style="margin-top:16px">
@@ -3117,6 +3728,64 @@ const dlnaView = Vue.component('dlna-view', {
       </div>
     </div>`,
   methods: {
+    generateUuid: function() {
+      // Prefer the platform RNG; crypto.randomUUID needs a secure context
+      // (https or localhost), so fall back to a v4 builder over plain http.
+      let u;
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        u = window.crypto.randomUUID();
+      } else {
+        u = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+          const r = (window.crypto && window.crypto.getRandomValues
+            ? window.crypto.getRandomValues(new Uint8Array(1))[0] & 15
+            : Math.floor(Math.random() * 16));
+          const v = c === 'x' ? r : (r & 0x3) | 0x8;
+          return v.toString(16);
+        });
+      }
+      this.selectedUuid = u;
+    },
+    applyIdentity: async function() {
+      const name = (this.selectedName || '').trim();
+      const uuid = (this.selectedUuid || '').trim();
+      if (!name) {
+        iziToast.error({ title: 'Server name cannot be empty', position: 'topCenter', timeout: 3500 });
+        return;
+      }
+      const nameChanged = name !== (this.params.name || '');
+      const uuidChanged = uuid !== (this.params.uuid || '');
+      if (!nameChanged && !uuidChanged) {
+        iziToast.info({ title: 'No changes to apply', position: 'topCenter', timeout: 3500 });
+        return;
+      }
+      try {
+        this.identityPending = true;
+        if (nameChanged) {
+          await API.axios({
+            method: 'POST',
+            url: `${API.url()}/api/v1/admin/dlna/name`,
+            data: { name }
+          });
+        }
+        if (uuidChanged) {
+          await API.axios({
+            method: 'POST',
+            url: `${API.url()}/api/v1/admin/dlna/uuid`,
+            data: { uuid }
+          });
+        }
+        await ADMINDATA.getDlnaParams();
+        iziToast.success({ title: 'DLNA identity updated', position: 'topCenter', timeout: 3500 });
+      } catch(err) {
+        const msg = err && err.response && err.response.data && err.response.data.error
+          ? err.response.data.error : 'Failed to update DLNA identity';
+        iziToast.error({ title: msg, position: 'topCenter', timeout: 4000 });
+        // Re-sync the inputs so a rejected value doesn't linger in the form.
+        await ADMINDATA.getDlnaParams();
+      } finally {
+        this.identityPending = false;
+      }
+    },
     applyBrowse: async function() {
       try {
         this.browsePending = true;
@@ -3779,6 +4448,1653 @@ const subsonicView = Vue.component('subsonic-view', {
   }
 });
 
+// ── Torrent (V37 — UX-layer settings) ──────────────────────────────────────
+// First-cut admin surface for the optional torrent-client feature. Two
+// dropdowns:
+//   client      — 'disabled' (default) or 'transmission'. More backends
+//                 will land later (qBittorrent, Deluge, rTorrent); the
+//                 dropdown is a single-select on purpose because only one
+//                 client is active at a time in v1.
+//   enabledFor  — 'all' (every authenticated user) or 'whitelist' (only
+//                 users with users.allow_torrent = 1). When 'whitelist'
+//                 is selected, an inline user-grant table appears so the
+//                 admin can flip the per-user flag without leaving the
+//                 page.
+const torrentView = Vue.component('torrent-view', {
+  data() {
+    return {
+      paramsTS:   ADMINDATA.torrentParamsUpdated,
+      params:     ADMINDATA.torrentParams,
+      statusTS:   ADMINDATA.torrentStatusUpdated,
+      status:     ADMINDATA.torrentStatus,
+      listTS:     ADMINDATA.torrentListUpdated,
+      list:       ADMINDATA.torrentList,
+      listRefreshPending: false,
+      // Client-side substring filter for the torrents table. Matches
+      // against name + infoHash so operators can paste a hash and find
+      // the row instantly. Cleared when the user clicks the ✕ button.
+      listFilter:      '',
+      // Soft render cap. Daemons can return thousands of torrents; we
+      // render LIST_PAGE_SIZE at a time and let the operator click
+      // "Show more" / "Show all" to expand. Reset to LIST_PAGE_SIZE on
+      // every Refresh so the table doesn't accidentally render 10k rows
+      // after the operator left the page open overnight.
+      listVisibleCap:  100,
+      // Per-info-hash pending flag while DELETE /admin/torrent/:hash is
+      // in flight. Stops the operator from double-clicking the same
+      // row, which would surface a confusing 404 after the first call
+      // succeeded.
+      removePending:   {},
+      accessTS:   ADMINDATA.torrentVpathAccessUpdated,
+      access:     ADMINDATA.torrentVpathAccess,
+      accessRefreshPending: false,
+      // Per-vpath edit-mode tracking. Keyed by vpath name. When the
+      // operator clicks "Override" on a confirmed row, we flip the
+      // input from disabled→editable here and accept a new daemon
+      // path entry. Cleared on Save / Cancel.
+      accessEditPath: {},        // { 'music': '/downloads/music', … } — input value
+      accessEditPending: {},     // per-row pending flag during /manual POST
+      accessEditMode:    {},     // 'view' | 'edit' — defaults to 'view' for
+                                  // confirmed rows, 'edit' for unconfirmed
+      // ── Path Templates (V41) ──────────────────────────────────────
+      // Per-vpath template editor state. Mirrors the access-edit
+      // pattern: a draft string per vpath plus a per-row pending
+      // flag during the PUT.
+      tmplTS:       ADMINDATA.torrentPathTemplatesUpdated,
+      tmpl:         ADMINDATA.torrentPathTemplates,
+      tmplDraft:    {},          // { 'music': '{{ARTIST}}/{{ALBUM}}', ... }
+      tmplPending:  {},
+      tmplError:    {},          // per-row inline error from the API
+      // ── Import for Seeding ───────────────────────────────────────
+      // Drag-drop + bounded-concurrency uploader state. seedResults
+      // is an array of per-file rows the UI renders; each row gets
+      // populated with the route's outcome as the corresponding
+      // request resolves. Rows are added eagerly (pending=true) so
+      // the operator sees the upload set immediately, even before
+      // any responses come back.
+      seedIsDragOver:    false,
+      seedSelectedVpaths: [],     // empty array = check ALL libraries (route default)
+      seedResults:       [],
+      seedRunningCount:  0,
+      seedConcurrency:   6,       // parallel requests cap
+      users:      ADMINDATA.users,
+      usersTS:    ADMINDATA.usersUpdated,
+      selectedClient:     'disabled',
+      selectedEnabledFor: 'all',
+      clientPending:     false,
+      enabledForPending: false,
+      // Per-row pending state so a slow request on one user doesn't
+      // disable every checkbox.
+      grantPending: {},
+      // Transmission login form. Pre-filled with sane defaults; bound
+      // to the inputs in the v-if='!params.transmission.configured'
+      // block.
+      tForm: {
+        host:     '',
+        port:     9091,
+        username: '',
+        password: '',
+        rpcPath:  '/transmission/rpc',
+        useHttps: false,
+      },
+      tFormError:        null,
+      tConnectPending:   false,
+      tTestPending:      false,
+      tDisconnectPending: false,
+      // qBittorrent login form. No `rpcPath` — the WebAPI is mounted
+      // at a fixed /api/v2/* under the host, not user-configurable.
+      qForm: {
+        host:     '',
+        port:     8080,
+        username: '',
+        password: '',
+        useHttps: false,
+      },
+      qFormError:        null,
+      qConnectPending:   false,
+      qTestPending:      false,
+      qDisconnectPending: false,
+      // Deluge login form. Smaller than the others — no username and
+      // no rpcPath. Default port 8112 (Deluge WebUI).
+      dForm: {
+        host:     '',
+        port:     8112,
+        password: '',
+        useHttps: false,
+      },
+      dFormError:        null,
+      dConnectPending:   false,
+      dTestPending:      false,
+      dDisconnectPending: false,
+    };
+  },
+  watch: {
+    'paramsTS.ts': {
+      immediate: true,
+      handler: function() {
+        this.selectedClient     = this.params.client     || 'disabled';
+        this.selectedEnabledFor = this.params.enabledFor || 'all';
+      }
+    }
+  },
+  computed: {
+    // Substring match on name + infoHash. Case-insensitive. Empty
+    // filter short-circuits to the full list so the common case (no
+    // filter, small N) doesn't allocate a new array on every render.
+    filteredTorrents: function() {
+      const q = (this.listFilter || '').trim().toLowerCase();
+      if (!q) { return this.list.torrents; }
+      return this.list.torrents.filter(t =>
+        (t.name || '').toLowerCase().includes(q) ||
+        (t.infoHash || '').toLowerCase().includes(q)
+      );
+    },
+    // What actually gets rendered into the DOM. Cap is reset to its
+    // default on every Refresh; "Show more" bumps it by one page and
+    // "Show all" sets it to Infinity.
+    visibleTorrents: function() {
+      const filtered = this.filteredTorrents;
+      if (this.listVisibleCap >= filtered.length) { return filtered; }
+      return filtered.slice(0, this.listVisibleCap);
+    }
+  },
+  template: `
+    <div v-if="paramsTS.ts === 0" class="row">
+      <svg class="spinner" width="65px" height="65px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
+    </div>
+    <div v-else class="container">
+      <div class="row" style="margin-top:24px">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">
+                Torrent Client
+                <span style="display:inline-block; margin-left:8px; padding:2px 8px; font-size:0.55em; font-weight:bold; letter-spacing:0.5px; background:#ff9800; color:#fff; border-radius:3px; vertical-align:middle;">BETA</span>
+              </span>
+              <p>Hand off magnet links and <code>.torrent</code> files to a torrent client running on this host (or reachable on the LAN). Completed downloads are picked up by the next library scan.</p>
+              <p style="font-size:0.85em; color:#888; margin-top:-6px; margin-bottom:14px;">
+                <b style="color:#e67e22;">Beta:</b> The torrent feature is new — please <a href="https://github.com/IrosTheBeggar/mStream/issues" target="_blank" rel="noopener">report any issues</a> you run into.
+              </p>
+              <p style="font-size:0.85em; margin-top:-6px; margin-bottom:14px; padding:8px 12px; background:rgba(33,150,243,0.10); border-left:3px solid #2196f3; border-radius:3px;">
+                <b>Mobile:</b> Users can add torrents from their phone at <a href="/torrent" target="_blank" rel="noopener" style="color:#90caf9;"><code>/torrent</code></a> — a standalone, mobile-friendly add-torrent page. The torrent feature isn't exposed by the apps; this gives users a way to add them on the go.
+              </p>
+              <div style="margin-top:16px">
+                <p><b>Current:</b> {{params.client || 'disabled'}}</p>
+              </div>
+              <div style="margin-top:16px;max-width:320px">
+                <select class="browser-default" v-model="selectedClient">
+                  <option value="disabled">Disabled</option>
+                  <option value="transmission">Transmission</option>
+                  <option value="qbittorrent">qBittorrent</option>
+                  <option value="deluge">Deluge</option>
+                </select>
+              </div>
+            </div>
+            <div class="card-action flow-root">
+              <a v-on:click="applyClient()" :disabled="clientPending"
+                 class="waves-effect waves-light btn right">
+                Apply
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Transmission backend: only when client is Transmission. Two
+           mutually-exclusive states based on whether credentials are
+           saved. Login form when not configured; status card when
+           configured. -->
+      <div class="row" v-if="params.client === 'transmission' && !params.transmission.configured">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Connect to Transmission</span>
+              <p>Provide RPC credentials. <b>Test</b> probes the daemon without saving; <b>Connect</b> persists the credentials on a successful probe.</p>
+              <div class="row" style="margin-top:16px">
+                <div class="input-field col s12 m8">
+                  <input id="t-host" type="text" v-model.trim="tForm.host" placeholder="127.0.0.1" />
+                  <label for="t-host" class="active">Host</label>
+                </div>
+                <div class="input-field col s12 m4">
+                  <input id="t-port" type="number" v-model.number="tForm.port" min="1" max="65535" />
+                  <label for="t-port" class="active">Port</label>
+                </div>
+              </div>
+              <div class="row">
+                <div class="input-field col s12 m6">
+                  <input id="t-username" type="text" v-model.trim="tForm.username" />
+                  <label for="t-username" class="active">Username</label>
+                </div>
+                <div class="input-field col s12 m6">
+                  <input id="t-password" type="password" v-model="tForm.password" autocomplete="new-password" />
+                  <label for="t-password" class="active">Password</label>
+                </div>
+              </div>
+              <div class="row">
+                <div class="input-field col s12 m8">
+                  <input id="t-rpcpath" type="text" v-model.trim="tForm.rpcPath" />
+                  <label for="t-rpcpath" class="active">RPC Path</label>
+                </div>
+                <div class="col s12 m4" style="padding-top:1.5em">
+                  <label>
+                    <input type="checkbox" class="filled-in" v-model="tForm.useHttps" />
+                    <span>Use HTTPS</span>
+                  </label>
+                </div>
+              </div>
+              <div v-if="tFormError" class="card-panel red lighten-4" style="margin-top:8px">
+                <b>Connection failed:</b> {{tFormError}}
+              </div>
+            </div>
+            <div class="card-action flow-root">
+              <a v-on:click="testTransmission()" :disabled="tTestPending || tConnectPending"
+                 class="waves-effect waves-light btn-flat right" style="margin-right:8px">
+                {{ tTestPending ? 'Testing…' : 'Test' }}
+              </a>
+              <a v-on:click="connectTransmission()" :disabled="tConnectPending || tTestPending"
+                 class="waves-effect waves-light btn right">
+                {{ tConnectPending ? 'Connecting…' : 'Connect' }}
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- qBittorrent: login form / status card. Same structure as
+           the Transmission pair but no rpcPath field — qBittorrent's
+           WebAPI mount point is fixed. -->
+      <div class="row" v-if="params.client === 'qbittorrent' && !params.qbittorrent.configured">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Connect to qBittorrent</span>
+              <p>Provide WebUI credentials. <b>Test</b> probes the daemon without saving; <b>Connect</b> persists the credentials on a successful probe.</p>
+              <div class="card-panel yellow lighten-4" style="padding:8px 12px;margin:8px 0;font-size:0.85em">
+                <b>Note:</b> mStream does not send a <code>Referer</code> header on its WebAPI calls. If you've enabled qBittorrent's <i>"Enable Cross-Site Request Forgery (CSRF) protection"</i> option (off by default), connections will fail. Disable CSRF in qBittorrent's <i>WebUI</i> settings or restrict access via <i>"Bypass authentication for clients on localhost"</i> + a host allowlist.
+              </div>
+              <div class="row" style="margin-top:16px">
+                <div class="input-field col s12 m8">
+                  <input id="q-host" type="text" v-model.trim="qForm.host" placeholder="127.0.0.1" />
+                  <label for="q-host" class="active">Host</label>
+                </div>
+                <div class="input-field col s12 m4">
+                  <input id="q-port" type="number" v-model.number="qForm.port" min="1" max="65535" />
+                  <label for="q-port" class="active">Port</label>
+                </div>
+              </div>
+              <div class="row">
+                <div class="input-field col s12 m6">
+                  <input id="q-username" type="text" v-model.trim="qForm.username" />
+                  <label for="q-username" class="active">Username</label>
+                </div>
+                <div class="input-field col s12 m6">
+                  <input id="q-password" type="password" v-model="qForm.password" autocomplete="new-password" />
+                  <label for="q-password" class="active">Password</label>
+                </div>
+              </div>
+              <div class="row">
+                <div class="col s12 m4" style="padding-top:1.5em">
+                  <label>
+                    <input type="checkbox" class="filled-in" v-model="qForm.useHttps" />
+                    <span>Use HTTPS</span>
+                  </label>
+                </div>
+              </div>
+              <div v-if="qFormError" class="card-panel red lighten-4" style="margin-top:8px">
+                <b>Connection failed:</b> {{qFormError}}
+              </div>
+            </div>
+            <div class="card-action flow-root">
+              <a v-on:click="testQbittorrent()" :disabled="qTestPending || qConnectPending"
+                 class="waves-effect waves-light btn-flat right" style="margin-right:8px">
+                {{ qTestPending ? 'Testing…' : 'Test' }}
+              </a>
+              <a v-on:click="connectQbittorrent()" :disabled="qConnectPending || qTestPending"
+                 class="waves-effect waves-light btn right">
+                {{ qConnectPending ? 'Connecting…' : 'Connect' }}
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row" v-if="params.client === 'qbittorrent' && params.qbittorrent.configured">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">qBittorrent Connection</span>
+              <div v-if="statusTS.ts === 0" style="margin-top:8px">
+                <svg class="spinner" width="36px" height="36px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
+              </div>
+              <div v-else>
+                <p style="margin-top:8px">
+                  <span v-if="status.connected" class="card-panel green lighten-4" style="display:inline-block;padding:6px 14px;margin:0">
+                    <b>● Connected</b><span v-if="status.version"> &mdash; qBittorrent {{status.version}}</span>
+                  </span>
+                  <span v-else class="card-panel red lighten-4" style="display:inline-block;padding:6px 14px;margin:0">
+                    <b>● Disconnected</b><span v-if="status.reason"> &mdash; {{status.reason}}</span>
+                  </span>
+                </p>
+                <table style="margin-top:16px">
+                  <tbody>
+                    <tr><td style="width:140px"><b>Host</b></td><td>{{params.qbittorrent.host}}</td></tr>
+                    <tr><td><b>Port</b></td><td>{{params.qbittorrent.port}}</td></tr>
+                    <tr><td><b>Username</b></td><td>{{params.qbittorrent.username || '(none)'}}</td></tr>
+                    <tr><td><b>HTTPS</b></td><td>{{params.qbittorrent.useHttps ? 'yes' : 'no'}}</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div class="card-action flow-root">
+              <a v-on:click="disconnectQbittorrent()" :disabled="qDisconnectPending"
+                 class="waves-effect waves-light btn-flat red-text right" style="margin-right:8px">
+                {{ qDisconnectPending ? 'Disconnecting…' : 'Disconnect' }}
+              </a>
+              <a v-on:click="refreshStatus()" :disabled="qTestPending"
+                 class="waves-effect waves-light btn right">
+                {{ qTestPending ? 'Testing…' : 'Test' }}
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Deluge: login form / status card. Password-only auth. -->
+      <div class="row" v-if="params.client === 'deluge' && !params.deluge.configured">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Connect to Deluge</span>
+              <p>Provide WebUI credentials. <b>Test</b> probes the daemon without saving; <b>Connect</b> persists the credentials on a successful probe.</p>
+              <div class="row" style="margin-top:16px">
+                <div class="input-field col s12 m8">
+                  <input id="d-host" type="text" v-model.trim="dForm.host" placeholder="127.0.0.1" />
+                  <label for="d-host" class="active">Host</label>
+                </div>
+                <div class="input-field col s12 m4">
+                  <input id="d-port" type="number" v-model.number="dForm.port" min="1" max="65535" />
+                  <label for="d-port" class="active">Port</label>
+                </div>
+              </div>
+              <div class="row">
+                <div class="input-field col s12 m8">
+                  <input id="d-password" type="password" v-model="dForm.password" autocomplete="new-password" />
+                  <label for="d-password" class="active">WebUI password</label>
+                </div>
+                <div class="col s12 m4" style="padding-top:1.5em">
+                  <label>
+                    <input type="checkbox" class="filled-in" v-model="dForm.useHttps" />
+                    <span>Use HTTPS</span>
+                  </label>
+                </div>
+              </div>
+              <div v-if="dFormError" class="card-panel red lighten-4" style="margin-top:8px">
+                <b>Connection failed:</b> {{dFormError}}
+              </div>
+            </div>
+            <div class="card-action flow-root">
+              <a v-on:click="testDeluge()" :disabled="dTestPending || dConnectPending"
+                 class="waves-effect waves-light btn-flat right" style="margin-right:8px">
+                {{ dTestPending ? 'Testing…' : 'Test' }}
+              </a>
+              <a v-on:click="connectDeluge()" :disabled="dConnectPending || dTestPending"
+                 class="waves-effect waves-light btn right">
+                {{ dConnectPending ? 'Connecting…' : 'Connect' }}
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row" v-if="params.client === 'deluge' && params.deluge.configured">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Deluge Connection</span>
+              <div v-if="statusTS.ts === 0" style="margin-top:8px">
+                <svg class="spinner" width="36px" height="36px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
+              </div>
+              <div v-else>
+                <p style="margin-top:8px">
+                  <span v-if="status.connected" class="card-panel green lighten-4" style="display:inline-block;padding:6px 14px;margin:0">
+                    <b>● Connected</b><span v-if="status.version"> &mdash; Deluge {{status.version}}</span>
+                  </span>
+                  <span v-else class="card-panel red lighten-4" style="display:inline-block;padding:6px 14px;margin:0">
+                    <b>● Disconnected</b><span v-if="status.reason"> &mdash; {{status.reason}}</span>
+                  </span>
+                </p>
+                <table style="margin-top:16px">
+                  <tbody>
+                    <tr><td style="width:140px"><b>Host</b></td><td>{{params.deluge.host}}</td></tr>
+                    <tr><td><b>Port</b></td><td>{{params.deluge.port}}</td></tr>
+                    <tr><td><b>HTTPS</b></td><td>{{params.deluge.useHttps ? 'yes' : 'no'}}</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div class="card-action flow-root">
+              <a v-on:click="disconnectDeluge()" :disabled="dDisconnectPending"
+                 class="waves-effect waves-light btn-flat red-text right" style="margin-right:8px">
+                {{ dDisconnectPending ? 'Disconnecting…' : 'Disconnect' }}
+              </a>
+              <a v-on:click="refreshStatus()" :disabled="dTestPending"
+                 class="waves-effect waves-light btn right">
+                {{ dTestPending ? 'Testing…' : 'Test' }}
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Per-vpath access mapping. The table tells the operator which
+           libraries are reachable from the active torrent client and
+           the daemon's view of each (the absolute path it would use
+           internally — usually different from mStream's path when the
+           daemon is in Docker). Confirmed rows show the resolved path
+           in a disabled input. Unconfirmed rows expose an editable
+           input where the operator can manually type the daemon-side
+           path; submitting runs the same probe primitive as
+           auto-detect. -->
+      <div class="row" v-if="(params.client === 'transmission' && params.transmission.configured) || (params.client === 'qbittorrent' && params.qbittorrent.configured) || (params.client === 'deluge' && params.deluge.configured)">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">
+                Library Access
+                <a v-on:click="refreshAccess()" :disabled="accessRefreshPending"
+                   class="waves-effect waves-light btn-flat right" style="margin-top:-6px">
+                  {{ accessRefreshPending ? 'Auto-detecting…' : 'Auto-detect' }}
+                </a>
+              </span>
+              <p style="opacity:0.85;margin-bottom:8px">
+                The paths below are <b>as seen by the torrent client</b>, not by mStream.
+                When the daemon runs in Docker (or any container), its absolute paths
+                usually differ from mStream's. Verified rows are confirmed via the daemon
+                directly; unverified rows need a manual mapping before torrents can be added.
+              </p>
+              <div v-if="accessTS.ts === 0" style="margin-top:8px">
+                <svg class="spinner" width="36px" height="36px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
+              </div>
+              <div v-else-if="Object.keys(access.vpaths).length === 0" style="margin-top:8px;opacity:0.7">
+                <i>No libraries defined. Add one on the Directories page first.</i>
+              </div>
+              <table v-else style="margin-top:8px">
+                <thead>
+                  <tr>
+                    <th style="width:140px">Library</th>
+                    <th style="width:140px">Status</th>
+                    <th>Path (as seen by {{params.client}})</th>
+                    <th style="width:1px"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(v, name) in access.vpaths" :key="name">
+                    <td><b>{{name}}</b></td>
+                    <td>
+                      <span class="status-chip" :class="accessChipClass(v)">
+                        {{accessChipLabel(v)}}
+                      </span>
+                      <div v-if="v.lastError" style="font-size:0.75em;color:#c62828;margin-top:4px">{{v.lastError}}</div>
+                    </td>
+                    <td>
+                      <input type="text"
+                             :value="accessInputValue(name, v)"
+                             @input="onAccessInput(name, $event.target.value)"
+                             :disabled="!accessIsEditing(name, v)"
+                             :placeholder="accessPlaceholder(v)"
+                             style="margin:0" />
+                      <div v-if="!accessIsEditing(name, v) && v.daemonPath && v.confidence !== 'pending'" style="font-size:0.75em;opacity:0.65;margin-top:2px">
+                        verified via {{v.method || 'auto-detect'}}<span v-if="v.source === 'manual'"> · manually set</span>
+                      </div>
+                    </td>
+                    <td>
+                      <a v-if="accessIsEditing(name, v)"
+                         v-on:click="saveManualMapping(name)"
+                         :disabled="accessEditPending[name]"
+                         class="waves-effect waves-light btn-small green">
+                        {{ accessEditPending[name] ? '…' : 'Save' }}
+                      </a>
+                      <a v-else
+                         v-on:click="enterEditMode(name, v)"
+                         class="waves-effect waves-light btn-small btn-flat">
+                        Override
+                      </a>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Path Templates (V41). Per-vpath template strings the player
+           UI uses to construct the destination path from auto-detected
+           metadata. Hidden when there are no libraries to template
+           against. Server validates the template (parse + sample
+           resolve + path safety) before persisting; errors render
+           inline below the row that failed. -->
+      <div class="row" v-if="(params.client === 'transmission' && params.transmission.configured) || (params.client === 'qbittorrent' && params.qbittorrent.configured) || (params.client === 'deluge' && params.deluge.configured)">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Path Templates</span>
+              <p>
+                Templates the player uses to construct the destination path when a torrent is added.
+                Variables resolve from the torrent's metadata; empty variables drop their segment.
+              </p>
+              <p style="font-size:0.85em;opacity:0.75">
+                <b>Supported:</b>
+                <code v-for="v in tmpl.supportedVars" :key="v" style="margin-right:6px">{{tmplVarDisplay(v)}}</code>
+              </p>
+              <div v-if="tmplTS.ts === 0" style="margin-top:8px">
+                <svg class="spinner" width="36px" height="36px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
+              </div>
+              <div v-else-if="Object.keys(tmpl.vpaths).length === 0" style="margin-top:8px;opacity:0.7">
+                <i>No libraries defined.</i>
+              </div>
+              <table v-else style="margin-top:8px">
+                <thead>
+                  <tr>
+                    <th style="width:140px">Library</th>
+                    <th>Template</th>
+                    <th>Preview</th>
+                    <th style="width:1px"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(t, name) in tmpl.vpaths" :key="name">
+                    <td><b>{{name}}</b></td>
+                    <td>
+                      <input type="text"
+                             :value="tmplInputValue(name, t)"
+                             @input="onTmplInput(name, $event.target.value)"
+                             placeholder="(empty — uses manual freeform entry)"
+                             style="margin:0" />
+                      <div v-if="tmplError[name]" style="font-size:0.78em;color:#c62828;margin-top:4px">
+                        {{tmplError[name]}}
+                      </div>
+                      <a v-if="!tmplInputValue(name, t)" v-on:click="useSuggestedTemplate(name)"
+                         style="font-size:0.78em;cursor:pointer;display:inline-block;margin-top:4px">
+                        Use suggested: <code>{{tmpl.suggestedTemplate}}</code>
+                      </a>
+                    </td>
+                    <td>
+                      <code style="font-size:0.8em;opacity:0.75;word-break:break-all">{{tmplPreview(name, t)}}</code>
+                    </td>
+                    <td>
+                      <a v-on:click="saveTmpl(name)" :disabled="tmplPending[name]"
+                         class="waves-effect waves-light btn-small green">
+                        {{ tmplPending[name] ? '…' : 'Save' }}
+                      </a>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Import for Seeding. Drop N .torrent files; for each we
+           check whether the contents already live under one of the
+           libraries and, on a match, hand the torrent to the daemon
+           paused=false so it starts seeding. UI fires uploads in
+           parallel (bounded by seedConcurrency) and renders one row
+           per file as responses land. -->
+      <div class="row" v-if="(params.client === 'transmission' && params.transmission.configured) || (params.client === 'qbittorrent' && params.qbittorrent.configured) || (params.client === 'deluge' && params.deluge.configured)">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Import for Seeding</span>
+              <p>
+                Upload <code>.torrent</code> files for content already on disk. mStream checks each torrent's files against your libraries and, when every file matches, registers the torrent with the daemon so it starts seeding without re-downloading.
+              </p>
+              <div class="seed-drop-zone"
+                   :class="{ 'is-dragover': seedIsDragOver, 'is-busy': seedRunningCount > 0 }"
+                   v-on:dragover.prevent="seedIsDragOver = true"
+                   v-on:dragleave.prevent="seedIsDragOver = false"
+                   v-on:drop.prevent="onSeedDrop">
+                <p style="margin:0">
+                  <b>Drop .torrent files here</b>, or
+                  <a v-on:click="seedClickPicker" style="cursor:pointer;text-decoration:underline">browse</a>
+                </p>
+                <input ref="seedFileInput" type="file" multiple accept=".torrent"
+                       v-on:change="onSeedFilePick" style="display:none">
+                <p v-if="seedRunningCount > 0" style="margin-top:8px;font-size:0.85em;opacity:0.7">
+                  Checking {{seedRunningCount}} torrent<span v-if="seedRunningCount !== 1">s</span>…
+                </p>
+              </div>
+              <div style="margin-top:12px;font-size:0.9em">
+                <b>Search in:</b>
+                <label v-for="(v, name) in tmpl.vpaths" :key="name" style="margin-left:12px">
+                  <input type="checkbox" v-model="seedSelectedVpaths" :value="name">
+                  <span>{{name}}</span>
+                </label>
+                <span v-if="seedSelectedVpaths.length === 0" style="margin-left:12px;opacity:0.65">
+                  (none selected = every library)
+                </span>
+              </div>
+              <div v-if="seedResults.length > 0" style="margin-top:16px">
+                <table class="striped" style="margin-top:0">
+                  <thead>
+                    <tr>
+                      <th style="width:30%">File</th>
+                      <th style="width:140px">Outcome</th>
+                      <th>Details</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="(r, idx) in seedResults" :key="idx">
+                      <td :title="r.filename">
+                        <code style="font-size:0.85em">{{r.filename}}</code>
+                      </td>
+                      <td>
+                        <span v-if="r.pending" class="status-chip" :class="'status-pending'">⟳ Checking…</span>
+                        <span v-else class="status-chip" :class="seedChipClass(r.outcome)">{{seedChipLabel(r.outcome)}}</span>
+                      </td>
+                      <td style="font-size:0.85em;opacity:0.85">
+                        <span v-if="r.outcome === 'seeded'">
+                          ✓ {{r.vpath}} → <code>{{r.addedAt}}</code>
+                        </span>
+                        <span v-else-if="r.outcome === 'partial_match'">
+                          {{r.matched}}/{{r.total}} files matched in <b>{{r.vpath}}</b>; missing:
+                          <span v-for="(m, i) in r.missing.slice(0, 3)" :key="i" style="font-family:monospace">
+                            {{m}}<span v-if="i < 2 && i < r.missing.length - 1">, </span>
+                          </span>
+                          <span v-if="r.missing.length > 3">…+{{r.missing.length - 3}}</span>
+                        </span>
+                        <span v-else-if="r.outcome === 'no_match'">
+                          Not found in {{r.checkedVpaths.join(', ')}}
+                        </span>
+                        <span v-else-if="r.outcome === 'already_in_daemon'">
+                          Daemon already has this torrent — no action taken
+                        </span>
+                        <span v-else-if="r.outcome === 'invalid_torrent'" style="color:#c62828">
+                          {{r.error}}
+                        </span>
+                        <span v-else-if="r.outcome === 'daemon_error'" style="color:#c62828">
+                          {{r.error || 'Daemon refused the add'}}
+                        </span>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div style="margin-top:8px">
+                  <a v-on:click="seedClearResults" class="waves-effect waves-light btn-flat btn-small">
+                    Clear results
+                  </a>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- All torrents the daemon knows about. Rendered as soon as
+           credentials are saved; if the daemon is unreachable the card
+           still shows, with the error inline rather than disappearing
+           — invisible failure is worse than a visible one. -->
+      <div class="row" v-if="(params.client === 'transmission' && params.transmission.configured) || (params.client === 'qbittorrent' && params.qbittorrent.configured) || (params.client === 'deluge' && params.deluge.configured)">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">
+                Torrents
+                <a v-on:click="refreshList()" :disabled="listRefreshPending"
+                   class="waves-effect waves-light btn-flat right" style="margin-top:-6px">
+                  {{ listRefreshPending ? 'Loading…' : 'Refresh' }}
+                </a>
+              </span>
+              <div v-if="listTS.ts === 0" style="margin-top:8px">
+                <svg class="spinner" width="36px" height="36px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
+              </div>
+              <div v-else-if="list.error" class="card-panel red lighten-4" style="margin-top:8px">
+                <b>Couldn't fetch torrents:</b> {{list.error}}
+              </div>
+              <div v-else-if="list.torrents.length === 0" style="margin-top:8px;opacity:0.7">
+                <i>No torrents.</i>
+              </div>
+              <div v-else>
+                <div style="margin-top:8px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+                  <div style="position:relative;flex:1;min-width:200px;max-width:360px">
+                    <input type="text" v-model="listFilter" placeholder="Filter by name or info-hash…"
+                           style="margin:0;padding-right:28px;height:36px;font-size:0.9em">
+                    <a v-if="listFilter" v-on:click="listFilter = ''"
+                       style="position:absolute;right:6px;top:6px;cursor:pointer;opacity:0.6;font-size:1.2em;line-height:1"
+                       title="Clear filter">&times;</a>
+                  </div>
+                  <span style="font-size:0.85em;opacity:0.7">
+                    <span v-if="listFilter">{{filteredTorrents.length}} of {{list.torrents.length}} match</span>
+                    <span v-else>{{list.torrents.length}} torrent<span v-if="list.torrents.length !== 1">s</span></span>
+                  </span>
+                </div>
+                <div v-if="filteredTorrents.length === 0" style="margin-top:8px;opacity:0.7">
+                  <i>No torrents match the filter.</i>
+                </div>
+                <table v-if="filteredTorrents.length > 0" class="striped" style="margin-top:8px">
+                <thead>
+                  <tr>
+                    <th style="width:38%">Name</th>
+                    <th>Status</th>
+                    <th>Progress</th>
+                    <th>DL</th>
+                    <th>Size</th>
+                    <th>Source</th>
+                    <th style="width:1px"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="t in visibleTorrents" :key="t.infoHash"
+                      :class="{ 'managed-row': t.managedByMstream }">
+                    <td :title="t.name + ' &mdash; ' + t.infoHash">
+                      <span style="display:inline-block;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle">{{t.name}}</span>
+                    </td>
+                    <td>
+                      <span class="status-chip" :class="'status-' + t.status">{{t.status}}</span>
+                      <div v-if="t.errorMessage" style="font-size:0.75em;color:#c62828;margin-top:4px">{{t.errorMessage}}</div>
+                    </td>
+                    <td style="min-width:120px">
+                      <div style="font-size:0.85em">{{Math.round(t.percent * 100)}}%</div>
+                      <div style="background:#e0e0e0;border-radius:3px;height:6px;width:100px;overflow:hidden">
+                        <div :style="{ width: (t.percent * 100) + '%', background: t.status === 'seeding' ? '#43a047' : '#1e88e5', height: '100%' }"></div>
+                      </div>
+                    </td>
+                    <td>{{ t.rateDownload > 0 ? formatRate(t.rateDownload) : '—' }}</td>
+                    <td>{{formatSize(t.sizeBytes)}}</td>
+                    <td>
+                      <span v-if="t.managedByMstream"
+                            class="status-chip status-managed"
+                            :title="t.managedBy ? 'Added by ' + t.managedBy + ' via mStream' : 'Added via mStream'">
+                        ● mStream<span v-if="t.managedBy"> ({{t.managedBy}})</span>
+                      </span>
+                      <span v-else style="opacity:0.55;font-size:0.85em">external</span>
+                    </td>
+                    <td>
+                      <!-- Remove is mStream-managed only. External torrents (added
+                           directly via the daemon's own client) are intentionally
+                           untouchable from here — operator uses the daemon UI for
+                           those. Confirm dialog spells out the "files stay on disk"
+                           contract so a click isn't catastrophic. -->
+                      <a v-if="t.managedByMstream"
+                         v-on:click="removeTorrent(t)"
+                         :disabled="removePending[t.infoHash]"
+                         class="waves-effect waves-light btn-small btn-flat red-text"
+                         :title="'Remove from daemon (keeps files on disk)'">
+                        {{ removePending[t.infoHash] ? '…' : '✕ Remove' }}
+                      </a>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <div v-if="filteredTorrents.length > visibleTorrents.length"
+                   style="margin-top:8px;display:flex;align-items:center;gap:12px">
+                <span style="font-size:0.85em;opacity:0.7">
+                  Showing {{visibleTorrents.length}} of {{filteredTorrents.length}}
+                </span>
+                <a v-on:click="showMore()" class="waves-effect waves-light btn-flat btn-small">
+                  Show 100 more
+                </a>
+                <a v-on:click="showAll()" class="waves-effect waves-light btn-flat btn-small">
+                  Show all
+                </a>
+              </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row" v-if="params.client === 'transmission' && params.transmission.configured">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Transmission Connection</span>
+              <div v-if="statusTS.ts === 0" style="margin-top:8px">
+                <svg class="spinner" width="36px" height="36px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
+              </div>
+              <div v-else>
+                <p style="margin-top:8px">
+                  <span v-if="status.connected" class="card-panel green lighten-4" style="display:inline-block;padding:6px 14px;margin:0">
+                    <b>● Connected</b><span v-if="status.version"> &mdash; Transmission {{status.version}}</span>
+                  </span>
+                  <span v-else class="card-panel red lighten-4" style="display:inline-block;padding:6px 14px;margin:0">
+                    <b>● Disconnected</b><span v-if="status.reason"> &mdash; {{status.reason}}</span>
+                  </span>
+                </p>
+                <table style="margin-top:16px">
+                  <tbody>
+                    <tr><td style="width:140px"><b>Host</b></td><td>{{params.transmission.host}}</td></tr>
+                    <tr><td><b>Port</b></td><td>{{params.transmission.port}}</td></tr>
+                    <tr><td><b>Username</b></td><td>{{params.transmission.username || '(none)'}}</td></tr>
+                    <tr><td><b>RPC path</b></td><td>{{params.transmission.rpcPath}}</td></tr>
+                    <tr><td><b>HTTPS</b></td><td>{{params.transmission.useHttps ? 'yes' : 'no'}}</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div class="card-action flow-root">
+              <a v-on:click="disconnectTransmission()" :disabled="tDisconnectPending"
+                 class="waves-effect waves-light btn-flat red-text right" style="margin-right:8px">
+                {{ tDisconnectPending ? 'Disconnecting…' : 'Disconnect' }}
+              </a>
+              <a v-on:click="refreshStatus()" :disabled="tTestPending"
+                 class="waves-effect waves-light btn right">
+                {{ tTestPending ? 'Testing…' : 'Test' }}
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Enabled For</span>
+              <p>Pick who can use the torrent feature.</p>
+              <div style="margin-top:16px">
+                <p><b>Current:</b> {{params.enabledFor || 'all'}}</p>
+              </div>
+              <div style="margin-top:16px">
+                <p>
+                  <label style="margin-right:24px">
+                    <input type="radio" v-model="selectedEnabledFor" value="all" />
+                    <span><b>All users</b> &mdash; every authenticated user can add torrents.</span>
+                  </label>
+                </p>
+                <p>
+                  <label>
+                    <input type="radio" v-model="selectedEnabledFor" value="whitelist" />
+                    <span><b>Whitelist</b> &mdash; only users you explicitly grant.</span>
+                  </label>
+                </p>
+              </div>
+            </div>
+            <div class="card-action flow-root">
+              <a v-on:click="applyEnabledFor()" :disabled="enabledForPending"
+                 class="waves-effect waves-light btn right">
+                Apply
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row" v-if="(params.enabledFor || 'all') === 'whitelist'">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Whitelisted Users</span>
+              <p>Toggle access per user. Changes apply immediately.</p>
+              <div v-if="usersTS.ts === 0" style="margin-top:16px">
+                <svg class="spinner" width="36px" height="36px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
+              </div>
+              <div v-else-if="Object.keys(users).length === 0" style="margin-top:16px">
+                <p><i>No users defined yet. Add users on the Users page first.</i></p>
+              </div>
+              <table v-else style="margin-top:16px">
+                <thead>
+                  <tr>
+                    <th>User</th>
+                    <th>Admin</th>
+                    <th>Torrent access</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(v, k) in users">
+                    <td>{{k}}</td>
+                    <td>
+                      <span v-if="v.admin">yes</span>
+                      <span v-else>no</span>
+                    </td>
+                    <td>
+                      <label>
+                        <input
+                          type="checkbox"
+                          class="filled-in"
+                          :checked="v.allowTorrent === true"
+                          :disabled="grantPending[k] === true"
+                          @change="toggleAccess(k, $event.target.checked)" />
+                        <span>&nbsp;</span>
+                      </label>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`,
+  methods: {
+    applyClient: async function() {
+      const client = this.selectedClient;
+      try {
+        this.clientPending = true;
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/torrent/client`,
+          data: { client }
+        });
+        await ADMINDATA.getTorrentParams();
+        await ADMINDATA.getTorrentStatus();
+        // List depends on active client; refetch so the table reflects
+        // whatever the newly-selected client is reporting (or clears
+        // when switching to 'disabled').
+        await ADMINDATA.getTorrentList();
+        iziToast.success({
+          title: `Torrent client set to ${client}`,
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } catch(err) {
+        iziToast.error({ title: 'Failed to update torrent client', position: 'topCenter', timeout: 3500 });
+      } finally {
+        this.clientPending = false;
+      }
+    },
+    applyEnabledFor: async function() {
+      const enabledFor = this.selectedEnabledFor;
+      try {
+        this.enabledForPending = true;
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/torrent/enabled-for`,
+          data: { enabledFor }
+        });
+        await ADMINDATA.getTorrentParams();
+        iziToast.success({
+          title: `Torrent access policy set to "${enabledFor}"`,
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } catch(err) {
+        iziToast.error({ title: 'Failed to update torrent policy', position: 'topCenter', timeout: 3500 });
+      } finally {
+        this.enabledForPending = false;
+      }
+    },
+    toggleAccess: async function(username, allowTorrent) {
+      Vue.set(this.grantPending, username, true);
+      try {
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/users/torrent-access`,
+          data: { username, allowTorrent }
+        });
+        Vue.set(ADMINDATA.users[username], 'allowTorrent', allowTorrent);
+        iziToast.success({
+          title: `${username}: torrent ${allowTorrent ? 'granted' : 'revoked'}`,
+          position: 'topCenter',
+          timeout: 2500
+        });
+      } catch(err) {
+        iziToast.error({ title: 'Failed to update access', position: 'topCenter', timeout: 3500 });
+      } finally {
+        Vue.set(this.grantPending, username, false);
+      }
+    },
+    // ── Transmission backend actions ─────────────────────────────────
+    _credsFromForm() {
+      return {
+        host:     this.tForm.host,
+        port:     this.tForm.port,
+        username: this.tForm.username,
+        password: this.tForm.password,
+        rpcPath:  this.tForm.rpcPath || '/transmission/rpc',
+        useHttps: !!this.tForm.useHttps,
+      };
+    },
+    async testTransmission() {
+      this.tFormError = null;
+      this.tTestPending = true;
+      try {
+        const res = await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/torrent/transmission/test`,
+          data: this._credsFromForm(),
+        });
+        if (res.data.ok) {
+          iziToast.success({
+            title: `Reachable${res.data.version ? ' (Transmission ' + res.data.version + ')' : ''}`,
+            position: 'topCenter', timeout: 3000
+          });
+        } else {
+          this.tFormError = res.data.message || res.data.error || 'Unknown error';
+        }
+      } catch (err) {
+        this.tFormError = err.message || 'Request failed';
+      } finally {
+        this.tTestPending = false;
+      }
+    },
+    async connectTransmission() {
+      this.tFormError = null;
+      this.tConnectPending = true;
+      try {
+        const res = await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/torrent/transmission/connect`,
+          data: this._credsFromForm(),
+        });
+        if (res.data.ok) {
+          await ADMINDATA.getTorrentParams();
+          await ADMINDATA.getTorrentStatus();
+          // The server runs _sweepVpathsForActiveClient inside /connect
+          // so the access cache is fresh by the time the response
+          // arrives — but the UI's cached vpath-access list was last
+          // pulled at page-load against the prior client (or none),
+          // and would otherwise show "needs a path" until a reload.
+          // Same applies to qBittorrent + Deluge below.
+          await ADMINDATA.getTorrentVpathAccess();
+          iziToast.success({
+            title: `Connected${res.data.version ? ' to Transmission ' + res.data.version : ''}`,
+            position: 'topCenter', timeout: 3500
+          });
+          // Wipe the password field once it's been accepted — the
+          // status card doesn't need it.
+          this.tForm.password = '';
+        } else {
+          this.tFormError = res.data.message || res.data.error || 'Unknown error';
+        }
+      } catch (err) {
+        this.tFormError = err.message || 'Request failed';
+      } finally {
+        this.tConnectPending = false;
+      }
+    },
+    async disconnectTransmission() {
+      this.tDisconnectPending = true;
+      try {
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/torrent/transmission/disconnect`,
+        });
+        await ADMINDATA.getTorrentParams();
+        await ADMINDATA.getTorrentStatus();
+        iziToast.success({ title: 'Disconnected', position: 'topCenter', timeout: 2500 });
+      } catch (err) {
+        iziToast.error({ title: 'Failed to disconnect', position: 'topCenter', timeout: 3500 });
+      } finally {
+        this.tDisconnectPending = false;
+      }
+    },
+    // ── Library Access (per-vpath path-mapping) ────────────────────
+    accessChipClass(v) {
+      switch (v.confidence) {
+        case 'verified':    return 'status-verified';
+        case 'inferred':    return 'status-inferred';
+        case 'pending':     return 'status-pending';
+        default:            return 'status-unconfirmed';
+      }
+    },
+    accessChipLabel(v) {
+      switch (v.confidence) {
+        case 'verified':    return '✓ Verified';
+        case 'inferred':    return '~ Inferred';
+        case 'pending':     return '⟳ Probing…';
+        default:            return '✗ Unconfirmed';
+      }
+    },
+    accessIsEditing(name, v) {
+      // Confirmed rows are view-mode by default; unconfirmed rows are
+      // edit-mode by default. PENDING rows render as view-mode (the
+      // probe is mid-flight, manual override during a sweep would be
+      // confusing). The accessEditMode override flips a confirmed row
+      // to editable when the operator clicks "Override".
+      const override = this.accessEditMode[name];
+      if (override === 'edit') { return true; }
+      if (override === 'view') { return false; }
+      return v.confidence === 'unconfirmed';
+    },
+    accessInputValue(name, v) {
+      // Edit-mode draft (if any) takes precedence; otherwise the
+      // verified value; otherwise empty for the operator to type.
+      if (this.accessEditPath[name] != null) { return this.accessEditPath[name]; }
+      return v.daemonPath || '';
+    },
+    accessPlaceholder(v) {
+      if (v.confidence === 'unconfirmed') {
+        return `Enter the path ${this.params.client} uses for this library`;
+      }
+      if (v.confidence === 'pending') {
+        return 'Probing daemon…';
+      }
+      return '';
+    },
+    onAccessInput(name, val) {
+      Vue.set(this.accessEditPath, name, val);
+    },
+    enterEditMode(name, v) {
+      Vue.set(this.accessEditMode, name, 'edit');
+      Vue.set(this.accessEditPath, name, v.daemonPath || '');
+    },
+    async saveManualMapping(name) {
+      const daemonPath = (this.accessEditPath[name] || '').trim();
+      if (!daemonPath) {
+        iziToast.error({ title: 'Enter a path first', position: 'topCenter', timeout: 2500 });
+        return;
+      }
+      Vue.set(this.accessEditPending, name, true);
+      try {
+        const res = await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/torrent/vpath-access/manual`,
+          data: { vpathName: name, daemonPath },
+        });
+        await ADMINDATA.getTorrentVpathAccess();
+        Vue.set(this.accessEditPath, name, null);
+        Vue.set(this.accessEditMode, name, 'view');
+        iziToast.success({
+          title: `${name}: mapped → ${res.data.daemonPath} (${res.data.confidence})`,
+          position: 'topCenter', timeout: 3000
+        });
+      } catch (err) {
+        const errorData = err.response?.data || {};
+        // Refresh the cache to pick up the latest probe row. vpath-access-cache.upsert
+        // ran with source=MANUAL even on verification failure, so the operator can see
+        // last_error / last_probed_at for what they tried. No multi-attempt audit log
+        // is persisted — just the final state.
+        await ADMINDATA.getTorrentVpathAccess();
+        iziToast.error({
+          title: errorData.message || errorData.error || err.message || 'Could not verify path',
+          position: 'topCenter', timeout: 5000
+        });
+      } finally {
+        Vue.set(this.accessEditPending, name, false);
+      }
+    },
+    async refreshAccess() {
+      this.accessRefreshPending = true;
+      try {
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/torrent/vpath-access/auto-detect`,
+          data: {},
+        });
+        await ADMINDATA.getTorrentVpathAccess();
+        // Clear any pending edit drafts since the canonical state just
+        // changed; the operator can re-Override if they still want to
+        // edit something.
+        this.accessEditPath = {};
+        this.accessEditMode = {};
+        iziToast.success({ title: 'Auto-detect complete', position: 'topCenter', timeout: 2500 });
+      } catch (err) {
+        const errorData = err.response?.data || {};
+        iziToast.error({
+          title: errorData.message || errorData.error || err.message || 'Auto-detect failed',
+          position: 'topCenter', timeout: 3500
+        });
+      } finally {
+        this.accessRefreshPending = false;
+      }
+    },
+    // ── Path Templates ───────────────────────────────────────────────
+    // Render a variable name as the template token the operator types.
+    // Done in a method (not inline) because Vue's template parser
+    // treats the literal `{{` in a mustache as the interpolation
+    // delimiter and silently bails on nested cases.
+    tmplVarDisplay(v) { return '{{' + v + '}}'; },
+    tmplInputValue(name, t) {
+      // Draft (if any) wins over the persisted server value.
+      if (this.tmplDraft[name] != null) { return this.tmplDraft[name]; }
+      return t.template || '';
+    },
+    onTmplInput(name, val) {
+      Vue.set(this.tmplDraft, name, val);
+      // Drafts invalidate the last error — the operator is mid-fix.
+      if (this.tmplError[name]) { Vue.set(this.tmplError, name, null); }
+    },
+    useSuggestedTemplate(name) {
+      Vue.set(this.tmplDraft, name, this.tmpl.suggestedTemplate);
+    },
+    // Live preview by resolving the current draft against the server-
+    // supplied sample metadata. Mirrors src/torrent/path-template.js
+    // — see resolveTemplate() there for the authoritative version.
+    // Both implementations need to stay in sync; the server re-validates
+    // on save so a divergence becomes a visible "preview said X but the
+    // save rejected" error rather than a silent corruption.
+    tmplPreview(name, t) {
+      const raw = (this.tmplInputValue(name, t) || '').trim();
+      if (!raw) { return '(no template — operator types path manually)'; }
+      const meta = this.tmpl.sampleMetadata || {};
+      const lookup = {
+        ARTIST:      this._tmplSanitize(meta.artist),
+        ALBUM:       this._tmplSanitize(meta.album),
+        YEAR:        this._tmplSanitize(meta.year),
+        GENRE:       this._tmplSanitize(meta.genre),
+        ALBUMARTIST: this._tmplSanitize(meta.albumartist || meta.artist),
+      };
+      const subst = raw.replace(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g, (_m, n) => {
+        const key = n.toUpperCase();
+        return lookup[key] != null ? lookup[key] : '';
+      });
+      const path = subst.split(/[/\\]+/).map(s => s.trim()).filter(s => s.length > 0).join('/');
+      return path || '(template resolves to empty)';
+    },
+    _tmplSanitize(s) {
+      if (s == null) { return ''; }
+      let v = String(s);
+      // eslint-disable-next-line no-control-regex
+      v = v.replace(/[/\\:*?<>|"\x00-\x1f]+/g, '-');
+      v = v.replace(/\s+/g, ' ');
+      v = v.replace(/^[.\s]+|[.\s]+$/g, '');
+      if (v.length > 200) { v = v.slice(0, 200); }
+      return v;
+    },
+    async saveTmpl(name) {
+      Vue.set(this.tmplPending, name, true);
+      Vue.set(this.tmplError, name, null);
+      const raw = (this.tmplInputValue(name, this.tmpl.vpaths[name]) || '').trim();
+      try {
+        const res = await API.axios({
+          method: 'PUT',
+          url: `${API.url()}/api/v1/admin/torrent/path-templates/${encodeURIComponent(name)}`,
+          data: { template: raw || null },
+        });
+        if (res.data.ok) {
+          // Clear the draft now that the server holds the canonical value.
+          Vue.delete(this.tmplDraft, name);
+          await ADMINDATA.getTorrentPathTemplates();
+          iziToast.success({
+            title: raw ? `${name}: template saved` : `${name}: template cleared`,
+            position: 'topCenter', timeout: 2500
+          });
+        } else {
+          Vue.set(this.tmplError, name, res.data.message || res.data.error || 'Save failed');
+        }
+      } catch (err) {
+        const body = err.response?.data || {};
+        Vue.set(this.tmplError, name, body.message || body.error || err.message || 'Save failed');
+      } finally {
+        Vue.set(this.tmplPending, name, false);
+      }
+    },
+    // ── Import for Seeding ───────────────────────────────────────────
+    seedClickPicker() {
+      this.$refs.seedFileInput.click();
+    },
+    onSeedFilePick(ev) {
+      const files = Array.from(ev.target.files || []);
+      // Reset the input so picking the same filename again re-fires
+      // the change event.
+      ev.target.value = '';
+      this.seedProcessFiles(files);
+    },
+    onSeedDrop(ev) {
+      this.seedIsDragOver = false;
+      const files = Array.from(ev.dataTransfer?.files || []);
+      this.seedProcessFiles(files);
+    },
+    seedChipClass(outcome) {
+      switch (outcome) {
+        case 'seeded':            return 'status-verified';
+        case 'partial_match':     return 'status-inferred';
+        case 'already_in_daemon': return 'status-inferred';
+        case 'no_match':          return 'status-unconfirmed';
+        case 'invalid_torrent':   return 'status-unconfirmed';
+        case 'daemon_error':      return 'status-unconfirmed';
+        default:                  return 'status-unconfirmed';
+      }
+    },
+    seedChipLabel(outcome) {
+      switch (outcome) {
+        case 'seeded':            return '✓ Seeding';
+        case 'partial_match':     return '~ Partial';
+        case 'already_in_daemon': return '⊝ Already there';
+        case 'no_match':          return '✗ Not found';
+        case 'invalid_torrent':   return '✗ Invalid';
+        case 'daemon_error':      return '✗ Daemon error';
+        default:                  return outcome;
+      }
+    },
+    seedClearResults() {
+      this.seedResults = [];
+    },
+    async seedProcessFiles(files) {
+      const torrents = files.filter(f => /\.torrent$/i.test(f.name));
+      if (torrents.length === 0) {
+        iziToast.warning({
+          title: 'Drop .torrent files only', position: 'topCenter', timeout: 2500
+        });
+        return;
+      }
+      // Seed the results array with placeholder rows; the workers
+      // below patch each row in place when its request resolves so
+      // the operator sees "checking…" badges first, then outcomes
+      // as they land. Preserves drop order in the UI.
+      const startIdx = this.seedResults.length;
+      for (const f of torrents) {
+        this.seedResults.push({ filename: f.name, pending: true });
+      }
+      const queue = torrents.map((file, i) => ({ file, idx: startIdx + i }));
+      const workers = [];
+      for (let i = 0; i < this.seedConcurrency; i++) {
+        workers.push(this._seedWorker(queue));
+      }
+      await Promise.all(workers);
+    },
+    async _seedWorker(queue) {
+      // Workers pull from the shared queue array; an empty queue
+      // means the worker is done. Each request is independent, so
+      // we don't have to coordinate failures across workers — the
+      // catch below patches the individual row and moves on.
+      while (queue.length > 0) {
+        const item = queue.shift();
+        if (!item) { return; }
+        this.seedRunningCount++;
+        try {
+          const fd = new FormData();
+          fd.append('torrentFile', item.file);
+          if (this.seedSelectedVpaths.length > 0) {
+            fd.append('vpaths', JSON.stringify(this.seedSelectedVpaths));
+          }
+          const res = await API.axios({
+            method: 'POST',
+            url:    `${API.url()}/api/v1/admin/torrent/seed-existing`,
+            data:   fd,
+          });
+          // axios + the route's "every outcome is HTTP 200" contract:
+          // the body always has {ok:true, outcome:...}. Patch the row
+          // in place. Vue.set is required because seedResults entries
+          // were added before the worker started, and direct property
+          // assignment on a non-reactive object wouldn't trigger a
+          // re-render.
+          Vue.set(this.seedResults, item.idx, {
+            filename: item.file.name,
+            pending:  false,
+            ...res.data,
+          });
+        } catch (err) {
+          // HTTP-level failure (network drop, 4xx pre-route-handler
+          // like multipart parse error). Surface as a synthetic
+          // outcome so the row's still readable.
+          const body = err.response?.data || {};
+          Vue.set(this.seedResults, item.idx, {
+            filename: item.file.name,
+            pending:  false,
+            outcome:  body.error || 'daemon_error',
+            error:    body.message || err.message || 'Request failed',
+          });
+        } finally {
+          this.seedRunningCount--;
+          // Refresh the torrents list too so newly-seeded entries
+          // appear without a manual click. Cheap; reuses the same
+          // ADMINDATA cache the Torrents card consumes.
+          ADMINDATA.getTorrentList().catch(() => {});
+        }
+      }
+    },
+
+    async refreshList() {
+      this.listRefreshPending = true;
+      // Reset the soft cap so a stale "Show all" from a previous
+      // session doesn't silently re-render thousands of rows when the
+      // operator hits Refresh.
+      this.listVisibleCap = 100;
+      try {
+        await ADMINDATA.getTorrentList();
+        if (this.list.error) {
+          iziToast.error({ title: this.list.error, position: 'topCenter', timeout: 3500 });
+        }
+      } finally {
+        this.listRefreshPending = false;
+      }
+    },
+    // ── Remove (managed-only, no data) ──────────────────────────────
+    // The confirm() dialog is intentionally explicit about the
+    // "files stay on disk" contract — operators have been burned by
+    // other tools where "remove" silently means "remove + delete data".
+    async removeTorrent(t) {
+      if (!t || !t.managedByMstream) { return; }
+      const yes = window.confirm(
+        `Remove "${t.name}" from ${this.params.client}?\n\n` +
+        `Files on disk will be KEPT — only the daemon's record of the torrent is dropped.\n` +
+        `Use the daemon's own UI if you want to delete the files.`
+      );
+      if (!yes) { return; }
+      Vue.set(this.removePending, t.infoHash, true);
+      try {
+        const res = await API.axios({
+          method: 'DELETE',
+          url:    `${API.url()}/api/v1/admin/torrent/${encodeURIComponent(t.infoHash)}`,
+        });
+        const body = res.data || {};
+        if (body.daemonRemoveOk === false) {
+          // Managed row was dropped but the daemon-side delete failed.
+          // Surface as a warning rather than success so the operator
+          // knows the daemon may still have the torrent in its session.
+          iziToast.warning({
+            title:    `${t.name}: mStream record removed, daemon-side delete failed`,
+            message:  body.daemonRemoveError || 'See server logs',
+            position: 'topCenter', timeout: 5500,
+          });
+        } else {
+          iziToast.success({
+            title:    `Removed ${t.name}`,
+            message:  'Files on disk kept',
+            position: 'topCenter', timeout: 3000,
+          });
+        }
+        await ADMINDATA.getTorrentList();
+      } catch (err) {
+        const body = err.response?.data || {};
+        iziToast.error({
+          title:    body.message || body.error || err.message || 'Remove failed',
+          position: 'topCenter', timeout: 4000,
+        });
+      } finally {
+        Vue.delete(this.removePending, t.infoHash);
+      }
+    },
+    showMore() { this.listVisibleCap += 100; },
+    showAll()  { this.listVisibleCap = Infinity; },
+    formatRate(bytesPerSec) {
+      // KB/s when small, MB/s once we cross the megabyte line. Two
+      // levels is enough for residential connection rates.
+      if (!bytesPerSec) { return '—'; }
+      if (bytesPerSec >= 1024 * 1024) { return (bytesPerSec / 1024 / 1024).toFixed(1) + ' MB/s'; }
+      return (bytesPerSec / 1024).toFixed(1) + ' KB/s';
+    },
+    formatSize(bytes) {
+      if (!bytes) { return '0 B'; }
+      const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let i = 0;
+      let v = bytes;
+      while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+      return v.toFixed(i >= 2 ? 2 : 0) + ' ' + u[i];
+    },
+    async refreshStatus() {
+      // Used by Transmission, qBittorrent, and Deluge status cards.
+      // The pending flag flips based on which client is active so
+      // only the right button shows "Testing…" while the call is
+      // in flight.
+      const client = this.params.client;
+      const setBusy = v => {
+        if (client === 'qbittorrent')     { this.qTestPending = v; }
+        else if (client === 'deluge')     { this.dTestPending = v; }
+        else                              { this.tTestPending = v; }
+      };
+      const label = client === 'qbittorrent' ? 'qBittorrent'
+                  : client === 'deluge'      ? 'Deluge'
+                  :                            'Transmission';
+      setBusy(true);
+      try {
+        await ADMINDATA.getTorrentStatus();
+        if (this.status.connected) {
+          iziToast.success({
+            title: `Reachable${this.status.version ? ` (${label} ${this.status.version})` : ''}`,
+            position: 'topCenter', timeout: 3000
+          });
+        } else {
+          iziToast.error({
+            title: this.status.reason || 'Not reachable',
+            position: 'topCenter', timeout: 4000
+          });
+        }
+      } finally {
+        setBusy(false);
+      }
+    },
+    // ── qBittorrent backend actions ──────────────────────────────────
+    _qCredsFromForm() {
+      return {
+        host:     this.qForm.host,
+        port:     this.qForm.port,
+        username: this.qForm.username,
+        password: this.qForm.password,
+        useHttps: !!this.qForm.useHttps,
+      };
+    },
+    async testQbittorrent() {
+      this.qFormError = null;
+      this.qTestPending = true;
+      try {
+        const res = await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/torrent/qbittorrent/test`,
+          data: this._qCredsFromForm(),
+        });
+        if (res.data.ok) {
+          iziToast.success({
+            title: `Reachable${res.data.version ? ' (qBittorrent ' + res.data.version + ')' : ''}`,
+            position: 'topCenter', timeout: 3000
+          });
+        } else {
+          this.qFormError = res.data.message || res.data.error || 'Unknown error';
+        }
+      } catch (err) {
+        this.qFormError = err.message || 'Request failed';
+      } finally {
+        this.qTestPending = false;
+      }
+    },
+    async connectQbittorrent() {
+      this.qFormError = null;
+      this.qConnectPending = true;
+      try {
+        const res = await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/torrent/qbittorrent/connect`,
+          data: this._qCredsFromForm(),
+        });
+        if (res.data.ok) {
+          await ADMINDATA.getTorrentParams();
+          await ADMINDATA.getTorrentStatus();
+          await ADMINDATA.getTorrentVpathAccess();
+          await ADMINDATA.getTorrentList();
+          iziToast.success({
+            title: `Connected${res.data.version ? ' to qBittorrent ' + res.data.version : ''}`,
+            position: 'topCenter', timeout: 3500
+          });
+          this.qForm.password = '';
+        } else {
+          this.qFormError = res.data.message || res.data.error || 'Unknown error';
+        }
+      } catch (err) {
+        this.qFormError = err.message || 'Request failed';
+      } finally {
+        this.qConnectPending = false;
+      }
+    },
+    async disconnectQbittorrent() {
+      this.qDisconnectPending = true;
+      try {
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/torrent/qbittorrent/disconnect`,
+        });
+        await ADMINDATA.getTorrentParams();
+        await ADMINDATA.getTorrentStatus();
+        await ADMINDATA.getTorrentList();
+        iziToast.success({ title: 'Disconnected', position: 'topCenter', timeout: 2500 });
+      } catch (err) {
+        iziToast.error({ title: 'Failed to disconnect', position: 'topCenter', timeout: 3500 });
+      } finally {
+        this.qDisconnectPending = false;
+      }
+    },
+    // ── Deluge backend actions ───────────────────────────────────────
+    _dCredsFromForm() {
+      return {
+        host:     this.dForm.host,
+        port:     this.dForm.port,
+        password: this.dForm.password,
+        useHttps: !!this.dForm.useHttps,
+      };
+    },
+    async testDeluge() {
+      this.dFormError = null;
+      this.dTestPending = true;
+      try {
+        const res = await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/torrent/deluge/test`,
+          data: this._dCredsFromForm(),
+        });
+        if (res.data.ok) {
+          iziToast.success({
+            title: `Reachable${res.data.version ? ' (Deluge ' + res.data.version + ')' : ''}`,
+            position: 'topCenter', timeout: 3000
+          });
+        } else {
+          this.dFormError = res.data.message || res.data.error || 'Unknown error';
+        }
+      } catch (err) {
+        this.dFormError = err.message || 'Request failed';
+      } finally {
+        this.dTestPending = false;
+      }
+    },
+    async connectDeluge() {
+      this.dFormError = null;
+      this.dConnectPending = true;
+      try {
+        const res = await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/torrent/deluge/connect`,
+          data: this._dCredsFromForm(),
+        });
+        if (res.data.ok) {
+          await ADMINDATA.getTorrentParams();
+          await ADMINDATA.getTorrentStatus();
+          await ADMINDATA.getTorrentVpathAccess();
+          await ADMINDATA.getTorrentList();
+          iziToast.success({
+            title: `Connected${res.data.version ? ' to Deluge ' + res.data.version : ''}`,
+            position: 'topCenter', timeout: 3500
+          });
+          this.dForm.password = '';
+        } else {
+          this.dFormError = res.data.message || res.data.error || 'Unknown error';
+        }
+      } catch (err) {
+        this.dFormError = err.message || 'Request failed';
+      } finally {
+        this.dConnectPending = false;
+      }
+    },
+    async disconnectDeluge() {
+      this.dDisconnectPending = true;
+      try {
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/torrent/deluge/disconnect`,
+        });
+        await ADMINDATA.getTorrentParams();
+        await ADMINDATA.getTorrentStatus();
+        await ADMINDATA.getTorrentList();
+        iziToast.success({ title: 'Disconnected', position: 'topCenter', timeout: 2500 });
+      } catch (err) {
+        iziToast.error({ title: 'Failed to disconnect', position: 'topCenter', timeout: 3500 });
+      } finally {
+        this.dDisconnectPending = false;
+      }
+    },
+  }
+});
+
 // ── Backup destinations (V28) ──────────────────────────────────────────────
 // Lives in its own admin section. Lets operators register one or more local
 // mirror destinations per library (typically: a second drive on the same
@@ -4358,6 +6674,153 @@ const backupView = Vue.component('backup-view', {
   },
 });
 
+const irohView = Vue.component('iroh-view', {
+  data() {
+    return {
+      irohTS: ADMINDATA.irohParamsUpdated,
+      iroh: ADMINDATA.irohParams,
+      togglePending: false,
+      rotatePending: false,
+    };
+  },
+  watch: {
+    // Re-render the QR whenever fresh status arrives (the ticket changes on
+    // enable / secret rotation). $nextTick so the #iroh-qr div exists.
+    'irohTS.ts': {
+      immediate: true,
+      handler() { this.$nextTick(() => this.renderQr()); }
+    }
+  },
+  methods: {
+    renderQr() {
+      const el = document.getElementById('iroh-qr');
+      if (!el) { return; }
+      if (this.iroh.enabled && this.iroh.qr && typeof qrcode !== 'undefined') {
+        try {
+          const qr = qrcode(0, 'L');     // auto version, low EC = max capacity
+          qr.addData(this.iroh.qr);
+          qr.make();
+          el.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
+          const svg = el.querySelector('svg');
+          if (svg) { svg.style.width = '240px'; svg.style.height = '240px'; }
+        } catch (e) { el.innerHTML = '<p>Could not render QR.</p>'; }
+      } else {
+        el.innerHTML = '';
+      }
+    },
+    async toggle() {
+      this.togglePending = true;
+      try {
+        await API.axios({ method: 'POST', url: `${API.url()}/api/v1/admin/iroh`, data: { enabled: !this.iroh.enabled } });
+        await ADMINDATA.getIroh();
+        if (this.iroh.enabled && this.iroh.available === false) {
+          iziToast.warning({ title: 'Unavailable', message: 'Iroh has no prebuilt binary for this server’s platform; the tunnel could not start.' });
+        }
+      } catch (e) {
+        iziToast.error({ title: 'Error', message: 'Failed to update Quick Connect setting.' });
+      }
+      this.togglePending = false;
+    },
+    async rotate() {
+      this.rotatePending = true;
+      try {
+        await API.axios({ method: 'POST', url: `${API.url()}/api/v1/admin/iroh/rotate-secret`, data: {} });
+        await ADMINDATA.getIroh();
+        iziToast.success({ title: 'Rotated', message: 'New secret in effect — previously-shared QR codes no longer work.' });
+      } catch (e) {
+        iziToast.error({ title: 'Error', message: 'Failed to rotate secret.' });
+      }
+      this.rotatePending = false;
+    },
+  },
+  mounted() { ADMINDATA.getIroh(); },
+  template: `
+    <div v-if="irohTS.ts === 0" class="row">
+      <svg class="spinner" width="65px" height="65px" viewBox="0 0 66 66" xmlns="http://www.w3.org/2000/svg"><circle class="spinner-path" fill="none" stroke-width="6" stroke-linecap="round" cx="33" cy="33" r="30"></circle></svg>
+    </div>
+    <div v-else class="container">
+      <div class="row" style="margin-top:24px">
+        <div class="col s12">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Quick Connect</span>
+              <p>Reach this server from anywhere with <b>no network configuration</b> — no port-forwarding, dynamic DNS, domain name, or SSL certificate. mStream dials out to the Iroh network; a paired device connects by scanning the code below, and the connection is peer-to-peer and end-to-end encrypted.</p>
+              <div class="card-panel amber lighten-4" style="margin-top:8px">
+                <p><b>Apps only.</b> Quick Connect works through the mStream mobile/desktop apps.</p>
+                <ul class="browser-default" style="margin:8px 0 0 4px">
+                  <li>You can't open the web player in a normal browser over this connection.</li>
+                  <li><b>Sharing playlists won't work</b> — shared links aren't publicly reachable over the tunnel.</li>
+                </ul>
+              </div>
+              <div v-if="iroh.available === false" class="card-panel orange lighten-4" style="margin-top:16px">
+                <p><b>Not available on this platform.</b> The Iroh native component has no prebuilt binary for this server’s OS/CPU, so the tunnel can’t run here. Everything else in mStream is unaffected.</p>
+              </div>
+              <p><b>Keep the code secret.</b> Anyone who scans it can open a tunnel to this server (your normal mStream login still applies on top). Share it only with your own devices, and rotate it if it leaks.</p>
+            </div>
+            <div class="card-action flow-root">
+              <a v-on:click="toggle()" :class="{disabled: togglePending}" class="waves-effect waves-light btn right">
+                {{ iroh.enabled ? 'Turn Off' : 'Turn On' }}
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="iroh.enabled && iroh.running" class="row">
+        <div class="col s12 m6">
+          <div class="card">
+            <div class="card-content center-align">
+              <span class="card-title left-align">Pairing code</span>
+              <div id="iroh-qr" style="margin:12px auto"></div>
+              <p style="font-size:0.85em;color:#777" class="left-align">Scan from the mStream app, or copy the code into the desktop client.</p>
+              <a class="waves-effect waves-light btn-flat iroh-copy-button" :data-clipboard-text="iroh.qr">
+                Copy code
+              </a>
+            </div>
+          </div>
+        </div>
+        <div class="col s12 m6">
+          <div class="card">
+            <div class="card-content">
+              <span class="card-title">Details</span>
+              <p style="margin-top:8px"><b>Status:</b>
+                <span v-if="iroh.enabled && iroh.running" style="color:#2e7d32">On{{ iroh.online ? ' · connected to relay' : ' · connecting…' }}</span>
+                <span v-else style="color:#777">Off</span>
+              </p>
+              <p style="margin-top:8px"><b>Endpoint ID</b></p>
+              <p style="word-break:break-all;font-family:monospace;font-size:0.8em">{{ iroh.endpointId }}</p>
+              <p style="margin-top:8px" v-if="iroh.relayUrl"><b>Home relay:</b> {{ iroh.relayUrl }}</p>
+              <div style="margin-top:20px">
+                <p><b>Rotate secret</b></p>
+                <p style="font-size:0.85em;color:#777">Issues a new pairing code and invalidates the current one. Use this if a code leaked or a device should lose access.</p>
+                <a v-on:click="rotate()" :class="{disabled: rotatePending}" class="waves-effect waves-light btn red lighten-1" style="margin-top:8px">
+                  Rotate secret
+                </a>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `
+});
+
+// Optional URL-hash deep-link: `/admin/#view=<name>` (or just
+// `/admin/#<name>`) opens the matching tab on first paint. Useful for
+// bookmarks, support links, and any tooling that wants to drop the user
+// on a specific page without the user having to click through the
+// sidebar.
+function _initialViewFromHash() {
+  const valid = new Set([
+    'folders-view','users-view','db-view','advanced-view','info-view',
+    'transcode-view','federation-view','dlna-view','subsonic-view','iroh-view',
+    'torrent-view','logs-view','rpn-view','security-view','backup-view',
+  ]);
+  const raw = (location.hash || '').replace(/^#/, '');
+  const name = raw.startsWith('view=') ? raw.slice(5) : raw;
+  return valid.has(name) ? name : 'folders-view';
+}
+
 const vm = new Vue({
   el: '#content',
   components: {
@@ -4370,13 +6833,15 @@ const vm = new Vue({
     'federation-view': federationView,
     'dlna-view': dlnaView,
     'subsonic-view': subsonicView,
+    'iroh-view': irohView,
+    'torrent-view': torrentView,
     'logs-view': logsView,
     'rpn-view': rpnView,
-    'lock-view': lockView,
+    'security-view': securityView,
     'backup-view': backupView,
   },
   data: {
-    currentViewMain: 'folders-view',
+    currentViewMain: _initialViewFromHash(),
     componentKey: false
   }
 });
@@ -4791,6 +7256,70 @@ const editRequestSizeModal = Vue.component('edit-request-size-modal', {
 });
 
 
+const editDownloadSizeLimitModal = Vue.component('edit-download-size-limit-modal', {
+  data() {
+    return {
+      params: ADMINDATA.serverParams,
+      submitPending: false,
+      downloadSizeLimit: ADMINDATA.serverParams.downloadSizeLimit
+    };
+  },
+  template: `
+    <form @submit.prevent="updateDownloadSizeLimit">
+      <div class="modal-content">
+        <h4>{{ t('admin.modal.changeDownloadSizeLimit') }}</h4>
+        <p>{{ t('admin.modal.acceptsSizeUnits') }}</p>
+        <div class="input-field">
+          <input v-model="downloadSizeLimit" id="edit-download-size-limit" required type="text">
+          <label for="edit-download-size-limit">{{ t('admin.modal.editDownloadSizeLimit') }}</label>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
+        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
+        </button>
+      </div>
+    </form>`,
+  mounted: function () {
+    M.updateTextFields();
+  },
+  methods: {
+    updateDownloadSizeLimit: async function() {
+      try {
+        this.submitPending = true;
+        this.downloadSizeLimit = this.downloadSizeLimit.replaceAll(' ', '');
+
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/config/download-size-limit`,
+          data: { downloadSizeLimit: this.downloadSizeLimit }
+        });
+
+        // No reboot — the download routes read this live. Reflect it in the UI.
+        Vue.set(ADMINDATA.serverParams, 'downloadSizeLimit', this.downloadSizeLimit);
+
+        M.Modal.getInstance(document.getElementById('admin-modal')).close();
+
+        iziToast.success({
+          title: t('admin.settings.updated'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } catch(err) {
+        iziToast.error({
+          title: t('admin.modal.updateFailed'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } finally {
+        this.submitPending = false;
+      }
+    }
+  }
+});
+
+
 const editPortModal = Vue.component('edit-port-modal', {
   data() {
     return {
@@ -4968,6 +7497,67 @@ const editBootScanView = Vue.component('edit-boot-scan-delay-modal', {
         Vue.set(ADMINDATA.dbParams, 'bootScanDelay', this.editValue);
   
         // close & reset the modal
+        M.Modal.getInstance(document.getElementById('admin-modal')).close();
+
+        iziToast.success({
+          title: t('admin.settings.updated'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } catch(err) {
+        iziToast.error({
+          title: t('admin.modal.updateFailed'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      }finally {
+        this.submitPending = false;
+      }
+    }
+  }
+});
+
+const editAutoAlbumArtPerRunView = Vue.component('edit-auto-album-art-per-run-modal', {
+  data() {
+    return {
+      params: ADMINDATA.dbParams,
+      submitPending: false,
+      editValue: ADMINDATA.dbParams.autoAlbumArtPerRun
+    };
+  },
+  template: `
+    <form @submit.prevent="updateParam">
+      <div class="modal-content">
+        <h4>{{ t('admin.modal.editAutoArtPerRun') }}</h4>
+        <div class="input-field">
+          <input v-model="editValue" id="edit-auto-album-art-per-run" required type="number" min="1" max="10000">
+          <label for="edit-auto-album-art-per-run">{{ t('admin.db.autoArtPerRun') }}</label>
+          <span class="helper-text">{{ t('admin.modal.autoArtPerRunHelp') }}</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
+        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
+        </button>
+      </div>
+    </form>`,
+  mounted: function () {
+    M.updateTextFields();
+  },
+  methods: {
+    updateParam: async function() {
+      try {
+        this.submitPending = true;
+
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/db/params/auto-album-art-per-run`,
+          data: { autoAlbumArtPerRun: Number(this.editValue) }
+        });
+
+        Vue.set(ADMINDATA.dbParams, 'autoAlbumArtPerRun', Number(this.editValue));
+
         M.Modal.getInstance(document.getElementById('admin-modal')).close();
 
         iziToast.success({
@@ -5436,6 +8026,66 @@ const editRustPlayerPortModal = Vue.component('edit-rust-player-port-modal', {
   }
 });
 
+const editLogBufferSizeModal = Vue.component('edit-log-buffer-size-modal', {
+  data() {
+    return {
+      submitPending: false,
+      currentSize: ADMINDATA.serverParams.logBufferSize
+    };
+  },
+  template: `
+    <form @submit.prevent="updateSize">
+      <div class="modal-content">
+        <h4>{{ t('admin.modal.changeLogBuffer') }}</h4>
+        <div class="input-field">
+          <input v-model="currentSize" id="edit-log-buffer" required type="number" min="0" max="10000">
+          <label for="edit-log-buffer">{{ t('admin.modal.logBufferLines') }}</label>
+        </div>
+        <blockquote>
+          {{ t('admin.modal.logBufferHint') }}
+        </blockquote>
+      </div>
+      <div class="modal-footer">
+        <a href="#!" class="modal-close waves-effect waves-green btn-flat">{{ t('admin.modal.goBack') }}</a>
+        <button class="btn green waves-effect waves-light" type="submit" :disabled="submitPending === true">
+          {{ submitPending === false ? t('admin.modal.update') : t('admin.modal.updating') }}
+        </button>
+      </div>
+    </form>`,
+  mounted: function () {
+    M.updateTextFields();
+  },
+  methods: {
+    updateSize: async function() {
+      try {
+        this.submitPending = true;
+        await API.axios({
+          method: 'POST',
+          url: `${API.url()}/api/v1/admin/config/log-buffer-size`,
+          data: { logBufferSize: Number(this.currentSize) }
+        });
+
+        Vue.set(ADMINDATA.serverParams, 'logBufferSize', Number(this.currentSize));
+
+        M.Modal.getInstance(document.getElementById('admin-modal')).close();
+        iziToast.success({
+          title: t('admin.settings.updated'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      } catch(err) {
+        iziToast.error({
+          title: t('admin.logs.bufferUpdateFailed'),
+          position: 'topCenter',
+          timeout: 3500
+        });
+      }
+
+      this.submitPending = false;
+    }
+  }
+});
+
 const editAlbumArtServicesModal = Vue.component('edit-album-art-services-modal', {
   data() {
     return {
@@ -5865,6 +8515,7 @@ const modVM = new Vue({
     // 'federation-generate-invite-modal': federationGenerateInvite,
     'edit-rust-player-port-modal': editRustPlayerPortModal,
     'edit-album-art-services-modal': editAlbumArtServicesModal,
+    'edit-log-buffer-size-modal': editLogBufferSizeModal,
     'backup-history-modal': backupHistoryModal,
     'backup-edit-modal': backupEditModal,
     'null-modal': nullModal

@@ -17,6 +17,7 @@ import * as config from '../state/config.js';
 import * as db from '../db/manager.js';
 import * as vpath from '../util/vpath.js';
 import { joiValidate, sanitizeFilename } from '../util/validation.js';
+import WebError from '../util/web-error.js';
 import { ffmpegBin } from '../util/ffmpeg-bootstrap.js';
 import { isDownloaded as ffmpegIsDownloaded } from './transcode.js';
 
@@ -147,55 +148,62 @@ export async function saveImageToCache(imgBuf, albumArtDir) {
   return filename;
 }
 
-export function embedArtInFile(audioFilePath, imgBuf) {
-  return new Promise(async (resolve, reject) => {
-    const ffmpeg = ffmpegBin();
-    if (!ffmpeg) { return resolve(); }
-    // Only verify existence for absolute paths. When ffmpegBin() returns a
-    // bare command name (system-PATH fallback), leave the check to spawn().
-    if (path.isAbsolute(ffmpeg)) {
-      try { await fsp.access(ffmpeg); } catch { return resolve(); }
-    }
+export async function embedArtInFile(audioFilePath, imgBuf) {
+  const ffmpeg = ffmpegBin();
+  if (!ffmpeg) { return; }
+  // Only verify existence for absolute paths. When ffmpegBin() returns a
+  // bare command name (system-PATH fallback), leave the check to spawn().
+  if (path.isAbsolute(ffmpeg)) {
+    try { await fsp.access(ffmpeg); } catch { return; }
+  }
 
-    const tmpImg = audioFilePath + '.cover.jpg';
-    const tmpOut = audioFilePath + '.tmp_art';
-    await fsp.writeFile(tmpImg, imgBuf);
+  const ext = path.extname(audioFilePath).toLowerCase();
+  const tmpImg = audioFilePath + '.cover.jpg';
+  // Keep the real extension on the temp output — ffmpeg infers the output
+  // container from it. A bare `.tmp_art` fails with "Unable to choose an
+  // output format", which silently broke art-embedding for every format.
+  const tmpOut = audioFilePath + '.tmp_art' + ext;
 
-    const ext = path.extname(audioFilePath).toLowerCase();
-    let args;
+  // Map only the source AUDIO streams (`0:a`) + the new cover (`1:0`). Using
+  // `-map 0` would also carry over any existing embedded cover, which then
+  // collides with the new one — a hard mux error on M4A ("two mjpeg streams")
+  // or stale, unreplaced art on FLAC. `0:a` drops the old cover so the new one
+  // cleanly replaces it.
+  let args;
+  if (ext === '.mp3') {
+    args = ['-y', '-i', audioFilePath, '-i', tmpImg, '-map', '0:a', '-map', '1:0',
+            '-c', 'copy', '-id3v2_version', '3',
+            '-metadata:s:v', 'title=Album cover', '-metadata:s:v', 'comment=Cover (front)', tmpOut];
+  } else if (ext === '.flac') {
+    // `-disposition:v:0 attached_pic` is REQUIRED for FLAC — without it the
+    // FLAC muxer drops the mapped image (writes 0 bytes of picture data) and
+    // the cover silently never lands.
+    args = ['-y', '-i', audioFilePath, '-i', tmpImg, '-map', '0:a', '-map', '1:0',
+            '-c', 'copy', '-disposition:v:0', 'attached_pic', '-metadata:s:v', 'comment=Cover (front)', tmpOut];
+  } else if (ext === '.m4a' || ext === '.aac' || ext === '.m4b') {
+    args = ['-y', '-i', audioFilePath, '-i', tmpImg, '-map', '0:a', '-map', '1:0',
+            '-c', 'copy', '-disposition:v:0', 'attached_pic', tmpOut];
+  } else {
+    return; // unsupported container — nothing to embed
+  }
 
-    if (ext === '.mp3') {
-      args = ['-y', '-i', audioFilePath, '-i', tmpImg, '-map', '0:a', '-map', '1:0',
-              '-c', 'copy', '-id3v2_version', '3',
-              '-metadata:s:v', 'title=Album cover', '-metadata:s:v', 'comment=Cover (front)', tmpOut];
-    } else if (ext === '.flac') {
-      args = ['-y', '-i', audioFilePath, '-i', tmpImg, '-map', '0', '-map', '1:0',
-              '-c', 'copy', '-metadata:s:v', 'comment=Cover (front)', tmpOut];
-    } else if (ext === '.m4a' || ext === '.aac' || ext === '.m4b') {
-      args = ['-y', '-i', audioFilePath, '-i', tmpImg, '-map', '0', '-map', '1:0',
-              '-c', 'copy', '-disposition:v:0', 'attached_pic', tmpOut];
-    } else {
-      await fsp.unlink(tmpImg).catch(() => {});
-      return resolve();
-    }
-
-    const proc = spawn(ffmpeg, args, { stdio: ['ignore', 'ignore', 'pipe'] });
-    proc.on('close', async (code) => {
-      await fsp.unlink(tmpImg).catch(() => {});
-      if (code === 0) {
-        await fsp.rename(tmpOut, audioFilePath).catch(() => {});
-        resolve();
-      } else {
-        await fsp.unlink(tmpOut).catch(() => {});
-        reject(new Error('ffmpeg embed failed'));
-      }
+  // NOTE: plain async function, NOT `new Promise(async …)`. With an async
+  // executor a throw from writeFile/spawn rejects the executor's inner
+  // promise, never the constructed one, so the caller's `await` hangs forever
+  // and leaks the temp files. Here every failure rejects normally and the
+  // `finally` guarantees cleanup.
+  await fsp.writeFile(tmpImg, imgBuf);
+  try {
+    await new Promise((resolve, reject) => {
+      const proc = spawn(ffmpeg, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+      proc.on('error', () => reject(new Error('ffmpeg spawn failed')));
+      proc.on('close', (code) => code === 0 ? resolve() : reject(new Error('ffmpeg embed failed')));
     });
-    proc.on('error', async () => {
-      await fsp.unlink(tmpImg).catch(() => {});
-      await fsp.unlink(tmpOut).catch(() => {});
-      reject(new Error('ffmpeg spawn failed'));
-    });
-  });
+    await fsp.rename(tmpOut, audioFilePath);
+  } finally {
+    await fsp.unlink(tmpImg).catch(() => {});
+    await fsp.unlink(tmpOut).catch(() => {}); // no-op on success (renamed away)
+  }
 }
 
 // ── API setup ───────────────────────────────────────────────────────────────
@@ -254,7 +262,9 @@ export function setup(mstream) {
       await applyAlbumArt(req.body.filepath, imgBuf, req.body.writeToFolder, req.body.writeToFile, req.user);
       res.json({ ok: true });
     } catch (e) {
-      res.status(400).json({ error: e.message });
+      // Honour a WebError's status (e.g. 404 not-found from applyAlbumArt);
+      // everything else here is a bad-image / processing failure → 400.
+      res.status(e instanceof WebError ? e.status : 400).json({ error: e.message });
     }
   });
 
@@ -291,7 +301,9 @@ export function setup(mstream) {
       await applyAlbumArt(req.body.filepath, imgBuf, req.body.writeToFolder, req.body.writeToFile, req.user);
       res.json({ ok: true });
     } catch (e) {
-      res.status(400).json({ error: e.message });
+      // Honour a WebError's status (e.g. 404 not-found from applyAlbumArt);
+      // everything else here is a bad-image / processing failure → 400.
+      res.status(e instanceof WebError ? e.status : 400).json({ error: e.message });
     }
   });
 
@@ -320,12 +332,12 @@ export function setup(mstream) {
     // Find the track in DB
     const pathInfo = vpath.getVPathInfo(filepath, user);
     const lib = db.getLibraryByName(pathInfo.vpath);
-    if (!lib) throw new Error('Library not found');
+    if (!lib) throw new WebError('Library not found', 404);
 
     const track = d().prepare(
       'SELECT id, album_id FROM tracks WHERE filepath = ? AND library_id = ?'
     ).get(pathInfo.relativePath, lib.id);
-    if (!track) throw new Error('Track not found');
+    if (!track) throw new WebError('Track not found', 404);
 
     // Update track art
     d().prepare('UPDATE tracks SET album_art_file = ? WHERE id = ?').run(filename, track.id);

@@ -29,7 +29,7 @@ const youtubeUrlSchema = Joi.string().uri({ scheme: ['http', 'https'] }).require
 function sanitizeYoutubeUrl(url) {
   const parsed = new URL(url);
   const v = parsed.searchParams.get('v');
-  if (!v) { throw new Error('Invalid YouTube URL - missing video ID'); }
+  if (!v) { throw new WebError('Invalid YouTube URL - missing video ID', 400); }
   parsed.search = '';
   parsed.searchParams.set('v', v);
   return parsed.toString();
@@ -46,7 +46,7 @@ function lookupMetadata(url) {
 
     proc.on('close', (code) => {
       if (code !== 0) {
-        winston.error('yt-dlp metadata lookup failed:', stderr);
+        winston.error(`yt-dlp metadata lookup failed: ${stderr}`);
         return reject(new Error('Failed to lookup metadata'));
       }
 
@@ -68,11 +68,11 @@ function lookupMetadata(url) {
 
 export function setup(mstream) {
   mstream.post("/api/v1/ytdl/", async (req, res) => {
-    if (config.program.noUpload === true) { throw new WebError('Uploading Disabled'); }
+    if (config.program.noUpload === true) { throw new WebError('Uploading Disabled', 403); }
     if (req.user.allow_upload === false || req.user.allow_upload === 0) { throw new WebError('Uploading Disabled', 403); }
 
     if (!transcode.isDownloaded()) {
-      return res.status(500).json({ error: 'FFmpeg not downloaded yet' });
+      return res.status(500).json({ error: 'FFmpeg is not available yet' });
     }
 
     const filesFormats = Object.keys(config.program.supportedAudioFiles).filter((format) => {
@@ -94,7 +94,7 @@ export function setup(mstream) {
 
     // verify path exists
     const pathInfo = vpath.getVPathInfo(value.directory, req.user);
-    if (!(await fs.stat(pathInfo.fullPath)).isDirectory()) { throw new Error('Not A Directory'); }
+    if (!(await fs.stat(pathInfo.fullPath)).isDirectory()) { throw new WebError('Not A Directory', 400); }
 
     value.url = sanitizeYoutubeUrl(value.url);
 
@@ -121,7 +121,14 @@ export function setup(mstream) {
     const ytdlAudioFormat = formatMap[value.outputCodec] || value.outputCodec;
     const ytdlArgs = ['-f', "ba", "-x", value.url, '-o', downloadDir,
       "--restrict-filenames", "--no-overwrites",
-      "--ffmpeg-location", ffmpegPath, "--audio-format", ytdlAudioFormat, "--embed-metadata"];
+      "--audio-format", ytdlAudioFormat, "--embed-metadata"];
+    // yt-dlp's --ffmpeg-location takes a filesystem path/dir, NOT a PATH-
+    // resolved command name. Only pass it when we manage an on-disk binary;
+    // for the system-PATH fallback (bare 'ffmpeg', e.g. musl/Alpine) omit it
+    // and let yt-dlp find ffmpeg itself — passing 'ffmpeg' makes it look in cwd.
+    if (ffmpegPath && path.isAbsolute(ffmpegPath)) {
+      ytdlArgs.push("--ffmpeg-location", ffmpegPath);
+    }
     const noEmbedThumbnail = ['wav', 'opus', 'ogg'];
     if (!noEmbedThumbnail.includes(value.outputCodec)) {
       ytdlArgs.push("--embed-thumbnail", "--convert-thumbnails", "jpg");
@@ -143,8 +150,8 @@ export function setup(mstream) {
     });
 
     ytdl.stderr.on('data', (data) => {
-      winston.error('yt-dlp error: failed to download file - ', value.url);
-      winston.error('yt-dlp error:', data.toString());
+      winston.error(`yt-dlp error: failed to download file - ${value.url}`);
+      winston.error(`yt-dlp error: ${data.toString()}`);
     });
 
     ytdl.on('close', async (code) => {
@@ -362,9 +369,11 @@ export function setup(mstream) {
           aaFile: null,
           vpath: pathInfo.vpath,
           ts: Math.floor(Date.now() / 1000),
-          // scan_id is the scanner's sweep marker — leave NULL here so the
-          // first scan that touches this file claims the row normally. The
-          // 'ytdl' provenance signal lives in tracks.source (V36) instead.
+          // Leave scan_id NULL: the scanner stamps it only when it
+          // rewrites a row, and the first scan that walks this file
+          // claims the row normally (the stale sweep keys on the
+          // scanner's in-memory seen tracking, not this column). The
+          // 'ytdl' provenance signal lives in tracks.source (V36).
           sID: null,
           replaygainTrackDb: metadata.replaygain_track_gain ? metadata.replaygain_track_gain.dB : null,
         };
@@ -512,7 +521,7 @@ export function setup(mstream) {
       return res.status(403).json({ error: 'Uploading Disabled' });
     }
     if (!transcode.isDownloaded()) {
-      return res.status(500).json({ error: 'FFmpeg not downloaded yet' });
+      return res.status(500).json({ error: 'FFmpeg is not available yet' });
     }
 
     try {
@@ -557,7 +566,12 @@ export function setup(mstream) {
     const formatMap = { 'ogg': 'vorbis', 'm4b': 'm4a' };
     const ytdlAudioFormat = formatMap[outputCodec] || outputCodec;
     const ytdlArgs = ['-f', 'ba', '-x', sanitizedUrl, '-o', downloadDir,
-      '--ffmpeg-location', ffmpegPath, '--audio-format', ytdlAudioFormat, '--embed-metadata'];
+      '--audio-format', ytdlAudioFormat, '--embed-metadata'];
+    // See POST /ytdl/ above: only pass --ffmpeg-location for an on-disk binary;
+    // a bare 'ffmpeg' (system PATH) must be left to yt-dlp's own lookup.
+    if (ffmpegPath && path.isAbsolute(ffmpegPath)) {
+      ytdlArgs.push('--ffmpeg-location', ffmpegPath);
+    }
     const noEmbedThumbnail = ['wav', 'opus', 'ogg'];
     if (!noEmbedThumbnail.includes(outputCodec)) {
       ytdlArgs.push('--embed-thumbnail', '--convert-thumbnails', 'jpg');
