@@ -1300,6 +1300,8 @@ const MSTREAMPLAYER = (() => {
 
     // Count the play: the complete play is reported once this song is over.
     beginPlaySession(mstreamModule.playlist[position]);
+
+    App.scrollToSong();
   }
 
   // Should be called whenever the "metadata" field of the current song is changed, or
@@ -1328,6 +1330,10 @@ const MSTREAMPLAYER = (() => {
     mstreamModule.playerStats.metadata['has-lyrics'] = !!(curSong.metadata && curSong.metadata['has-lyrics']);
     mstreamModule.playerStats.metadata['has-synced-lyrics'] = !!(curSong.metadata && curSong.metadata['has-synced-lyrics']);
     mstreamModule.playerStats.metadata.filepath = curSong.rawFilePath;
+
+    mstreamModule.playerStats.metadata.bitrate = curSong.metadata && typeof curSong.metadata.bitrate === "number" ? curSong.metadata.bitrate : 0;
+    mstreamModule.playerStats.metadata["sample-rate"] = curSong.metadata && typeof curSong.metadata["sample-rate"] === "number" ? curSong.metadata["sample-rate"] : 0;
+
 
     // Auto-DJ song-change side-effects — pulled into a helper so the
     // metadata-reset flow stays focused on rendering the now-playing
@@ -1498,6 +1504,8 @@ const MSTREAMPLAYER = (() => {
       "bpm": null,
       "musical-key": null,
       "replaygain-track-db": "",
+      "bitrate": 0,
+      "sample-rate": 0
     },
     replayGain: false,
     replayGainPreGainDb: 0

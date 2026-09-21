@@ -260,6 +260,12 @@ const VUEPLAYERCORE = (() => {
         if (code && code !== String(raw).trim()) { return `${raw} (${code})`; }
         return code || String(raw);
       },
+      playlistLength: function () { return this.playlist.length; },
+      playlistDuration: function () {
+        const arr = this.playlist.map(track => track.metadata && track.metadata.duration ? track.metadata.duration : 0);
+        const duration = arr.length > 0 ? arr.reduce((total, value) => total + value) : 0;
+        return duration > 0 ? ` | ${App.formatSongDuration(duration)}` : "";
+      }
     },
     methods: {
       getSongInfo: function() {
@@ -592,26 +598,26 @@ const VUEPLAYERCORE = (() => {
     template: `
       <li v-on:click="goToSong($event)" class="noselect np-queue-item" v-bind:class="{ playError: (this.songError && this.songError === true) }">
         <span onclick="event.stopPropagation()" class="drag-handle">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="16" height="16"><path fill="#666" d="M4 7v2h24V7Zm0 8v2h24v-2Zm0 8v2h24v-2Z"/></svg>
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="20" height="32"><path fill="#666" d="M4 7v2h24V7Zm0 8v2h24v-2Zm0 8v2h24v-2Z"/></svg>
         </span>
         <img v-if="albumArt" class="np-queue-art" loading="lazy" :src="albumArt">
         <div v-else class="np-queue-art-placeholder">
           <svg xmlns="http://www.w3.org/2000/svg" height="18" viewBox="0 0 24 24" fill="#555"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
         </div>
         <div class="np-queue-info">
-          <div class="np-queue-title">{{ songTitle }}</div>
           <div class="np-queue-artist" v-if="songArtist">{{ songArtist }}</div>
+          <div class="np-queue-title">{{ songTitle }}</div>
         </div>
         <div onclick="event.stopPropagation()" class="np-queue-actions">
           <span v-on:click="createPopper($event)" class="np-queue-action pop-c" title="Rate">
             {{ratingNumber}}
-            <svg class="pop-c" width="14" height="14" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 53.867 53.867"><path class="pop-c" d="m26.934 1.318 8.322 16.864 18.611 2.705L40.4 34.013l3.179 18.536-16.645-8.751-16.646 8.751 3.179-18.536L0 20.887l18.611-2.705z" fill="#efce4a"/></svg>
+            <svg class="pop-c" width="16" height="16" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 53.867 53.867"><path class="pop-c" d="m26.934 1.318 8.322 16.864 18.611 2.705L40.4 34.013l3.179 18.536-16.645-8.751-16.646 8.751 3.179-18.536L0 20.887l18.611-2.705z" fill="#efce4a"/></svg>
           </span>
           <span v-on:click="createPopper2($event)" class="np-queue-action popperMenu pop-d" title="More">
-            <svg class="pop-d" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><path class="pop-d" fill="#aaa" d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
+            <svg class="pop-d" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path class="pop-d" fill="#aaa" d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
           </span>
           <span v-on:click="removeSong($event)" class="np-queue-action np-queue-remove" title="Remove">
-            <svg width="10" height="10" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+            <svg width="28" height="28" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
           </span>
         </div>
       </li>`,
@@ -1060,6 +1066,9 @@ const VUEPLAYERCORE = (() => {
       return;
     }
 
+    const overriden = keyDownOverride(event);
+    if (overriden) { return; }
+
     const action = MSTREAMPLAYER.hotkeys.resolve(event);
     if (!action) { return; }
     event.preventDefault();
@@ -1083,28 +1092,22 @@ const VUEPLAYERCORE = (() => {
       case 'speedUp': hotkeyStepPlaybackRate(0.25); break;
       case 'speedDown': hotkeyStepPlaybackRate(-0.25); break;
       case 'percentSeek': MSTREAMPLAYER.seekByPercentage(parseInt(event.key, 10) * 10); break;
-      case "ArrowUp":
-        event.preventDefault();
-        App.focusOnBrowserEl("prev");
-        break;
-      case "ArrowDown":
-        event.preventDefault();
-        App.focusOnBrowserEl("next");
-        break;
-      case "ArrowLeft":
-        event.preventDefault();
-        App.focusOnBrowserEl("prev");
-        break;
-      case "ArrowRight":
-        event.preventDefault();
-        App.focusOnBrowserEl("next");
-        break;
-      case "Enter":
-        event.preventDefault();
-        App.clickOnFocusedEl();
-        break;
     }
   }, false);
+
+  const keyDownOverride = (event) => {
+    switch (event.key) {
+      case "ArrowUp":
+      case "ArrowRight":
+        event.preventDefault(); App.focusOnBrowserEl("prev"); return true;
+      case "ArrowDown":
+      case "ArrowLeft":
+        event.preventDefault(); App.focusOnBrowserEl("next"); return true;
+      case "Enter":
+        event.preventDefault(); App.clickOnFocusedEl(); return true;
+      default: return false;
+    }
+  }
 
   const myRater = raterJs({
     element: document.querySelector(".my-rating"),
@@ -1208,6 +1211,19 @@ const VUEPLAYERCORE = (() => {
       }
     }
   };
+
+  mstreamModule.setSongListMetadata = async (rawFilepaths) => {
+    // response: { [rawFilePath]: { filepath: string, metadata: object } }
+    const response = await MSTREAMAPI.lookupMetadataBatch(rawFilepaths);
+
+    MSTREAMPLAYER.playlist.forEach(song => {
+      const needsMeta = typeof song.metadata === "object" && Object.keys(song.metadata).length === 0;
+      if (needsMeta && response.hasOwnProperty(song.rawFilePath)) {
+          song.metadata = response[song.rawFilePath].metadata
+      }
+    });
+    MSTREAMPLAYER.resetCurrentMetadata();
+  }
 
   // Queue a track that lives on a FEDERATED PEER. It plays through this
   // server's stream proxy (/api/v1/federation/peers/:id/stream/…), so the

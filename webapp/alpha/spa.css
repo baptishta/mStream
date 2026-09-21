@@ -1,27 +1,39 @@
 /* Responsive layout */
 html {
+  height: 100%;
+  max-height: 100%;
   overflow: hidden; /* removes all scroll bars */
 }
 
 body {
   display: flex;
   flex-direction: row;
+  flex-wrap: nowrap;
+  position: relative;
   overflow: hidden;
-  height: 100vh;
-  max-height: 100vh;
+  height: 100%;
+  max-height: 100%;
+  box-sizing: border-box;
+  padding-top: 48px;
+}
+
+body.top-bar-hidden {
+  padding-top: 0;
 }
 
 #nav-bar {
-  position: fixed;
+  position: absolute;
+  top: 0;
   left: 0;
-  bottom: 0;
   right: 0;
-  background-color: #1a1a1a;
+  display: flex;
+  align-items: center;
+  height: 48px;
+  padding: 0 12px;
   color: #F5F7FA;
-  font-size: 12px;
-  max-height: 20vh;
-  overflow: auto;
-
+  border-bottom: 1px solid #444c56;
+  background-color: #1a1a1a;
+  z-index: 1001;
 }
 
 /* mStream logo inside the top bar (left-aligned). Sized to fit the 48px bar. */
@@ -45,6 +57,18 @@ body {
   display: flex;
   align-items: center;
   gap: 12px;
+}
+
+#debug-mode-content {
+  position: fixed;
+  left: 0;
+  bottom: 0;
+  right: 0;
+  background-color: #1a1a1a;
+  color: #F5F7FA;
+  font-size: 12px;
+  max-height: 20vh;
+  overflow: auto;
 }
 
 /* ── "Hide top bar" layout state ──────────────────────────────────────────
@@ -76,16 +100,6 @@ body.top-bar-hidden .side-nav-header.sidenav-logo {
 body.top-bar-hidden .sidenav-spacer-bottom {
   display: block;
   flex-grow: 1;
-}
-
-body.top-bar-hidden #content {
-  height: calc(var(--vh, 1vh) * 100);
-}
-
-@media screen and (min-width: 768px) {
-  body.top-bar-hidden #sidenav {
-    height: calc(var(--vh, 1vh) * 100);
-  }
 }
 
 /* Shared style for icon links in the top nav-bar (GitHub, Discord, etc.) */
@@ -158,7 +172,6 @@ body.top-bar-hidden #content {
 
 #sidenav {
   background-color: #262a33;
-  /* background-color: #22272e; */
   border-right: 1px solid #444c56;
 
   overflow-y: auto;
@@ -269,7 +282,8 @@ body.top-bar-hidden #content {
 @media screen and (max-width: 768px) {
   #sidenav {
     position: fixed;
-    height: 100vh;
+    top: 0;
+    bottom: 0;
     z-index: 100000;
 
     left: -220px;
@@ -326,15 +340,7 @@ body.top-bar-hidden #content {
   }
 }
 
-@media screen and (min-width: 768px) {
-  #sidenav {
-    /* height: calc(calc(var(--vh, 1vh) * 100) - 48px);
-    overflow-y: auto; */
-    /* flex-grow: 0; */     /* do not grow   - initial value: 0 */
-    /* flex-shrink: 0; */  /* do not shrink - initial value: 1 */
-    /* flex-basis: 240px;*/ /* width/height  - initial value: auto */
-  }
-
+@media screen and (min-width: 769px) {
   #sidenav-cover {
     visibility: hidden;
   }
@@ -402,6 +408,7 @@ body.top-bar-hidden #content {
   display: flex;
   align-items: center;
   font-weight: bold;
+  padding-left: 6px;
 }
 
 .side-nav-header button {
@@ -496,11 +503,10 @@ body.top-bar-hidden #content {
 }
 
 #filelist {
-  overflow-y: auto !important;
-  margin: 0 !important;
-  flex-grow: 1;
   display: flex;
+  flex-grow: 1;
   flex-direction: column;
+  overflow: hidden;
   background-color: #1a1a1a;
 }
 
@@ -580,11 +586,12 @@ body.top-bar-hidden #content {
 .np-queue-item {
   display: flex;
   align-items: center;
-  padding: 6px 8px;
-  gap: 10px;
+  padding: 4px 4px;
+  gap: 4px;
   border-bottom: 1px solid rgba(255,255,255,.06);
   cursor: pointer;
-  transition: background .12s;
+  background-color: #1e2228;
+  transition: background-color .12s;
 }
 
 .np-queue-item:hover {
@@ -594,7 +601,7 @@ body.top-bar-hidden #content {
 .np-queue-active {
   background: rgba(100,126,228,.15) !important;
   border-left: 3px solid #657ee4;
-  padding-left: 5px;
+  padding-left: 4px;
 }
 
 .np-queue-art {
@@ -622,7 +629,7 @@ body.top-bar-hidden #content {
 }
 
 .np-queue-title {
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 500;
   color: #eee;
   overflow: hidden;
@@ -632,8 +639,8 @@ body.top-bar-hidden #content {
 }
 
 .np-queue-artist {
-  font-size: 11px;
-  color: #888;
+  font-size: 14px;
+  color: #ababab;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -652,11 +659,11 @@ body.top-bar-hidden #content {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: auto;
+  height: auto;
   border-radius: 50%;
   cursor: pointer;
-  transition: background .12s;
+  transition: background-color .12s;
 }
 
 .np-queue-action:hover {
@@ -676,7 +683,7 @@ body.top-bar-hidden #content {
   border: none;
   float: none;
   min-width: unset !important;
-  height: 28px;
+  height: auto;
   padding: 0;
   font-size: unset;
   border-radius: 50%;
@@ -883,7 +890,7 @@ body.top-bar-hidden #content {
   cursor: pointer;
   font-size: 13px;
   color: #ddd;
-  transition: background .12s;
+  transition: background-color .12s;
 }
 
 .pop-list-item:hover {
@@ -918,7 +925,6 @@ body.top-bar-hidden #content {
 .drag-handle {
   display: block;
   cursor: move;
-  padding-right: 6px;
 }
 
 .drag-handle svg {
@@ -1128,8 +1134,15 @@ svg {
   overflow: hidden;
   color: #ccc;
 }
-#directoryName--last {
+#directoryName .filepath-html--last {
   color: #fff;
+}
+.filepath-html {
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+}
+.filepath-html--last {
   font-weight: bold;
 }
 
@@ -1327,7 +1340,7 @@ select {
   border-radius: 8px;
   overflow: hidden;
   background: rgba(255,255,255,.04);
-  transition: background .15s, transform .1s;
+  transition: background-color .15s, transform .1s;
   user-select: none;
   -webkit-tap-highlight-color: transparent;
 }
@@ -2021,8 +2034,7 @@ select {
    dressed as .autodj-select so the two "how much" controls at the top
    of the panel match. Native spinners stay: step=1 is meaningful here. */
 .dj-limit-num {
-  width: 5.5em;
-  min-width: 0;
+  min-width: 60px;
   text-align: center;
   cursor: text;
 }
@@ -2488,17 +2500,14 @@ body.on-federated-server .side-nav-note {
   color: #999;
   font-weight: 400;
 }
-}
 
 /* Added styles by baptishta */
 
 #debug-mode-checkbox {
-  position: relative;
-  display: inline-block;
+  position: static;
   opacity: 1;
   pointer-events: auto;
-  margin-right: 18px;
-  margin-left: 10px;
+  margin: 0px 10px;
 }
 
 #debug-mode-checkbox-label {
@@ -2569,6 +2578,29 @@ body.on-federated-server .side-nav-note {
   background-color: #2ab7a9;
 }
 
+.content-list-scrollable-inner {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  overflow: auto;
+}
+
+#song-controls .card .card-content {
+  padding: 10px;
+}
+
+#playback-controls-song-info {
+  display: none;
+  font-size: 12px;
+  text-align: center;
+}
+
+#browser [type="checkbox"]+span:not(.lever) {
+  padding-left: 24px;
+}
+
 .orientation--landscape #playlist-buttons a {
   padding-top: 0;
   padding-bottom: 0;
@@ -2587,6 +2619,15 @@ body.on-federated-server .side-nav-note {
 .orientation--landscape.view--small #song-controls {
     width: auto;
     margin: 0;
+}
+
+.orientation--landscape #playback-controls-wrapper {
+    flex-direction: column;
+}
+
+.orientation--landscape #playback-controls-song-info,
+.view--small #playback-controls-song-info {
+  display: block;
 }
 
 .orientation--landscape #hamburger-menu {

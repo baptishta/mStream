@@ -55,7 +55,11 @@ const App = (function() {
     }
   }
 
-  const scrollIntoViewIfNeeded = el => typeof el.scrollIntoViewIfNeeded === "function" && el.scrollIntoViewIfNeeded();
+  const scrollIntoViewIfNeeded = el => {
+    try {
+      typeof el.scrollIntoViewIfNeeded === "function" && el.scrollIntoViewIfNeeded();
+    } catch (e) { boilerplateFailure(e) }
+  }
 
   const keepCollectionItemInView = (element) => {
     if (!element.classList.contains("collection-item")) { return false; }
@@ -96,13 +100,12 @@ const App = (function() {
 
   const scrollToSong = () => {
     requestAnimationFrame(() => { 
+      if (MSTREAMPLAYER.playlist.length === 0) { return; }
       const playlistEl = document.getElementById('playlist');
       const nowPlayingBtn = document.getElementById('now-playing-tab-btn');
-      if (playlistEl !== null && ( (App.getView() === App.Views.SMALL && nowPlayingBtn.classList.contains('selected-tab')) || (App.getView() !== App.Views.SMALL) )) {
-        const playItem = playlistEl.getElementsByClassName('playing')[0];
-        if (playItem) {
-          scrollIntoViewIfNeeded(playItem);
-        }
+      if ((App.getView() === App.Views.SMALL && nowPlayingBtn.classList.contains('selected-tab')) || (App.getView() !== App.Views.SMALL)) {
+        const playItem = playlistEl.getElementsByClassName('np-queue-active')[0];
+        scrollIntoViewIfNeeded(playItem);
       }
     });
   };
@@ -128,8 +131,8 @@ const App = (function() {
     contentListEl.appendChild(content);
     content.innerHTML = `event.key: "${e.key}"; event.code: "${e.code}"; event.keyCode: "${e.keyCode}";`;
 
-    const navBarEl = document.getElementById("nav-bar");
-    navBarEl.scrollTop = navBarEl.scrollHeight;
+    const debugContentEl = document.getElementById("debug-mode-content");
+    debugContentEl.scrollTop = debugContentEl.scrollHeight;
   }
 
   let focusedEl = undefined;
@@ -194,6 +197,23 @@ const App = (function() {
     }
   }
 
+  function formatSongDuration(totalSeconds) {
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = Math.floor(totalSeconds % 60);
+
+    if (hours > 0) {
+      return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    }
+    return `${minutes}:${String(seconds).padStart(2, '0')}`;
+  }
+
+  const formatFilePathToHTML = (path) => {
+    const arr = path.replaceAll("/", "/<wbr>").split(/(?<=\/<wbr>)/);
+    arr[arr.length-1] = `<span class="filepath-html--last">${arr[arr.length-1]}</span>`;
+    return `<div class="filepath-html">${arr.join("")}</div>`
+  }
+
   return {
     init,
     getView,
@@ -204,7 +224,9 @@ const App = (function() {
     clickOnFocusedEl, //Enter keydown event
     getFocusedEl: () => focusedEl,
     getFocusableElements: () => focusableElements,
-    setFocusableElements
+    setFocusableElements,
+    formatSongDuration,
+    formatFilePathToHTML
   };
 })();
 

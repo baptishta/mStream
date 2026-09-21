@@ -239,6 +239,21 @@ function queueRow(peer, filepath, metadata, position) {
   VUEPLAYERCORE.addSongWizard(filepath, meta, !hasMeta, position);
 }
 
+async function queueMultipleRows(filez) { 
+  filez.filter(file => file.peer).forEach(file => queueRow(file.peer, file.filepath, file.metadata, file.position));
+  
+  const nonPeerFilepaths = filez.filter(file => !file.peer).map(async (file) => {
+    try {
+      await VUEPLAYERCORE.addSongWizard(file.filepath, file.metadata, false, file.position);
+      return file.filepath;
+    } catch (e) { boilerplateFailure(e) }
+  });
+  try {
+    const rawFilepaths = await Promise.all(nonPeerFilepaths);
+    VUEPLAYERCORE.setSongListMetadata(rawFilepaths);
+  } catch (e) { boilerplateFailure(e) }
+}
+
 const entityMap = {
   '&': '&amp;',
   '<': '&lt;',
@@ -439,22 +454,8 @@ async function senddir(root) {
       ? await MSTREAMAPI.peer.dirparser(peerContext.id, directoryString)
       : await MSTREAMAPI.dirparser(directoryString);
     if (gen !== browseGeneration) { return; }
-    // document.getElementById('directoryName').innerHTML = escapeHtml(response.path);
 
-    // const formattedPath = response.path.replaceAll("/", "/<wbr>");
-    // document.getElementById('directoryName').innerHTML = formattedPath;
-
-    const arr = response.path.split(/(\/)/);
-    arr.shift();
-    arr.pop();
-    arr.forEach((item, i) => {
-      if (item === "/") {
-        arr[i] = "/<wbr>"
-      }
-    })
-    arr[arr.length-2] = `<span id="directoryName--last">${arr[arr.length-2]}</span>`;
-
-    document.getElementById('directoryName').innerHTML = arr.join("");
+    document.getElementById('directoryName').innerHTML = App.formatFilePathToHTML(response.path);
 
     if(root === true && response.path.length > 1) {
       fileExplorerArray.push(response.path.replaceAll('/', ''));
@@ -556,8 +557,7 @@ function handleDirClick(el){
 }
 
 function boilerplateFailure(err) {
-  console.log(err);
-  let msg = t('error.callFailed');
+  let msg = err.message;
   // TODO: Check this
   if (err.responseJSON && err.responseJSON.error) {
     msg = err.responseJSON.error;
@@ -569,6 +569,8 @@ function boilerplateFailure(err) {
     position: 'topCenter',
     timeout: 3500
   });
+  
+  throw err;
 }
 
 function onFileClick(el) {
@@ -628,7 +630,15 @@ async function recursiveAddDir(el) {
     const res = peer
       ? await MSTREAMAPI.peer.recursiveScan(peer.id, directoryString)
       : await MSTREAMAPI.recursiveScan(directoryString);
-    res.forEach(fp => queueRow(peer, fp));
+
+    const filez = res.map(filepath => { 
+      return {
+        peer: peer,
+        filepath: filepath,
+        metadata: {}
+      };
+    });
+    queueMultipleRows(filez);
   } catch(err) {
     boilerplateFailure(err);
   }
@@ -671,9 +681,14 @@ async function addFilePlaylist(el) {
 }
 
 function addAll() {
-  ([...document.getElementsByClassName('filez')]).forEach(el => {
-    queueRow(peerOf(el), el.getAttribute("data-file_location"));
+  const filez = [...document.getElementsByClassName('filez')].map(el => { 
+    return {
+      peer: peerOf(el),
+      filepath: el.getAttribute("data-file_location"),
+      metadata: {}
+    }
   });
+  queueMultipleRows(filez);
 }
 
 function addAllSongs(res) {
@@ -1716,7 +1731,7 @@ function setupAddTorrentPanel() {
   const showVpathPicker = vpaths.length > 1;
 
   const newHtml = `
-    <div class="add-torrent-panel" style="max-width:680px;padding:18px;color:#fff;">
+    <div class="add-torrent-panel content-list-scrollable-inner" style="max-width:680px;padding:18px;color:#fff;">
 
       <!-- Feature-status banner — populated by the preflight call
            below. Hidden until preflight resolves; if the torrent
@@ -3287,6 +3302,8 @@ async function getAllGenres() {
     html += '</ul>';
 
     document.getElementById('filelist').innerHTML = html;
+
+    App.setFocusableElements();
   } catch(err) {
     document.getElementById('filelist').innerHTML = `<div>${t('error.serverCallFailed')}</div>`;
   }
@@ -3325,6 +3342,8 @@ async function getGenreSongs(genre) {
     songs += '</ul>';
 
     document.getElementById('filelist').innerHTML = songs;
+
+    App.setFocusableElements();
   } catch(err) {
     document.getElementById('filelist').innerHTML = `<div>${t('error.serverCallFailed')}</div>`;
   }
@@ -3358,7 +3377,7 @@ async function getAllAlbums() {
     });
     albums += '</div>'
 
-    document.getElementById('filelist').innerHTML = albums;
+    document.getElementById('filelist').innerHTML = `<div class="content-list-scrollable-inner">${albums}</div>`;
 
     App.setFocusableElements();
   }catch (err) {
@@ -3640,7 +3659,7 @@ function setupTranscodePanel(){
   }
 
   document.getElementById('filelist').innerHTML = `
-    <div class="browser-panel">
+    <div class="browser-panel content-list-scrollable-inner">
       <div>
         <label for="enable_transcoding_locally">
           <input type="checkbox" class="filled-in" onchange="toggleTranscoding(this);" id="enable_transcoding_locally" 
@@ -3719,6 +3738,7 @@ async function getMobilePanel(){
   setBrowserRootPanel(t('panel.mobileApps'), false);
 
   const html = `
+    <div class="content-list-scrollable-inner">
     <div class="mobile-links pad-6">
       <a target="_blank" href="https://play.google.com/store/apps/details?id=mstream.music&pcampaignid=MKT-Other-global-all-co-prtnr-py-PartBadge-Mar2515-1">
         <img alt='Get it on Google Play' src='https://play.google.com/intl/en_us/badges/images/generic/en_badge_web_generic.png'/>
@@ -3736,7 +3756,8 @@ async function getMobilePanel(){
     <div class="pad-6">
       <a target="_blank" href="/qr"><b>Checkout the QR Code tool to help add your server to the app</b></a>
     </div>
-    -->`;
+    -->
+    </div>`;
 
   document.getElementById('filelist').innerHTML = html;
 }
@@ -4604,7 +4625,7 @@ async function autoDjPanel() {
     </div>`;
 
   const html = `
-    <div class="pad-6 autodj-root">
+    <div class="pad-6 autodj-root content-list-scrollable-inner">
       <div class="autodj-hero">
         <h2>${t('panel.autoDJ')}</h2>
         <p class="autodj-hero-desc">${t('autoDJ.heroDescription')}</p>
@@ -5164,7 +5185,7 @@ function setupJukeboxPanel() {
     newHtml = createJukeboxPanel();
   } else {
     newHtml = `
-      <div class="pad-6">
+      <div class="pad-6 content-list-scrollable-inner">
         <h5>${t('jukebox.title')}</h5>
         <p style="color:#aaa;">${t('jukebox.description')}</p>
         <input class="btn green" value="${t('jukebox.connect')}" type="button" onclick="connectToJukeBox(this)">
@@ -5430,6 +5451,8 @@ async function submitSearchForm() {
     // server's results are already on screen, so a slow or dead peer costs
     // nothing but its own block.
     if (fanOut) { searchPeers(postObject, searchGen); }
+
+    App.setFocusableElements();
   }catch(err) {
     boilerplateFailure(err);
   }
@@ -5460,9 +5483,11 @@ function renderSearchResults(res, peer) {
 function renderSearchRow(key, value, peer) {
   const attr = peerAttr(peer || null);
   const isTrack = key === 'files' || key === 'title' || key === 'lyrics';
+  const valueName = key === 'files' ? App.formatFilePathToHTML(value.name) : escapeHtml(value.name);
+
   return `<li class="collection-item">
-    <div onclick="${searchMap[key].func}(this);" data-${searchMap[key].data}="${escapeHtml(value.filepath ? value.filepath : value.name)}"${attr} class="${searchMap[key].class} left">
-      <b>${searchMap[key].name}:</b> ${escapeHtml(value.name)}${key === 'lyrics' && value.snippet ? `<br><small class="grey-text">${escapeHtml(value.snippet)}</small>` : ''}
+    <div onclick="${searchMap[key].func}(this);" data-${searchMap[key].data}="${escapeHtml(value.filepath ? value.filepath : value.name)}"${attr} class="${searchMap[key].class}">
+      <b>${searchMap[key].name}:&nbsp;</b>${valueName}${key === 'lyrics' && value.snippet ? `<br><small class="grey-text">${escapeHtml(value.snippet)}</small>` : ''}
     </div>
     ${isTrack ? `<div class="song-button-box">
       <span title="Play Now" onclick="searchPlayNow(this);" data-file_location="${escapeHtml(value.filepath)}"${attr} class="songDropdown">
@@ -5737,7 +5762,7 @@ function setupLayoutPanel() {
   programState = [{ state: 'layout' }];
 
   const newHtml = `
-    <div>
+    <div class="content-list-scrollable-inner">
       <div class="switch">
         <label>
           <input onchange="tglBookCtrls(this);" type="checkbox" ${VUEPLAYERCORE.altLayout.audioBookCtrls === true ? 'checked' : ''}>

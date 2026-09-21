@@ -356,6 +356,10 @@ const MSTREAMAPI = (() => {
     return req('POST', mstreamModule.currentServer.host + "api/v1/db/metadata", { filepath: filepath });
   }
 
+  mstreamModule.lookupMetadataBatch =  (filepaths) => {
+    return req('POST', mstreamModule.currentServer.host + "api/v1/db/metadata/batch", filepaths);
+  }
+
   mstreamModule.getRandomSong =  (postObject, opts) => {
     return req('POST', mstreamModule.currentServer.host + "api/v1/db/random-songs", postObject, opts);
   }

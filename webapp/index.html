@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" meta name="viewport" content="width=device-width, initial-scale=1.0">
 
 <head>
   <meta charset="utf-8">
@@ -104,7 +104,7 @@
           <div class="hystmodal__styled">
             <h5 data-i18n="sonicPath.saveAsPlaylist">Save as Playlist</h5>
             <form action="javascript:sonicPathSavePlaylist()">
-              <input id="spath_playlist_name" autocomplete="off" type="text" required placeholder="Enter your playlist name" pattern="[a-zA-Z0-9 _-]+" data-i18n="playlist.namePlaceholder" data-i18n-attr="placeholder">
+              <input id="spath_playlist_name" autocomplete="off" type="text" required placeholder="Enter your playlist name" pattern="[a-zA-Z0-9\s_\-]+" data-i18n="playlist.namePlaceholder" data-i18n-attr="placeholder">
               <button type="submit" class="button2" data-i18n="modal.save">Save</button>
             </form>
           </div>
@@ -183,7 +183,7 @@
         <div class="hystmodal__styled">
           <h5 data-i18n="modal.savePlaylist">Save Playlist</h5>
           <form action="javascript:savePlaylist()">
-            <input id="playlist_name" autocomplete="off" type="text" required placeholder="Enter your playlist name" pattern="[a-zA-Z0-9 _-]+" data-i18n="playlist.namePlaceholder" data-i18n-attr="placeholder">
+            <input id="playlist_name" autocomplete="off" type="text" required placeholder="Enter your playlist name" pattern="[a-zA-Z0-9\s_\-]+" data-i18n="playlist.namePlaceholder" data-i18n-attr="placeholder">
             <input id="save_playlist" type="submit" class="btn green" value="Save Playlist" data-i18n="playlist.saveButton" data-i18n-attr="value">
           </form>
         </div>
@@ -251,7 +251,7 @@
         <div class="hystmodal__styled">
           <h5 data-i18n="modal.newPlaylist">New Playlist</h5>
           <form id="newPlaylistForm" action="javascript:newPlaylist()">
-            <input autocomplete="off" id="new_playlist_name" type="text" required placeholder="Enter your playlist name" pattern="[a-zA-Z0-9 _-]+" data-i18n="playlist.namePlaceholder" data-i18n-attr="placeholder">
+            <input autocomplete="off" id="new_playlist_name" type="text" required placeholder="Enter your playlist name" pattern="[a-zA-Z0-9\s_\-]+" data-i18n="playlist.namePlaceholder" data-i18n-attr="placeholder">
             <input id="new_playlist" type="submit" class="btn green" value="Create Playlist" data-i18n="playlist.createButton" data-i18n-attr="value">
           </form>
         </div>
@@ -722,8 +722,8 @@
               </div>
             </div>
           </div>
-
         </div>
+        <div id="playback-controls-song-info">{{ (meta.bitrate/1000) }}kbps | {{ (meta["sample-rate"]/1000) }}KHz</div>
       </div>
       <div id="song-controls" class="col s12 m8 l9">
         <div v-if="altLayout.moveMeta === false" id="song-data" class="card data-card hide-on-small-only">
@@ -755,6 +755,7 @@
             <p v-if="meta['has-lyrics']" style="margin-top:6px;">
               <span class="lyrics-chip" role="button" tabindex="0" v-on:click="openLyrics" style="display:inline-block;padding:3px 12px;border-radius:12px;background:#2196f3;color:#fff;cursor:pointer;font-size:0.85em;" data-i18n="metadata.lyricsTag">Lyrics</span>
             </p>
+            <p>{{ (meta.bitrate/1000) }}kbps | {{ (meta["sample-rate"]/1000) }}KHz</p>
           </div>
         </div>
         <div class="progress-wrapper">
@@ -854,9 +855,7 @@
   
       <div id="playlist" class="content-list">
         <div class="header-tab">
-          <div class="show-on-medium-and-up">
-            <h5 class="content-list-title" data-i18n="nav.nowPlaying">Playlist:</h5>
-          </div>
+          <div id="playlist-stats">Tracks: {{ playlistLength }}{{ playlistDuration }}</div>
           <div class="flex grow flex-end" id="playlist-buttons">
             <a title="Live Playlist" data-i18n="tooltip.livePlaylist" data-i18n-attr="title" onclick="openLivePlaylistModal();">
               <svg xmlns="http://www.w3.org/2000/svg" v-bind:class="{ 'aux-button-active': livePlaylist.name }"  xml:space="preserve" width="25" height="25" viewBox="0 0 512 512"><path d="M48 64h160c17.672 0 32-14.328 32-32 0-17.674-14.328-32-32-32H48C30.328 0 16 14.326 16 32c0 17.672 14.328 32 32 32zM48 160h160c17.672 0 32-14.328 32-32 0-17.674-14.328-32-32-32H48c-17.672 0-32 14.326-32 32 0 17.672 14.328 32 32 32zM240 224c0-17.674-14.328-32-32-32H48c-17.672 0-32 14.326-32 32 0 17.672 14.328 32 32 32h160c17.672 0 32-14.328 32-32z"/><path d="M411.328 75.914C393.043 61.805 368 42.477 368 32c0-17.672-14.328-32-32-32s-32 14.328-32 32v293.58c-10.023-3.549-20.762-5.58-32-5.58-53.02 0-96 42.98-96 96s42.98 96 96 96 96-42.98 96-96V123.293c1.414 1.094 2.82 2.203 4.23 3.293 36.105 27.852 59.77 48.078 59.77 74.305 0 40.766-21.684 63.516-22.305 64.164-12.672 12.32-12.961 32.578-.641 45.25 6.273 6.453 14.605 9.695 22.949 9.695 8.035 0 16.082-3.008 22.301-9.055 4.27-4.148 41.695-42.484 41.695-110.055.001-59.64-46.948-95.867-84.671-124.976z"/></svg>
@@ -1107,14 +1106,7 @@
     </div>
   </div>
 
-  <div id="nav-bar">
-    <div style="display: none;">
-      <a target="_blank" href="https://github.com/IrosTheBeggar/mStream">Github</a>
-    </div>
-    <div id="scan-status"></div>
-    <div id="scan-status-files"></div>
-    <div id="debug-mode-content"></div>
-  </div>
+  <div id="debug-mode-content"></div>
   
   <div id="hamburger-menu" class="fixed-action-btn responsive-hide">
     <a id="hamburger-btn" class="btn-floating btn-large blue-grey darken-1" onclick="toggleSideMenu()">
