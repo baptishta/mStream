@@ -931,7 +931,7 @@ body.top-bar-hidden .sidenav-spacer-bottom {
   display: block;
 }
 
-.removeSong, .deletePlaylist, .removePlaylistSong{
+.removeSong, .deletePlaylist, .removePlaylistSong, .renamePlaylist {
   cursor: pointer;
   min-width: 28px !important;
   height: 14px;
@@ -943,21 +943,29 @@ body.top-bar-hidden .sidenav-spacer-bottom {
   opacity: 0.9;
 }
 
+.renamePlaylist {
+  background-color: #8f7139;
+}
+
 .removeSong {
   min-width: 36px !important;
   height: 100%;
 }
 
-.removeSong:hover, .deletePlaylist:hover, .removePlaylistSong:hover{
+.removeSong:hover, .deletePlaylist:hover, .removePlaylistSong:hover {
   opacity: 1;
   background-color: 	rgba(255,0,0, .85);
 }
 
-.deletePlaylist, .removePlaylistSong {
+.renamePlaylist:hover {
+  background-color: #a37e38;
+}  
+
+.deletePlaylist, .removePlaylistSong, .renamePlaylist {
+  height: auto;
   line-height: 100% !important;
-  padding-left: 7px;
-  padding-right: 7px;
-  border-bottom-left-radius: 3px;
+  padding: 3px 7px;
+  border-radius: 0 0 3px 3px;
 }
 
 .downloadPlaylistSong, .recursiveAddDir, .addFileplaylist {

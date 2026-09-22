@@ -96,7 +96,13 @@ var fileExplorerArray = [];
 // Stores an array of searchable objects
 var currentBrowsingList = [];
 // This variable tracks the state of the explorer column
-var programState = [];
+// let programState = [];
+observeArrayProperty(
+  window,
+  "programState",
+  [],
+  App.programStateOnChange
+);
 
 let curFileTracker;
 
@@ -435,58 +441,90 @@ function setBrowserRootPanel(panelName, showBar) {
 ///////////////// File Explorer
 function loadFileExplorer() {
   setBrowserRootPanel(t('panel.fileExplorer'));
-  programState = [{ state: 'fileExplorer' }];
-
   // Reset file explorer vars
   fileExplorerArray = [];
-  //send this directory to be parsed and displayed
+  programState = [{ state: 'fileExplorer' }];
+
   senddir(true);
 }
 
-async function senddir(root) {
+async function senddir(root, backState) {
   // Construct the directory string
-  const directoryString = root === true ? '~' : getFileExplorerPath();
+  const directoryStringRequest = root === true ? '~' : getFileExplorerPath();
+  const cachedContent = App.fileExplorerCache.get(directoryStringRequest);
+
+  if (!backState) {
+    if (cachedContent === undefined) {
+      await getDir(root, directoryStringRequest);
+    } else {
+      programState.push({
+          state: 'fileExplorer',
+          previousScroll: 0,
+          previousSearch: '',
+          content: cachedContent
+      });
+    }
+  }
+  const currentStatePaths = App.getStatePaths(programState, programState[programState.length-1]);
+
+  document.getElementById('directoryName').innerHTML = App.formatFilePathToHTML(currentStatePaths.path);
+      
+  // Show upload and mkdir buttons only when inside a vpath (not at root)
+  const uploadBtn = document.getElementById('upload_btn');
+  const mkdirBtn = document.getElementById('mkdir_btn');
+  // Both are writes, and a federation key carries no write permission —
+  // the peer's allowlist stops at reads, so never offer them there.
+  if (fileExplorerArray.length > 0 && !peerContext) {
+    uploadBtn.classList.remove('super-hide');
+    if (MSTREAMAPI.currentServer.noMkdir === true) {
+      mkdirBtn.classList.add('super-hide');
+    } else {
+      mkdirBtn.classList.remove('super-hide');
+    }
+  } else {
+    uploadBtn.classList.add('super-hide');
+    mkdirBtn.classList.add('super-hide');
+  }
+
+  printdir(programState[programState.length-1].content);
+}
+
+async function getDir(root, directoryStringRequest) {
+  let response;
   document.getElementById('filelist').innerHTML = getLoadingSvg();
 
   const gen = browseGeneration;
   try {
-    const response = peerContext
-      ? await MSTREAMAPI.peer.dirparser(peerContext.id, directoryString)
-      : await MSTREAMAPI.dirparser(directoryString);
-    if (gen !== browseGeneration) { return; }
+    response = peerContext
+      ? await MSTREAMAPI.peer.dirparser(peerContext.id, directoryStringRequest)
+      : await MSTREAMAPI.dirparser(directoryStringRequest);
+  } catch(err) { boilerplateFailure(err); }
 
-    document.getElementById('directoryName').innerHTML = App.formatFilePathToHTML(response.path);
+  if (gen !== browseGeneration) { return; }
 
-    if(root === true && response.path.length > 1) {
-      fileExplorerArray.push(response.path.replaceAll('/', ''));
-      programState.push({
-        state: 'fileExplorer',
-        previousScroll: 0,
-        previousSearch: ''
-      });
+  const state = {
+    state: 'fileExplorer',
+    previousScroll: 0,
+    previousSearch: '',
+    content: {
+      path: getFileExplorerPath(),
+      files: response.files,
+      directories: response.directories
     }
-
-    // Show upload and mkdir buttons only when inside a vpath (not at root)
-    const uploadBtn = document.getElementById('upload_btn');
-    const mkdirBtn = document.getElementById('mkdir_btn');
-    // Both are writes, and a federation key carries no write permission —
-    // the peer's allowlist stops at reads, so never offer them there.
-    if (fileExplorerArray.length > 0 && !peerContext) {
-      uploadBtn.classList.remove('super-hide');
-      if (MSTREAMAPI.currentServer.noMkdir === true) {
-        mkdirBtn.classList.add('super-hide');
-      } else {
-        mkdirBtn.classList.remove('super-hide');
-      }
-    } else {
-      uploadBtn.classList.add('super-hide');
-      mkdirBtn.classList.add('super-hide');
-    }
-
-    printdir(response);
-  } catch(err) {
-    boilerplateFailure(err);
   }
+
+  if (root === true) {
+    if (response.path.length > 1) {
+      fileExplorerArray.push(response.path.replaceAll('/', ''));
+    }
+    state.content.path = getFileExplorerPath();
+    programState = [state];
+  } else {
+    programState.push(state);
+  }
+  App.fileExplorerCache.set(state.content.path, state.content);
+
+  return state;
 }
 
 // function that will receive JSON array of a directory listing.  It will then make a list of the directory and tack on classes for functionality
@@ -548,11 +586,6 @@ if (typeof(Storage) !== "undefined" && localStorage.getItem("token")) {
 function handleDirClick(el){
   adoptPeer(el);
   fileExplorerArray.push(el.getAttribute('data-directory'));
-  programState.push({
-    state: 'fileExplorer',
-    previousScroll: document.getElementById('filelist').scrollTop,
-    previousSearch: document.getElementById('localSearchBar').value
-  });
   senddir();
 }
 
@@ -812,7 +845,7 @@ async function init() {
     localStorage.removeItem('trans-algo-select');
   } catch (e) {}
 
-  try{
+  try {
     if (typeof serverAudioMode === 'undefined' || serverAudioMode !== true) {
       VUEPLAYERCORE.livePlaylist.name = localStorage.getItem('live-playlist-auto-start') ? localStorage.getItem('live-playlist-auto-start') : false;
     }
@@ -833,8 +866,12 @@ async function init() {
       document.getElementById('live-playlist-hide-these').hidden = true;
     }
 
-  }catch(err) {}
+  } catch (err) {}
+
+  window.addEventListener("popstate", historyPopstateHandler);
 }
+
+const historyPopstateHandler = event => { onBackButton(event); }
 
 // Scan progress display moved to webapp/alpha/scan-progress.js — that
 // poller hits /api/v1/scan/progress unconditionally on a 3s interval and
@@ -2803,8 +2840,9 @@ function toggleLocalSearch(forceToggle) {
   }
 }
 
-async function onBackButton() {
+async function onBackButton(event) {
   if (programState.length < 2) {
+    App.historyPushState(programState);
     return;
   }
 
@@ -2825,7 +2863,7 @@ async function onBackButton() {
     await getGenreSongs(backState.name);
   } else if (backState.state === 'fileExplorer') {
     fileExplorerArray.pop();
-    await senddir();
+    await senddir(undefined, backState);
   } else if (backState.state === 'searchPanel') {
     setupSearchPanel(backState.searchTerm, undefined);
   }
@@ -3005,7 +3043,9 @@ async function onPlaylistClick(el) {
       files += renderFileWithMetadataHtml(value.filepath, value.lokiId, value.metadata);
     });
 
-    document.getElementById('filelist').innerHTML = files;
+    document.getElementById('filelist').innerHTML = `<ul class="collection">${files}</ul>`;
+
+    App.setFocusableElements();
   }catch(err) {
     document.getElementById('filelist').innerHTML = `<div>${t('error.serverCallFailed')}</div>`;
     boilerplateFailure(response, error);

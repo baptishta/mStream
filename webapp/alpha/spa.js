@@ -214,6 +214,44 @@ const App = (function() {
     return `<div class="filepath-html">${arr.join("")}</div>`
   }
 
+  const getStatePaths = (_programState, currentState) => {
+    const isFileExplorerPath = currentState.state === "fileExplorer" && currentState.content !== undefined;
+    const currentStatePath = isFileExplorerPath ? currentState.content.path : _programState.map(item => item.name || item.state).join("/");
+    const currentStatePathURL = isFileExplorerPath ? `#fileExplorer/${currentStatePath}` : `#${currentStatePath}`
+    return {
+      path: currentStatePath,
+      pathURL: currentStatePathURL
+    }
+  }
+
+  const historyPushState = (_programState) => {
+    const currentState = _programState[_programState.length-1];
+    const currentStatePaths = getStatePaths(_programState, currentState);
+    const historyObj = { state: currentState.state, path: currentStatePaths.path };
+    try {
+      window.history.pushState(historyObj, historyObj.state, currentStatePaths.pathURL);
+    } catch (e) { boilerplateFailure(e) }
+
+    console.log(history.state);
+  }
+
+  //refer to: function observeArrayProperty(...); change.type: "reassignment" | "mutation"
+  const programStateOnChange = change => {
+    if (change.type === "mutation") {
+      //arr.pop()
+      if (!change.newValue || change.key === "length") {
+        return;
+      }
+    //change.type === "reassignment"
+    } else {
+      if (JSON.stringify(change.newValue) === JSON.stringify(change.oldValue)) {
+        return;
+      }
+    }
+
+    historyPushState(programState);
+  }
+
   return {
     init,
     getView,
@@ -226,7 +264,11 @@ const App = (function() {
     getFocusableElements: () => focusableElements,
     setFocusableElements,
     formatSongDuration,
-    formatFilePathToHTML
+    formatFilePathToHTML,
+    programStateOnChange,
+    historyPushState,
+    getStatePaths,
+    fileExplorerCache: new Map()
   };
 })();
 
@@ -272,7 +314,7 @@ function changeView(fn, el){
   closeSideMenu();
 
   toggleLocalSearch(false);
-
+  
   fn();
 }
 
@@ -288,3 +330,111 @@ function toggleThing(el, tabElId) {
 
   App.scrollToSong();
 }
+
+function observeArrayProperty(object, property, initialValue, onChange) {
+  let value;
+
+  function makeArray(array) {
+    let proxy;
+
+    const target = [...array];
+
+    proxy = new Proxy(target, {
+      set(target, key, newValue, receiver) {
+        const oldValue = target[key];
+
+        const result = Reflect.set(
+          target,
+          key,
+          newValue,
+          receiver
+        );
+
+        if (oldValue !== newValue) {
+          onChange({
+            type: "mutation",
+            property,
+            key,
+            oldValue,
+            newValue,
+            array: proxy
+          });
+        }
+
+        return result;
+      },
+
+      deleteProperty(target, key) {
+        const oldValue = target[key];
+        const result = Reflect.deleteProperty(target, key);
+
+        if (result) {
+          onChange({
+            type: "mutation",
+            property,
+            key,
+            oldValue,
+            array: proxy
+          });
+        }
+
+        return result;
+      }
+    });
+
+    return proxy;
+  }
+
+  value = makeArray(initialValue);
+
+  Object.defineProperty(object, property, {
+    enumerable: true,
+    configurable: true,
+
+    get() {
+      return value;
+    },
+
+    set(newValue) {
+      if (!Array.isArray(newValue)) {
+        throw new TypeError(`${property} must be an array`);
+      }
+
+      const oldValue = value;
+      value = makeArray(newValue);
+
+      onChange({
+        type: "reassignment",
+        property,
+        oldValue,
+        newValue: value
+      });
+    }
+  });
+}
+//Usage:
+/*
+const obj = {
+  name: "test"
+};
+
+observeArrayProperty(
+  obj,
+  "arr",
+  [1, 2],
+  change => {
+    console.log("Changed:", change);
+  }
+);
+
+obj.arr = [3, 4];
+// → type: "reassignment"
+obj.arr.push(5);
+// → type: "mutation", key: "2"
+obj.arr[0] = 100;
+// → type: "mutation", key: "0"
+obj.arr.pop();
+// → type: "mutation", key: "2"
+delete obj.arr[0];
+// → type: "mutation", key: "0"
+*/
