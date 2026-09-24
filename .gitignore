@@ -133,3 +133,6 @@ model-cache/
 # regenerated on demand and must never be committed.
 test/fixtures/.encode-cache/
 test/tmp-bench/
+
+mstream.crt
+mstream.key

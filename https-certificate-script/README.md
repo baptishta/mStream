@@ -1,0 +1,1 @@
+In Windows, use git bash to execute .sh script

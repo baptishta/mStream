@@ -295,7 +295,7 @@ function albumCredit(value) {
 // queueAlbum open exactly this card when two albums share a name; `artistLine`
 // is display only. Both are optional — a panel that lacks them draws the
 // pre-series card.
-function renderAlbum(id, artist, name, albumArtFile, year, albumArtist, artistLine) {
+function renderAlbum(id, artist, name, albumArtFile, year, albumArtist, artistLine, trackCount) {
   const artSrc = artUrl(albumArtFile, VUEPLAYERCORE.altLayout.compressArt ? 'l' : undefined);
 
   return `<div class="album-grid-card"${peerAttr()} ${year ? `data-year="${escapeHtml(year)}"` : ''} ${artist ? `data-artist="${escapeHtml(artist)}"` : ''} ${albumArtist ? `data-album-artist="${escapeHtml(albumArtist)}"` : ''} ${id ? `data-album="${escapeHtml(id)}"` : ''} onclick="getAlbumsOnClick(this);">
@@ -310,7 +310,10 @@ function renderAlbum(id, artist, name, albumArtFile, year, albumArtist, artistLi
     <div class="album-grid-info">
       <div class="album-grid-name">${escapeHtml(name)}</div>
       ${artistLine ? `<div class="album-grid-artist">${escapeHtml(artistLine)}</div>` : ''}
-      ${year ? `<div class="album-grid-year">${escapeHtml(year)}</div>` : ''}
+      <div class="album-grid-bottom-row">
+        ${year ? `<span class="album-grid-year">${escapeHtml(year)}</span>` : ''}
+        ${trackCount ? `<div class="album-grid-track_count">(${escapeHtml(trackCount)})</div>` : ''}
+      </div>
     </div>
   </div>`;
 }
@@ -324,7 +327,7 @@ function renderArtist(artist) {
 function renderGenre(genre, trackCount) {
   return `<li class="collection-item">
     <div data-genre="${escapeHtml(genre)}"${peerAttr()} class="artistz" onclick="getGenreSongsList(this)">
-      ${escapeHtml(genre)} <span style="color:#888;font-size:13px;">(${escapeHtml(trackCount)})</span>
+      ${escapeHtml(genre)}&nbsp;<span style="color:#888;font-size:13px;">(${escapeHtml(trackCount)})</span>
     </div>
   </li>`;
 }
@@ -465,9 +468,12 @@ async function senddir(root, backState) {
       });
     }
   }
-  const currentStatePaths = App.getStatePaths(programState, programState[programState.length-1]);
 
+  const currentStatePaths = App.getStatePaths(programState, programState[programState.length-1]);
   document.getElementById('directoryName').innerHTML = App.formatFilePathToHTML(currentStatePaths.path);
+
+  const fileCount = programState[programState.length-1].content.files.length;
+  document.getElementById("directory-file-count").innerHTML = fileCount > 0 ? `(${programState[programState.length-1].content.files.length})` : "";
       
   // Show upload and mkdir buttons only when inside a vpath (not at root)
   const uploadBtn = document.getElementById('upload_btn');
@@ -475,12 +481,8 @@ async function senddir(root, backState) {
   // Both are writes, and a federation key carries no write permission —
   // the peer's allowlist stops at reads, so never offer them there.
   if (fileExplorerArray.length > 0 && !peerContext) {
-    uploadBtn.classList.remove('super-hide');
-    if (MSTREAMAPI.currentServer.noMkdir === true) {
-      mkdirBtn.classList.add('super-hide');
-    } else {
-      mkdirBtn.classList.remove('super-hide');
-    }
+    uploadBtn.classList.toggle('super-hide', MSTREAMAPI.currentServer.noUpload);
+    mkdirBtn.classList.toggle('super-hide', MSTREAMAPI.currentServer.noMkdir);
   } else {
     uploadBtn.classList.add('super-hide');
     mkdirBtn.classList.add('super-hide');
@@ -786,6 +788,7 @@ async function init() {
     }
 
     MSTREAMAPI.currentServer.noMkdir = response.noMkdir === true;
+    MSTREAMAPI.currentServer.noUpload = response.noUpload === true;
 
     // Discovery capability — consumed by the Discover panel (below) and
     // the Auto-DJ panel's sonic-similarity section.
@@ -3272,6 +3275,7 @@ async function getAllArtists() {
     });
     artists += '</ul>';
 
+    document.getElementById('directoryName').innerHTML = `All Artists (${response.artists.length})`
     document.getElementById('filelist').innerHTML = artists;
 
     App.setFocusableElements();
@@ -3314,6 +3318,7 @@ async function getArtistsAlbums(artist) {
     });
     albums += '</div>';
 
+    document.getElementById('directoryName').innerHTML = `${artist} Albums (${response.albums.length})`;
     document.getElementById('filelist').innerHTML = albums;
 
     App.setFocusableElements();
@@ -3341,6 +3346,7 @@ async function getAllGenres() {
     });
     html += '</ul>';
 
+    document.getElementById('directoryName').innerHTML = `All Genres (${response.genres.length})`;
     document.getElementById('filelist').innerHTML = html;
 
     App.setFocusableElements();
@@ -3404,19 +3410,23 @@ async function getAllAlbums() {
     let albums = '<div class="album-grid">';
     response.albums.forEach(value => {
       const credit = albumCredit(value);
-      currentBrowsingList.push({
-        type: 'album',
-        name: value.name,
-        'album_art_file': value.album_art_file,
-        year: value.year,
-        album_artist: credit.albumArtist,
-        artist_line: credit.line
-      });
+      if (value.name) {
+        currentBrowsingList.push({
+          type: 'album',
+          name: value.name,
+          'album_art_file': value.album_art_file,
+          year: value.year,
+          album_artist: credit.albumArtist,
+          artist_line: credit.line,
+          trackCount: value['track_count']
+        });
 
-      albums += renderAlbum(value.name, undefined, value.name, value.album_art_file, value.year, credit.albumArtist, credit.line);
+        albums += renderAlbum(value.name, undefined, value.name, value.album_art_file, value.year, credit.albumArtist, credit.line, value['track_count']);
+      }
     });
     albums += '</div>'
 
+    document.getElementById('directoryName').innerHTML = `All Albums (${currentBrowsingList.length})`;
     document.getElementById('filelist').innerHTML = `<div class="content-list-scrollable-inner">${albums}</div>`;
 
     App.setFocusableElements();
@@ -5938,6 +5948,7 @@ function tglHideTopBar() {
   VUEPLAYERCORE.altLayout.hideTopBar = !VUEPLAYERCORE.altLayout.hideTopBar;
   document.body.classList.toggle('top-bar-hidden', VUEPLAYERCORE.altLayout.hideTopBar);
   localStorage.setItem('altLayout', JSON.stringify(VUEPLAYERCORE.altLayout));
+  if (VUEPLAYERCORE.altLayout.hideTopBar) { mstreamScanProgress.stop(); } else { mstreamScanProgress.start() }
 }
 
 // The two artists-list preferences (see artistsBody). Persisted with the

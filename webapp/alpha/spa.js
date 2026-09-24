@@ -1,3 +1,9 @@
+// Example usage:
+// const onWinResize = e => console.log(e);
+// const onWinResizeDebounced = debounce(onWinResize, 50);
+// const onDOMContentLoaded = e => {
+//   window.addEventListener("resize", onWinResizeDebounced);
+// };
 const debounce = (callback, wait) => {
   let timeoutId = null;
   return (...args) => {
@@ -7,9 +13,6 @@ const debounce = (callback, wait) => {
     }, wait);
   };
 };
-// Example usage:
-// const handleMouseMove = debounce((mouseEvent) => { console.log(mouseEvent) }, 250);
-// document.addEventListener('mousemove', handleMouseMove);
 
 const App = (function() {
   const ViewBreakPoints = {
@@ -232,11 +235,18 @@ const App = (function() {
       window.history.pushState(historyObj, historyObj.state, currentStatePaths.pathURL);
     } catch (e) { boilerplateFailure(e) }
 
-    console.log(history.state);
+    // console.log(history.state);
+  }
+
+  const toggleBackBtn = (_programState) => {
+    const backBtn = document.getElementById("browser-back-btn");
+    if (_programState.length < 2) { backBtn.classList.add("browser-back-btn--disabled"); } else { backBtn.classList.remove("browser-back-btn--disabled"); }
   }
 
   //refer to: function observeArrayProperty(...); change.type: "reassignment" | "mutation"
   const programStateOnChange = change => {
+    toggleBackBtn(programState);
+
     if (change.type === "mutation") {
       //arr.pop()
       if (!change.newValue || change.key === "length") {
@@ -314,6 +324,7 @@ function changeView(fn, el){
   closeSideMenu();
 
   toggleLocalSearch(false);
+  document.getElementById("directory-file-count").innerHTML = "";
   
   fn();
 }

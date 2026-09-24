@@ -117,6 +117,7 @@
   }
 
   function start() {
+    if (VUEPLAYERCORE.altLayout.hideTopBar) { return; }
     if (timer) { return; }
     tick();
     timer = setInterval(tick, POLL_INTERVAL_MS);
@@ -129,6 +130,11 @@
     start();
   }
 
+  function stop() {
+    clearInterval(timer);
+    timer = null;
+  }
+
   // Expose for tests / manual control
-  window.mstreamScanProgress = { tick, render };
+  window.mstreamScanProgress = { tick, render, start, stop };
 })();

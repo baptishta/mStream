@@ -1,0 +1,1 @@
+openssl req -x509 -newkey rsa:2048 -keyout ../mstream.key -out ../mstream.crt -days 3650 -nodes -config openssl.cnf

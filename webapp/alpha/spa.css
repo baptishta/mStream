@@ -1338,9 +1338,9 @@ select {
 
 .album-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-  gap: 16px;
-  padding: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 10px;
+  padding: 10px;
 }
 
 .album-grid-card {
@@ -1388,7 +1388,7 @@ select {
   justify-content: center;
   opacity: 0;
   transform: translateY(6px);
-  transition: opacity .2s, transform .2s, background .15s;
+  transition: opacity .2s, transform .2s, background-color .15s;
   box-shadow: 0 4px 12px rgba(0,0,0,.4);
   padding: 0;
 }
@@ -1428,7 +1428,7 @@ select {
 }
 
 .album-grid-info {
-  padding: 8px 10px 10px;
+  padding: 5px;
 }
 
 .album-grid-name {
@@ -1449,18 +1449,13 @@ select {
   white-space: nowrap;
 }
 
-.album-grid-year {
+.album-grid-bottom-row {
   font-size: 11px;
   color: #888;
-  margin-top: 2px;
 }
 
-@media (max-width: 480px) {
-  .album-grid {
-    grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
-    gap: 10px;
-    padding: 10px;
-  }
+.album-grid-track_count {
+  float: right;
 }
 
 .make-white {
@@ -2532,6 +2527,12 @@ body.on-federated-server .side-nav-note {
   border: 1px solid transparent;
 }
 
+.browser-back-btn--disabled {
+  opacity: 0.25;
+  cursor: auto;
+  pointer-events: none;
+}
+
 #local_search_btn {
   display: flex;
   align-items: center;
@@ -2549,8 +2550,19 @@ body.on-federated-server .side-nav-note {
   display: none;
 }
 
+#directory-file-count {
+  padding: 0 2px;
+  color: #ccc;
+}
+
 .focused-element {
   border: 1px solid orange !important;
+}
+
+.downloadPlaylist {
+  opacity: 0.25;
+  pointer-events: none;
+  cursor: auto;
 }
 
 .orientation--landscape #song-image,

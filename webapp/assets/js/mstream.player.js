@@ -14,6 +14,8 @@ const MSTREAMPLAYER = (() => {
   mstreamModule.positionCache = { val: -1 };
   mstreamModule.playlist = [];
   const cacheTimeout = 30000;
+  const GO_TO_SONG_DELAY = 200;
+  const GO_TO_SONG_LONG_DELAY = 500;
   
   var currentReplayGainAmp = 1.0;
 
@@ -1073,7 +1075,7 @@ const MSTREAMPLAYER = (() => {
     return getCurrentPlayer().songObject;
   }
 
-  function goToPreviousSong() {
+  function goToPreviousSong(longDelay) {
     // If random is set, go to previous song from cache
     if (mstreamModule.playerStats.shuffle === true) {
       // Check that there is a previous song to go back to
@@ -1096,7 +1098,7 @@ const MSTREAMPLAYER = (() => {
       }
       clearEnd();
 
-      goToSong(mstreamModule.positionCache.val);
+      goToSongDelayed(mstreamModule.positionCache.val, undefined, longDelay);
       return;
     }
 
@@ -1108,10 +1110,10 @@ const MSTREAMPLAYER = (() => {
     // Set previous song and play
     clearEnd();
     mstreamModule.positionCache.val--;
-    return goToSong(mstreamModule.positionCache.val);
+    return goToSongDelayed(mstreamModule.positionCache.val, undefined, longDelay);
   }
 
-  function goToNextSong() {
+  function goToNextSong(longDelay) {
     // If random is set, go to random song
     if (mstreamModule.playerStats.shuffle === true) {
       // Chose a random value
@@ -1137,7 +1139,7 @@ const MSTREAMPLAYER = (() => {
       }
       clearEnd();
 
-      goToSong(mstreamModule.positionCache.val);
+      goToSongDelayed(mstreamModule.positionCache.val, undefined, longDelay);
 
       // Remove duplicates from shuffle previous
       for (var i = 0, len = shufflePrevious.length; i < len; i++) {
@@ -1158,7 +1160,7 @@ const MSTREAMPLAYER = (() => {
         mstreamModule.positionCache.val = 0;
         clearEnd();
 
-        return goToSong(mstreamModule.positionCache.val);
+        return goToSongDelayed(mstreamModule.positionCache.val, undefined, longDelay);
       }
       // Self-healing fallback: Auto-DJ is on but we've run out of
       // queued songs. The bootstrap in toggleAutoDJ + clearPlaylist
@@ -1175,7 +1177,7 @@ const MSTREAMPLAYER = (() => {
           if (mstreamModule.playlist[mstreamModule.positionCache.val + 1]) {
             mstreamModule.positionCache.val++;
             clearEnd();
-            goToSong(mstreamModule.positionCache.val);
+            goToSongDelayed(mstreamModule.positionCache.val, undefined, longDelay);
           }
           // If autoDJ() failed to add a song (toast already shown),
           // the session stays paused at end-of-playlist. The user can
@@ -1190,9 +1192,17 @@ const MSTREAMPLAYER = (() => {
     // Load up next song
     mstreamModule.positionCache.val++;
     clearEnd();
-    return goToSong(mstreamModule.positionCache.val);
+    return goToSongDelayed(mstreamModule.positionCache.val, undefined, longDelay);
   }
 
+  const goToSongDebouncedLong = debounce(goToSong, GO_TO_SONG_LONG_DELAY);
+  const goToSongDebounced = debounce(goToSong, GO_TO_SONG_DELAY);
+
+  //long delay prevents media devices with rotary media controls to load songs upon rapid spinning
+  const goToSongDelayed = (position, forceAutoPlayOff, longDelay) => {
+    if (longDelay) { goToSongDebouncedLong(position, forceAutoPlayOff); }
+    else { goToSongDebounced(position, forceAutoPlayOff); }
+  }
 
   function getCurrentPlayer() {
     if (curP === 'A') {
@@ -1223,7 +1233,6 @@ const MSTREAMPLAYER = (() => {
 
     return curP;
   }
-
 
   function goToSong(position, forceAutoPlayOff) {
     if (!mstreamModule.playlist[position]) {
@@ -1954,8 +1963,8 @@ const MSTREAMPLAYER = (() => {
     // navigator.mediaSession.setActionHandler('seekbackward', function() { /* Code excerpted. */ });
     // navigator.mediaSession.setActionHandler('seekforward', function() { /* Code excerpted. */ });
     // navigator.mediaSession.setActionHandler('seekto', function() { /* Code excerpted. */ });
-    navigator.mediaSession.setActionHandler('previoustrack', function() { goToPreviousSong(); });
-    navigator.mediaSession.setActionHandler('nexttrack', function() { goToNextSong() });
+    navigator.mediaSession.setActionHandler('previoustrack', function() { goToPreviousSong(true); });
+    navigator.mediaSession.setActionHandler('nexttrack', function() { goToNextSong(true) });
   }
 
   // Return an object that is assigned to Module

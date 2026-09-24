@@ -1105,7 +1105,8 @@ const VUEPLAYERCORE = (() => {
         event.preventDefault(); App.focusOnBrowserEl("next"); return true;
       case "Enter":
         event.preventDefault(); App.clickOnFocusedEl(); return true;
-      default: return false;
+      default: 
+        return false;
     }
   }
 
