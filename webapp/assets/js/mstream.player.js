@@ -1333,6 +1333,7 @@ const MSTREAMPLAYER = (() => {
     mstreamModule.playerStats.metadata.track = curSong.metadata && curSong.metadata.track ? curSong.metadata.track : "";
     mstreamModule.playerStats.metadata.title = curSong.metadata && curSong.metadata.title ? curSong.metadata.title : "";
     mstreamModule.playerStats.metadata.year = curSong.metadata && curSong.metadata.year ? curSong.metadata.year : "";
+    mstreamModule.playerStats.metadata.genres = curSong.metadata && curSong.metadata.genres ? curSong.metadata.genres : null;
     mstreamModule.playerStats.metadata['album-art'] = curSong.metadata && curSong.metadata['album-art'] ? curSong.metadata['album-art'] : "";
     mstreamModule.playerStats.metadata['replaygain-track-db'] = curSong.metadata && curSong.metadata['replaygain-track-db'] ? curSong.metadata['replaygain-track-db'] : "";
     // V32 columns — used by the now-playing pill display + Auto-DJ
@@ -1512,6 +1513,7 @@ const MSTREAMPLAYER = (() => {
       "track": "",
       "title": "",
       "year": "",
+      "genres": null,
       "album-art": "",
       "filepath": "",
       "has-lyrics": false,

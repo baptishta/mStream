@@ -368,6 +368,7 @@
           <p><b data-i18n="metadata.album">Album:</b> <span id="meta--album"></span></p>
           <p><b data-i18n="metadata.artist">Artist:</b> <span id="meta--artist"></span></p>
           <p><b data-i18n="metadata.year">Year:</b> <span id="meta--year"></span></p>
+          <p><b>Genre:</b> <span id="meta--genre"></span></p>
           <p><b data-i18n="metadata.track">Track #:</b> <span id="meta--track"></span></p>
           <p><b data-i18n="metadata.disc">Disc #:</b><span id="meta--disk"></span></p>
           <p><b data-i18n="metadata.rating">Rating:</b> <span id="meta--rating"></span></p>
@@ -736,15 +737,12 @@
               <b data-i18n="metadata.artist">Artist:</b>
               <span class="pointer" v-on:click="goToArtist">{{ meta['artist-display'] || meta.artist || '' }}</span>
             </p>
-            <p v-if="meta.composer">
-              <b data-i18n="metadata.composer">Composer:</b>
-              {{ meta.composer }}
-            </p>
+            <!-- <p v-if="meta.composer"><b data-i18n="metadata.composer">Composer:</b>{{ meta.composer }}</p> -->
             <p>
               <b data-i18n="metadata.album">Album:</b>
               <span class="pointer" v-on:click="goToAlbum">{{ (meta.album) ? meta.album : '' }}</span>
             </p>
-            <p><b data-i18n="metadata.year">Year:</b> {{ (meta.year) ? meta.year : '' }}</p>
+            <p><b data-i18n="metadata.year">Year:</b> {{ (meta.year) ? meta.year : '' }}&nbsp;&nbsp;<b>Genre:</b> {{ (meta.genres) ? meta.genres.join(',') : '' }}</p>
             <!-- V32 pills — only render the row when at least one is
                  set so libraries without BPM/key tags don't get an
                  empty " · " line. -->

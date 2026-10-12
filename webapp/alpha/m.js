@@ -2484,6 +2484,7 @@ function openMetadataModal(metadata, fp) {
   document.getElementById('meta--album').textContent = metadata.album;
   document.getElementById('meta--artist').textContent = metadata.artist;
   document.getElementById('meta--year').textContent = metadata.year;
+  document.getElementById('meta--genre').textContent = metadata.genres.join(",");
   document.getElementById('meta--disk').textContent = metadata.disk;
   document.getElementById('meta--track').textContent = metadata.track;
   document.getElementById('meta--rating').textContent = metadata.rating;
