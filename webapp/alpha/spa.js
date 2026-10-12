@@ -58,27 +58,18 @@ const App = (function() {
     }
   }
 
-  const scrollIntoViewIfNeeded = el => {
+  const keepItemInView = (element, container) => {
     try {
-      typeof el.scrollIntoViewIfNeeded === "function" && el.scrollIntoViewIfNeeded();
-    } catch (e) { boilerplateFailure(e) }
-  }
+      const containerRect = container.getBoundingClientRect();
+      const elementRect = element.getBoundingClientRect();
 
-  const keepCollectionItemInView = (element) => {
-    if (!element.classList.contains("collection-item")) { return false; }
-
-    const container = document.getElementById("filelist").getElementsByClassName("collection")[0];
-    if (container instanceof HTMLElement === false) { return false; }
-
-    const containerRect = container.getBoundingClientRect();
-    const elementRect = element.getBoundingClientRect();
-
-    if (elementRect.top < containerRect.top) {
-      container.scrollTop -= containerRect.top - elementRect.top;
-    } else if (elementRect.bottom > containerRect.bottom) {
-      container.scrollTop += elementRect.bottom - containerRect.bottom;
-    }
-    return container.scrollTop;
+      if (elementRect.top < containerRect.top) {
+        container.scrollTop -= containerRect.top - elementRect.top;
+      } else if (elementRect.bottom > containerRect.bottom) {
+        container.scrollTop += elementRect.bottom - containerRect.bottom;
+      }
+      return container.scrollTop;
+    } catch (e) { boilerplateFailure(e); }
   }
 
   const onWinResize = e => {
@@ -108,7 +99,7 @@ const App = (function() {
       const nowPlayingBtn = document.getElementById('now-playing-tab-btn');
       if ((App.getView() === App.Views.SMALL && nowPlayingBtn.classList.contains('selected-tab')) || (App.getView() !== App.Views.SMALL)) {
         const playItem = playlistEl.getElementsByClassName('np-queue-active')[0];
-        scrollIntoViewIfNeeded(playItem);
+        keepItemInView(playItem, playlistEl.getElementsByClassName('collection')[0]);
       }
     });
   };
@@ -174,8 +165,7 @@ const App = (function() {
       focusedEl.classList.remove("focused-element");
       focusedEl = focusableElements[focusedElIndex - 1];
       focusedEl.classList.add("focused-element");
-      // scrollIntoViewIfNeeded(focusedEl);
-      keepCollectionItemInView(focusedEl);
+      keepItemInView(focusedEl, document.getElementById("filelist").getElementsByClassName("collection")[0]);
       return focusedEl;
     }
 
@@ -183,8 +173,7 @@ const App = (function() {
       focusedEl.classList.remove("focused-element");
       focusedEl = focusableElements[focusedElIndex + 1];
       focusedEl.classList.add("focused-element");
-      // scrollIntoViewIfNeeded(focusedEl);
-      keepCollectionItemInView(focusedEl);
+      keepItemInView(focusedEl, document.getElementById("filelist").getElementsByClassName("collection")[0]);
       return focusedEl;
     }
     return false;

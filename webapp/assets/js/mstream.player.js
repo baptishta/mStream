@@ -1097,6 +1097,7 @@ const MSTREAMPLAYER = (() => {
         }
       }
       clearEnd();
+      App.scrollToSong();
 
       goToSongDelayed(mstreamModule.positionCache.val, undefined, longDelay);
       return;
@@ -1110,6 +1111,7 @@ const MSTREAMPLAYER = (() => {
     // Set previous song and play
     clearEnd();
     mstreamModule.positionCache.val--;
+    App.scrollToSong();
     return goToSongDelayed(mstreamModule.positionCache.val, undefined, longDelay);
   }
 
@@ -1139,6 +1141,7 @@ const MSTREAMPLAYER = (() => {
       }
       clearEnd();
 
+      App.scrollToSong();
       goToSongDelayed(mstreamModule.positionCache.val, undefined, longDelay);
 
       // Remove duplicates from shuffle previous
@@ -1150,6 +1153,8 @@ const MSTREAMPLAYER = (() => {
       }
 
       shufflePrevious.push(nextSong);
+
+      App.scrollToSong();
       return;
     }
 
@@ -1159,6 +1164,7 @@ const MSTREAMPLAYER = (() => {
       if (mstreamModule.playerStats.shouldLoop === true && mstreamModule.playlist.length > 0) {
         mstreamModule.positionCache.val = 0;
         clearEnd();
+        App.scrollToSong();
 
         return goToSongDelayed(mstreamModule.positionCache.val, undefined, longDelay);
       }
@@ -1177,6 +1183,7 @@ const MSTREAMPLAYER = (() => {
           if (mstreamModule.playlist[mstreamModule.positionCache.val + 1]) {
             mstreamModule.positionCache.val++;
             clearEnd();
+            App.scrollToSong();
             goToSongDelayed(mstreamModule.positionCache.val, undefined, longDelay);
           }
           // If autoDJ() failed to add a song (toast already shown),
@@ -1192,6 +1199,7 @@ const MSTREAMPLAYER = (() => {
     // Load up next song
     mstreamModule.positionCache.val++;
     clearEnd();
+    App.scrollToSong();
     return goToSongDelayed(mstreamModule.positionCache.val, undefined, longDelay);
   }
 
@@ -1309,8 +1317,6 @@ const MSTREAMPLAYER = (() => {
 
     // Count the play: the complete play is reported once this song is over.
     beginPlaySession(mstreamModule.playlist[position]);
-
-    App.scrollToSong();
   }
 
   // Should be called whenever the "metadata" field of the current song is changed, or

@@ -917,6 +917,10 @@ body.top-bar-hidden .sidenav-spacer-bottom {
   color: #bbb;
 }
 
+.downloadDir {
+  pointer-events: none;
+}
+
 .song-button-box svg {
   vertical-align: top !important;
   padding-top: 1px;
